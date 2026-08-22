@@ -111,6 +111,7 @@ from kiro_crew.subagent_cost import (
     compact_cost_log,
     read_learned_cost,
 )
+from kiro_crew.subagent_lifecycle import SubagentLifecycle
 from kiro_crew.subagent_manager import (
     CancellationCoordinator,
     ContinuationCoordinator,
@@ -138,6 +139,7 @@ from kiro_crew.subagent_persistence import (
     write_result_chunk,
     write_tombstone,
 )
+from kiro_crew.subagent_scheduler import SubagentScheduler
 from kiro_crew.validation import _AGENT_NAME_RE
 
 # Standalone ClaudeCodeProvider removed (KiroACP-only). Name kept as None so the
@@ -1567,7 +1569,10 @@ class SubagentManager:
         self._sessions = sessions
         self._ctx_builder = ctx_builder
         self._on_done = on_done
-        self._max_concurrent = max_concurrent
+        self._scheduler = SubagentScheduler(
+            max_concurrent=max_concurrent,
+            stagger_seconds=0.0,
+        )
         self._default_turn_limit = default_turn_limit
         self._default_timeout = default_timeout if default_timeout > 0 else _TIMEOUT_SECS
         self._startup_deadline = startup_timeout if startup_timeout > 0 else _STARTUP_TIMEOUT_SECS
@@ -1591,10 +1596,7 @@ class SubagentManager:
         # coordinator mutation is async, so merely storing the adapter preserves
         # the existing admission and terminal ordering in this phase.
         self._coordinator = coordinator or MemoryRunCoordinator()
-        self._running_count = 0
-        # Strong refs to in-flight shielded terminal reports (see
-        # `_spawn_terminal_report`); drained in `cancel_all`.
-        self._report_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
+        self._lifecycle: SubagentLifecycle[SubagentInfo] = SubagentLifecycle()
         # follow_up watchers (spawn_steer mode="follow_up"), keyed by run id.
         # Manager-OWNED on purpose: these tasks can spawn a brand-new run
         # (continue_conversation), so per this module's containment contract
@@ -1602,9 +1604,6 @@ class SubagentManager:
         # cancel_all() — a watcher parked in the global _safe_fire set would
         # survive shutdown and dispatch against a closing SessionManager.
         self._followup_watchers: dict[str, asyncio.Task] = {}  # type: ignore[type-arg]
-        # task -> the agent whose terminal report it is delivering
-        self._report_owners: dict[asyncio.Task, SubagentInfo] = {}  # type: ignore[type-arg]
-        self._last_spawn_ts: float = 0.0  # monotonic time of the last actual start (stagger gate)
         self.hook_store: Any = None  # Optional ScriptHookStore, set by server.py
         self._agents: dict[str, SubagentInfo] = {}
         # Continuable conversations: session_key ("subagent:<conv-id>") →
@@ -1633,22 +1632,6 @@ class SubagentManager:
         except AttributeError:
             pass  # test doubles without the setter
         self._tasks: dict[str, asyncio.Task] = {}  # type: ignore[type-arg]
-        # Teardown gates for runs whose terminal report has started, keyed by id and
-        # OUTLIVING both dicts above. A "delivered" tombstone excludes a folder from
-        # restart orphan reconciliation, so it must never be written while the run's
-        # child is still being killed -- and the settlement that writes it can happen
-        # outside the run (the parent's queue drain; issue #4839), long after a
-        # dashboard "clear completed" / "cancel" has popped BOTH ``_agents`` and
-        # ``_tasks`` for a done-but-still-tearing-down run. Reading the gate from
-        # here, rather than inferring "record gone means teardown finished", is what
-        # makes that inference unnecessary. Removed by the same ``finally`` that sets
-        # the event, so a missing entry always means "nothing left to wait for".
-        self._teardown_gates: dict[str, asyncio.Event] = {}
-        # Queued spawns store the FULL spawn() kwarg set (not just a 5-tuple), so a
-        # drained spawn preserves approval_mode / silent / model / allowed_tools / bare —
-        # dropping them made a queued headless/auto spawn hit the deny-by-default gate and
-        # a queued silent spawn emit output. See _drain_queue.
-        self._queue: list[dict[str, Any]] = []
         # Batch ids whose spawn_batch_started event has already fired.
         self._seen_batches: set[str] = set()
         # Submission accounting per wave: batch_id -> (submitted, expected).
@@ -1689,9 +1672,10 @@ class SubagentManager:
         except Exception:
             self._spawn_stagger_secs = 2.0
 
-        # The facade is the single owner of mutable registries and slot tokens.
-        # Coordinators own transition logic and route every cross-boundary call
-        # back through this object, preserving overrides and monkeypatch seams.
+        # Coordinators own effectful transitions while the scheduler and
+        # lifecycle boundaries own their focused mutable state. Cross-boundary
+        # calls still route through this facade, preserving overrides and
+        # monkeypatch seams.
         self._monitor = OrphanStallMonitor(self)
         self._terminal = TerminalCoordinator(self)
         self._admission = SpawnAdmissionCoordinator(self)
@@ -1699,6 +1683,61 @@ class SubagentManager:
         self._waves = WaveDigestCoordinator(self)
         self._run_events = RunEventCoordinator(self)
         self._cancellation = CancellationCoordinator(self)
+
+    # Compatibility views for integrations and older tests that inspect the
+    # manager's private state. The scheduler and lifecycle own these values;
+    # production policy is implemented at those boundaries.
+    @property
+    def _max_concurrent(self) -> int:
+        return self._scheduler.max_concurrent
+
+    @_max_concurrent.setter
+    def _max_concurrent(self, value: int) -> None:
+        self._scheduler.max_concurrent = value
+
+    @property
+    def _running_count(self) -> int:
+        return self._scheduler.running_count
+
+    @_running_count.setter
+    def _running_count(self, value: int) -> None:
+        self._scheduler.running_count = value
+
+    @property
+    def _last_spawn_ts(self) -> float:
+        return self._scheduler.last_start
+
+    @_last_spawn_ts.setter
+    def _last_spawn_ts(self, value: float) -> None:
+        self._scheduler.last_start = value
+
+    @property
+    def _spawn_stagger_secs(self) -> float:
+        return self._scheduler.stagger_seconds
+
+    @_spawn_stagger_secs.setter
+    def _spawn_stagger_secs(self, value: float) -> None:
+        self._scheduler.stagger_seconds = max(0.0, value)
+
+    @property
+    def _queue(self) -> list[dict[str, Any]]:
+        return self._scheduler.queue
+
+    @_queue.setter
+    def _queue(self, value: list[dict[str, Any]]) -> None:
+        self._scheduler.queue = value
+
+    @property
+    def _report_tasks(self) -> set[asyncio.Task[None]]:
+        return self._lifecycle.report_tasks
+
+    @property
+    def _report_owners(self) -> dict[asyncio.Task[None], SubagentInfo]:
+        return self._lifecycle.report_owners
+
+    @property
+    def _teardown_gates(self) -> dict[str, asyncio.Event]:
+        return self._lifecycle.teardown_gates
 
     def _effective_turn_limit(self, info: SubagentInfo) -> int:
         return self._run_events._effective_turn_limit_impl(info)
@@ -1987,7 +2026,7 @@ class SubagentManager:
         still receives ``CancelledError`` — teardown semantics are unchanged and
         the outcome is never stranded.
         """
-        await asyncio.shield(task)
+        await SubagentLifecycle.await_report(task)
 
     def _release_slot(self, info: SubagentInfo) -> bool:
         return self._terminal._release_slot_impl(info)

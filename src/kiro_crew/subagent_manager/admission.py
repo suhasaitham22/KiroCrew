@@ -293,7 +293,8 @@ class SpawnAdmissionCoordinator(ManagerComponent):
             )
 
         now = time.monotonic()
-        should_queue, slot_free = self._manager._should_stagger_queue(now)
+        decision = self._manager._scheduler.admission(now)
+        should_queue, slot_free = decision.should_queue, decision.slot_free
         if should_queue:
             # A prevalidated app spawn must NOT sit in the queue. _agent_prevalidated
             # skips the agent-directory ownership scan on drain (it was validated
@@ -338,7 +339,7 @@ class SpawnAdmissionCoordinator(ManagerComponent):
             # the default 2s stagger that is EVERY member after the first, so a
             # 2-agent wave permanently rendered "1 agent running" while the
             # sidebar and Subagents panel correctly showed 2.
-            self._manager._queue.append(
+            self._manager._scheduler.enqueue(
                 {
                     "task": task,
                     "parent_session_key": parent_session_key,
@@ -377,9 +378,7 @@ class SpawnAdmissionCoordinator(ManagerComponent):
             # completion — schedule the staggered pump at the interval boundary
             # so the queued spawn still launches.
             if slot_free:
-                delay = max(
-                    0.0, self._manager._spawn_stagger_secs - (now - self._manager._last_spawn_ts)
-                )
+                delay = decision.retry_after or 0.0
                 try:
                     asyncio.get_event_loop().call_later(delay, self._manager._drain_queue)
                 except RuntimeError:
@@ -452,8 +451,7 @@ class SpawnAdmissionCoordinator(ManagerComponent):
         )
         info._raw_task = task  # unredacted prompt for kiro-cli execution
         self._manager._agents[agent_id] = info
-        self._manager._running_count += 1
-        self._manager._last_spawn_ts = time.monotonic()  # stagger gate: one start per interval
+        self._manager._scheduler.occupy(info, time.monotonic())
         # Batch lifecycle: announce the wave ONCE, on its first member to
         # actually start (queued members haven't started yet — the event marks
         # execution begin, and the UI uses it to key batch progress).
@@ -518,7 +516,7 @@ class SpawnAdmissionCoordinator(ManagerComponent):
             else:
                 info.done = True
                 info.error = "spawn rejected: no approval mechanism configured"
-                self._manager._running_count -= 1
+                self._manager._scheduler.release(info)
                 self._manager._drain_queue()
                 sel().log_tool_invocation(
                     session_key=info.parent_session_key,
@@ -541,7 +539,7 @@ class SpawnAdmissionCoordinator(ManagerComponent):
         else:
             info.done = True
             info.error = "spawn rejected: no approval mechanism configured"
-            self._manager._running_count -= 1
+            self._manager._scheduler.release(info)
             self._manager._drain_queue()
             sel().log_tool_invocation(
                 session_key=info.parent_session_key,
@@ -606,9 +604,8 @@ class SpawnAdmissionCoordinator(ManagerComponent):
         (``subagent_spawn_stagger_secs``) — so the initial fill never bursts and
         no two agents start within the interval (dynamic-subagent-sizing.md §5.3).
         """
-        slot_free = self._manager._running_count < self._manager._max_concurrent
-        too_soon = (now - self._manager._last_spawn_ts) < self._manager._spawn_stagger_secs
-        return (not slot_free or too_soon, slot_free)
+        decision = self._manager._scheduler.admission(now)
+        return decision.should_queue, decision.slot_free
 
     def _drain_queue_impl(self) -> None:
         """Spawn the next queued task if a slot is available and the stagger
@@ -619,22 +616,20 @@ class SpawnAdmissionCoordinator(ManagerComponent):
         slot is free but a spawn started too recently, it reschedules itself at
         the interval boundary rather than bursting.
         """
-        if (
-            not self._manager._queue
-            or self._manager._running_count >= self._manager._max_concurrent
-        ):
-            return
-        elapsed = time.monotonic() - self._manager._last_spawn_ts
-        if elapsed < self._manager._spawn_stagger_secs:
-            # Too soon since the last start — reschedule at the boundary.
+        decision = self._manager._scheduler.take_ready(time.monotonic())
+        if decision.entry is None:
+            # Capacity releases call this pump again. A stagger-only delay has
+            # no such future trigger, so schedule exactly at its boundary.
+            if self._manager._queue and decision.retry_after is not None:
+                delay = decision.retry_after
+            else:
+                return
             try:
-                asyncio.get_event_loop().call_later(
-                    self._manager._spawn_stagger_secs - elapsed, self._manager._drain_queue
-                )
+                asyncio.get_event_loop().call_later(delay, self._manager._drain_queue)
             except RuntimeError:
                 pass  # no running loop (sync/test context)
             return
-        params = self._manager._queue.pop(0)
+        params = decision.entry
         # A run can be cancelled WHILE it waits here — a user stop, or a session
         # deleted out from under it. Starting it anyway would execute tools for
         # work already reported as stopped, so skip it and drain the next one
@@ -693,11 +688,10 @@ class SpawnAdmissionCoordinator(ManagerComponent):
                 )
             except RuntimeError:
                 pass  # no running loop (sync/test context)
-        if self._manager._queue and self._manager._running_count < self._manager._max_concurrent:
+        continuation_delay = self._manager._scheduler.continuation_delay()
+        if continuation_delay is not None:
             try:
-                asyncio.get_event_loop().call_later(
-                    self._manager._spawn_stagger_secs, self._manager._drain_queue
-                )
+                asyncio.get_event_loop().call_later(continuation_delay, self._manager._drain_queue)
             except RuntimeError:
                 pass
 
@@ -737,8 +731,7 @@ class SpawnAdmissionCoordinator(ManagerComponent):
             # `_force_reap` releases the slot and reports. A bare decrement here
             # would double-release — driving `_running_count` negative — and the
             # announce below would double-report the completion.
-            if self._manager._release_slot(info):
-                self._manager._running_count -= 1
+            if self._manager._scheduler.release(info):
                 self._manager._drain_queue()
             self._manager._tasks.pop(info.id, None)
             sel().log_tool_invocation(
