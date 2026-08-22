@@ -6147,6 +6147,65 @@ class TestTokenPersistenceBackfill:
         assert completions == []
 
     @pytest.mark.asyncio
+    async def test_monitor_reauthorizes_at_provider_entry(self, tmp_path, monkeypatch):
+        """A stopped claim cannot cross the runner's final provider boundary."""
+        from kiro_crew.dashboard.chat import _run_chat
+        from kiro_crew.monitoring.completion import MonitorCompletionHook
+
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_mock_client([])
+        client.context_used_tokens = MagicMock(return_value=0)
+        client.context_window_tokens = MagicMock(return_value=0)
+        stream = MagicMock(side_effect=client.stream)
+        client.stream = stream
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+        authorize = AsyncMock(return_value=False)
+        completion = MonitorCompletionHook(
+            "monitor1",
+            "failure-a",
+            AsyncMock(),
+            authorization_callback=authorize,
+        )
+
+        await _run_chat(state, slot, "hello", monitor_completion=completion)
+
+        authorize.assert_awaited_once_with("monitor1", "failure-a")
+        assert completion.accepted is False
+        stream.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_monitor_shutdown_gate_precedes_acceptance(self, tmp_path, monkeypatch):
+        """A closing session cannot acknowledge a wake that never entered the provider."""
+        from kiro_crew.dashboard.chat import _run_chat
+        from kiro_crew.monitoring.completion import MonitorCompletionHook
+        from kiro_crew.session import SessionClosingError
+
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_mock_client([])
+        client.context_used_tokens = MagicMock(return_value=0)
+        client.context_window_tokens = MagicMock(return_value=0)
+        stream = MagicMock(side_effect=client.stream)
+        client.stream = stream
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+        state.sessions.begin_turn = MagicMock(side_effect=SessionClosingError("closing"))
+        accepted = MagicMock()
+        completion = MonitorCompletionHook(
+            "monitor1",
+            "failure-a",
+            AsyncMock(),
+            authorization_callback=AsyncMock(return_value=True),
+            acceptance_callback=accepted,
+        )
+
+        await _run_chat(state, slot, "hello", monitor_completion=completion)
+
+        assert completion.accepted is False
+        accepted.assert_not_called()
+        stream.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_raw_complete_survives_cancellation_during_token_persistence(
         self, tmp_path, monkeypatch
     ):
@@ -14799,6 +14858,38 @@ class TestStopDuringSessionPrep:
             "the turn was dispatched despite a Stop during session prep — "
             "the full response would stream behind a [Stopped] card (#5464)"
         )
+
+    @pytest.mark.asyncio
+    async def test_stop_during_get_or_create_does_not_accept_monitor_wake(
+        self, tmp_path: Path
+    ) -> None:
+        """A stopped pre-stream wake stays retryable instead of becoming DISPATCHED."""
+        from kiro_crew.monitoring.completion import MonitorCompletionHook
+
+        state, slot, _run_chat = self._make_state_and_slot(tmp_path)
+        stream_calls: list[str] = []
+        client = self._make_client(stream_calls)
+
+        async def _slow_create(*args, **kwargs):
+            slot._stop_state = "soft_pending"
+            slot._stop_state = "idle"
+            return client, True, False
+
+        state.sessions.get_or_create = AsyncMock(side_effect=_slow_create)
+        accepted = MagicMock()
+        completion = MonitorCompletionHook(
+            "monitor1",
+            "failure-a",
+            AsyncMock(),
+            authorization_callback=AsyncMock(return_value=True),
+            acceptance_callback=accepted,
+        )
+
+        await _run_chat(state, slot, "hello", monitor_completion=completion)
+
+        assert completion.accepted is False
+        accepted.assert_not_called()
+        assert stream_calls == []
 
     @pytest.mark.asyncio
     async def test_no_stop_dispatches_normally(self, tmp_path: Path) -> None:

@@ -166,8 +166,32 @@ async def test_budget_stop_persistence_failure_leaves_live_monitor_armed(
 
 
 @pytest.mark.asyncio
+async def test_completion_winning_dispatch_race_counts_the_wake_once(tmp_path) -> None:
+    """A synchronous channel completion can arrive before DISPATCHED is persisted."""
+    service = AutoNudgeService(base_dir=tmp_path)
+    loop = _structured_loop()
+    service._loops[loop.id] = loop
+    assert await service.mark_monitor_action_in_flight(loop.id, "failure-a", now=1_100.0)
+    completion = models.MonitorActionCompletion(
+        monitor_id=loop.id,
+        fingerprint="failure-a",
+        disposition=models.MonitorActionDisposition.SUCCESS,
+        completed_ts=1_120.0,
+    )
+
+    await service.record_monitor_turn_completion(completion)
+    await service.record_monitor_dispatched(loop.id, "failure-a", now=1_121.0)
+    await service.record_monitor_turn_completion(completion)
+
+    assert loop.monitor is not None
+    assert loop.monitor.wake_count == 1
+    assert loop.monitor.agent_turns == 1
+    service.stop()
+
+
+@pytest.mark.asyncio
 async def test_dispatch_failure_before_turn_start_does_not_charge(tmp_path) -> None:
-    """A failed handoff is not an agent turn and must remain retryable."""
+    """A failed handoff is uncharged and cannot duplicate its fingerprint."""
     service = AutoNudgeService(base_dir=tmp_path)
     loop = _structured_loop()
     service._loops[loop.id] = loop
@@ -179,7 +203,46 @@ async def test_dispatch_failure_before_turn_start_does_not_charge(tmp_path) -> N
     assert loop.monitor.agent_turns == 0
     assert loop.monitor.total_tokens == 0
     assert not loop.monitor.wake_in_flight
-    assert await service.mark_monitor_action_in_flight(loop.id, "failure-a", now=1_101.0)
+    assert loop.monitor.outcome is models.MonitorOutcome.TARGET_UNAVAILABLE
+    assert not await service.mark_monitor_action_in_flight(loop.id, "failure-a", now=1_101.0)
+
+
+@pytest.mark.asyncio
+async def test_late_dispatch_failure_preserves_terminal_stop(tmp_path) -> None:
+    """A delivery callback cannot replace a stop accepted during dispatch."""
+    service = AutoNudgeService(base_dir=tmp_path)
+    loop = _structured_loop()
+    service._loops[loop.id] = loop
+    assert await service.mark_monitor_action_in_flight(loop.id, "failure-a", now=1_100.0)
+    await service.stop_monitor(loop.id, now=1_105.0)
+
+    await service.record_monitor_dispatch_failure(loop.id, "failure-a", now=1_110.0)
+
+    assert loop.monitor is not None
+    assert loop.monitor.outcome is MonitorOutcome.USER_STOP
+    assert loop.monitor.stopped_reason == "user_stop"
+
+
+@pytest.mark.asyncio
+async def test_late_completion_expiry_preserves_terminal_stop(tmp_path) -> None:
+    """Missing-evidence recovery cannot replace a stop accepted during a turn."""
+    service = AutoNudgeService(base_dir=tmp_path)
+    loop = _structured_loop()
+    service._loops[loop.id] = loop
+    assert await service.mark_monitor_action_in_flight(loop.id, "failure-a", now=1_100.0)
+    assert loop.monitor is not None
+    loop.monitor.completion_evidence_deadline = 1_110.0
+    await service.stop_monitor(loop.id, now=1_105.0)
+    loop.monitor.completion_evidence_deadline = 1_110.0
+
+    await service.record_monitor_completion_evidence_unavailable(
+        loop.id,
+        "failure-a",
+        now=1_115.0,
+    )
+
+    assert loop.monitor.outcome is MonitorOutcome.USER_STOP
+    assert loop.monitor.stopped_reason == "user_stop"
 
 
 @pytest.mark.asyncio
