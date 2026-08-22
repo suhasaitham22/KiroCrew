@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
+import kiro_crew.run_coordinator.sqlite as sqlite_mod
 from kiro_crew.run_coordinator import (
     CommandClaim,
     CommandOperation,
@@ -21,6 +23,7 @@ from kiro_crew.run_coordinator import (
     RunCoordinator,
     RunOutcome,
     RunRecord,
+    SQLiteRunCoordinator,
     SubmitRun,
 )
 
@@ -38,10 +41,17 @@ def clock() -> FakeClock:
     return FakeClock()
 
 
-@pytest.fixture
-def coordinator(clock: FakeClock) -> RunCoordinator:
+@pytest.fixture(params=("memory", "sqlite"))
+def coordinator(
+    request: pytest.FixtureRequest,
+    clock: FakeClock,
+    tmp_path: Path,
+) -> RunCoordinator:
     ids = iter(("event-1", "event-2", "event-3"))
-    return MemoryRunCoordinator(clock=clock, id_factory=lambda: next(ids))
+    kwargs = {"clock": clock, "id_factory": lambda: next(ids)}
+    if request.param == "sqlite":
+        return SQLiteRunCoordinator(tmp_path / "coordinator.db", **kwargs)
+    return MemoryRunCoordinator(**kwargs)
 
 
 def _request(
@@ -49,6 +59,7 @@ def _request(
     run_id: str = "run-1",
     command_id: str = "command-1",
     idempotency_key: str = "key-1",
+    payload_json: str = '{"task":"compare the candidates","version":1}',
     payload_hash: str = "hash-1",
     accepted: bool = True,
     operation: CommandOperation = CommandOperation.SPAWN,
@@ -57,6 +68,7 @@ def _request(
         run_id=run_id,
         command_id=command_id,
         idempotency_key=idempotency_key,
+        payload_json=payload_json,
         payload_hash=payload_hash,
         parent_session="dashboard:parent",
         agent="researcher",
@@ -66,6 +78,30 @@ def _request(
         accepted=accepted,
         rejection_reason="governance denied" if not accepted else "",
     )
+
+
+@pytest.mark.asyncio
+async def test_default_sqlite_path_cannot_be_retargeted_after_first_use(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replacing a supported data-home link must not split durable state."""
+    real_home = tmp_path / "real-home"
+    real_home.mkdir()
+    linked_home = tmp_path / "linked-home"
+    linked_home.symlink_to(real_home, target_is_directory=True)
+    monkeypatch.setattr(sqlite_mod, "data_home", lambda: linked_home)
+    coordinator = SQLiteRunCoordinator()
+
+    created = await coordinator.submit(_request())
+    assert created.value is not None
+
+    linked_home.rename(tmp_path / "old-linked-home")
+    linked_home.mkdir()
+
+    assert await coordinator.get_run("run-1") == created.value.run
+    assert (real_home / "run-coordinator" / "coordinator.db").exists()
+    assert not (linked_home / "run-coordinator" / "coordinator.db").exists()
 
 
 async def _claimed_running(
@@ -109,6 +145,7 @@ async def test_submit_is_idempotent_and_detects_payload_conflicts(
     assert created.value.created is True
     assert created.value.run.run_id == "run-1"
     assert created.value.command.status is CommandStatus.PENDING
+    assert created.value.command.payload_json == _request().payload_json
 
     assert replay.decision is CoordinatorDecision.UNCHANGED
     assert replay.reason is CoordinatorReason.IDEMPOTENT_REPLAY
