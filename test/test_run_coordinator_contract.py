@@ -8,8 +8,10 @@ from pathlib import Path
 import pytest
 
 import kiro_crew.run_coordinator.sqlite as sqlite_mod
+import kiro_crew.run_coordinator_anchor as anchor_mod
 from kiro_crew.run_coordinator import (
     CommandClaim,
+    CommandFence,
     CommandOperation,
     CommandStatus,
     CoordinatorDecision,
@@ -24,6 +26,7 @@ from kiro_crew.run_coordinator import (
     RunOutcome,
     RunRecord,
     SQLiteRunCoordinator,
+    SubmitControl,
     SubmitRun,
 )
 
@@ -80,6 +83,27 @@ def _request(
     )
 
 
+def test_anchor_is_locked_down_before_payload_and_removed_on_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = tmp_path / "anchor"
+    anchored = tmp_path / "run-coordinator"
+    observed_payloads: list[bytes] = []
+
+    def fail_lockdown(path: Path) -> None:
+        observed_payloads.append(path.read_bytes())
+        raise OSError("lockdown failed")
+
+    monkeypatch.setattr(anchor_mod, "restrict_to_owner", fail_lockdown)
+
+    with pytest.raises(OSError, match="lockdown failed"):
+        anchor_mod._create_anchor(record, anchored)
+
+    assert observed_payloads == [b""]
+    assert not record.exists()
+
+
 @pytest.mark.asyncio
 async def test_default_sqlite_path_cannot_be_retargeted_after_first_use(
     tmp_path: Path,
@@ -90,7 +114,11 @@ async def test_default_sqlite_path_cannot_be_retargeted_after_first_use(
     real_home.mkdir()
     linked_home = tmp_path / "linked-home"
     linked_home.symlink_to(real_home, target_is_directory=True)
-    monkeypatch.setattr(sqlite_mod, "data_home", lambda: linked_home)
+    monkeypatch.setattr(
+        sqlite_mod,
+        "canonical_run_coordinator_dir",
+        lambda: linked_home / "run-coordinator",
+    )
     coordinator = SQLiteRunCoordinator()
 
     created = await coordinator.submit(_request())
@@ -102,6 +130,58 @@ async def test_default_sqlite_path_cannot_be_retargeted_after_first_use(
     assert await coordinator.get_run("run-1") == created.value.run
     assert (real_home / "run-coordinator" / "coordinator.db").exists()
     assert not (linked_home / "run-coordinator" / "coordinator.db").exists()
+
+
+@pytest.mark.asyncio
+async def test_default_sqlite_path_survives_retarget_across_gateway_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A durable anchor must outlive the process-local path cache."""
+    real_home = tmp_path / "real-home"
+    real_home.mkdir()
+    replacement_home = tmp_path / "replacement-home"
+    replacement_home.mkdir()
+    linked_home = tmp_path / "linked-home"
+    linked_home.symlink_to(real_home, target_is_directory=True)
+    anchor_home = tmp_path / "operator-home"
+    anchor_home.mkdir()
+    monkeypatch.setattr(anchor_mod, "data_home", lambda: linked_home)
+    monkeypatch.setattr(anchor_mod, "_anchor_home", lambda: anchor_home)
+    anchor_mod._clear_run_coordinator_anchor_cache()
+
+    first = anchor_mod.canonical_run_coordinator_dir()
+    assert first == real_home / "run-coordinator"
+
+    linked_home.unlink()
+    linked_home.symlink_to(replacement_home, target_is_directory=True)
+    anchor_mod._clear_run_coordinator_anchor_cache()
+
+    assert anchor_mod.canonical_run_coordinator_dir() == first
+    coordinator = SQLiteRunCoordinator()
+    created = await coordinator.submit(_request())
+
+    assert created.value is not None
+    assert (first / "coordinator.db").exists()
+    assert not (replacement_home / "run-coordinator" / "coordinator.db").exists()
+
+
+def test_default_real_home_needs_no_external_anchor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ordinary default path stays inside Kiro's protected data home."""
+    data_home = tmp_path / ".kiro" / "crew"
+    data_home.mkdir(parents=True)
+    anchor_home = tmp_path / "operator-home"
+    anchor_home.mkdir()
+    monkeypatch.delenv("KIROCREW_HOME", raising=False)
+    monkeypatch.setattr(anchor_mod, "data_home", lambda: data_home)
+    monkeypatch.setattr(anchor_mod, "_anchor_home", lambda: anchor_home)
+    anchor_mod._clear_run_coordinator_anchor_cache()
+
+    assert anchor_mod.canonical_run_coordinator_dir() == data_home / "run-coordinator"
+    assert not anchor_mod.run_coordinator_anchor_dir().exists()
 
 
 async def _claimed_running(
@@ -209,6 +289,301 @@ async def test_submit_rejects_control_commands_until_target_semantics_exist(
     assert result.reason is CoordinatorReason.UNSUPPORTED_OPERATION
     assert result.value is None
     assert await coordinator.get_run("run-1") is None
+
+
+@pytest.mark.asyncio
+async def test_control_submission_is_idempotent_and_queryable_without_mutating_run(
+    coordinator: RunCoordinator,
+) -> None:
+    created_run = await coordinator.submit(_request())
+    assert created_run.value is not None
+    before = created_run.value.run
+    request = SubmitControl(
+        command_id="control-1",
+        idempotency_key="control-key-1",
+        run_id="run-1",
+        operation=CommandOperation.STEER,
+        payload_hash="control-hash-1",
+        payload_json='{"message":"focus"}',
+    )
+
+    created = await coordinator.submit_control(request)
+    replay = await coordinator.submit_control(request)
+    conflict = await coordinator.submit_control(replace(request, payload_hash="different"))
+    queried = await coordinator.get_command_by_key("control-key-1")
+
+    assert created.decision is CoordinatorDecision.APPLIED
+    assert created.value is not None
+    assert created.value.created is True
+    assert created.value.command.status is CommandStatus.PENDING
+    assert replay.decision is CoordinatorDecision.UNCHANGED
+    assert replay.value is not None
+    assert replay.value.created is False
+    assert replay.value.command == created.value.command
+    assert conflict.reason is CoordinatorReason.IDEMPOTENCY_CONFLICT
+    assert queried == replay.value
+    assert await coordinator.get_run("run-1") == before
+
+
+@pytest.mark.asyncio
+async def test_rejected_control_is_sticky_never_claimed_and_does_not_terminal_run(
+    coordinator: RunCoordinator,
+    clock: FakeClock,
+) -> None:
+    created_run = await coordinator.submit(_request())
+    assert created_run.value is not None
+    before = created_run.value.run
+    request = SubmitControl(
+        command_id="control-1",
+        idempotency_key="control-key-1",
+        run_id="run-1",
+        operation=CommandOperation.CANCEL,
+        payload_hash="control-hash-1",
+        accepted=False,
+        rejection_reason="not authorized",
+    )
+
+    rejected = await coordinator.submit_control(request)
+    replay = await coordinator.submit_control(request)
+
+    assert rejected.reason is CoordinatorReason.ADMISSION_REJECTED
+    assert rejected.value is not None
+    assert rejected.value.command.status is CommandStatus.REJECTED
+    assert replay.value is not None
+    assert replay.value.command.status is CommandStatus.REJECTED
+    assert await coordinator.get_run("run-1") == before
+    assert (
+        await coordinator.claim_controls(OwnerLease("controller", clock.value + 10), limit=1) == []
+    )
+
+
+@pytest.mark.asyncio
+async def test_control_for_legacy_target_does_not_require_coordinator_run(
+    coordinator: RunCoordinator,
+    clock: FakeClock,
+) -> None:
+    submitted = await coordinator.submit_control(
+        SubmitControl(
+            command_id="control-legacy",
+            idempotency_key="control-key-legacy",
+            run_id="legacy-run",
+            operation=CommandOperation.STEER,
+            payload_hash="control-hash-legacy",
+        )
+    )
+    claim = (await coordinator.claim_controls(OwnerLease("controller", clock.value + 10), limit=1))[
+        0
+    ]
+
+    assert submitted.value is not None
+    assert submitted.value.run is None
+    assert claim.run is None
+    assert claim.fence is None
+
+
+@pytest.mark.asyncio
+async def test_control_claim_epoch_is_independent_from_execution_lease(
+    coordinator: RunCoordinator,
+    clock: FakeClock,
+) -> None:
+    await coordinator.submit(_request())
+    execution = (
+        await coordinator.claim_commands(OwnerLease("executor", clock.value + 100), limit=1)
+    )[0]
+    await coordinator.submit_control(
+        SubmitControl(
+            command_id="control-1",
+            idempotency_key="control-key-1",
+            run_id="run-1",
+            operation=CommandOperation.CANCEL,
+            payload_hash="control-hash-1",
+        )
+    )
+    run_before = await coordinator.get_run("run-1")
+
+    first = (
+        await coordinator.claim_controls(OwnerLease("controller-1", clock.value + 5), limit=1)
+    )[0]
+    assert first.fence is None
+    assert first.command_fence == CommandFence("control-1", "controller-1", 1)
+    assert await coordinator.get_run("run-1") == run_before
+
+    clock.value += 6
+    second = (
+        await coordinator.claim_controls(OwnerLease("controller-2", clock.value + 5), limit=1)
+    )[0]
+    stale = await coordinator.finish_control(first.command_fence, CommandStatus.APPLIED)
+    applied = await coordinator.finish_control(
+        second.command_fence,
+        CommandStatus.APPLIED,
+        "",
+        '{"cancelled":true}',
+    )
+
+    assert execution.fence is not None
+    assert second.command_fence.claim_epoch == first.command_fence.claim_epoch + 1
+    assert stale.reason is CoordinatorReason.STALE_FENCE
+    assert applied.decision is CoordinatorDecision.APPLIED
+    assert applied.value is not None
+    assert applied.value.result_json == '{"cancelled":true}'
+    assert await coordinator.get_run("run-1") == run_before
+
+
+@pytest.mark.asyncio
+async def test_control_claim_can_finish_after_deadline_until_it_is_superseded(
+    coordinator: RunCoordinator,
+    clock: FakeClock,
+) -> None:
+    await coordinator.submit_control(
+        SubmitControl(
+            command_id="slow-control",
+            idempotency_key="slow-control-key",
+            run_id="legacy-run",
+            operation=CommandOperation.CANCEL,
+            payload_hash="slow-control-hash",
+        )
+    )
+    claim = (
+        await coordinator.claim_controls(
+            OwnerLease("controller", clock.value + 5),
+            limit=1,
+        )
+    )[0]
+    clock.value += 6
+
+    finished = await coordinator.finish_control(
+        claim.command_fence,
+        CommandStatus.APPLIED,
+        result_json="true",
+    )
+
+    assert finished.decision is CoordinatorDecision.APPLIED
+    assert finished.value is not None
+    assert finished.value.result_json == "true"
+
+
+@pytest.mark.asyncio
+async def test_control_claim_can_target_one_command_and_finish_rejection(
+    coordinator: RunCoordinator,
+    clock: FakeClock,
+) -> None:
+    await coordinator.submit(_request())
+    for index, operation in enumerate((CommandOperation.STEER, CommandOperation.RELEASE), start=1):
+        await coordinator.submit_control(
+            SubmitControl(
+                command_id=f"control-{index}",
+                idempotency_key=f"control-key-{index}",
+                run_id="run-1",
+                operation=operation,
+                payload_hash=f"control-hash-{index}",
+            )
+        )
+
+    claims = await coordinator.claim_controls(
+        OwnerLease("controller", clock.value + 10),
+        limit=2,
+        command_id="control-2",
+    )
+    assert [claim.command.command_id for claim in claims] == ["control-2"]
+    rejected = await coordinator.finish_control(
+        claims[0].command_fence,
+        CommandStatus.REJECTED,
+        "conversation busy",
+        '{"ok":false}',
+    )
+    queried = await coordinator.get_command_by_key("control-key-2")
+
+    assert rejected.decision is CoordinatorDecision.APPLIED
+    assert rejected.value is not None
+    assert rejected.value.status is CommandStatus.REJECTED
+    assert rejected.value.rejection_reason == "conversation busy"
+    assert queried is not None
+    assert queried.command == rejected.value
+    remaining = await coordinator.claim_controls(
+        OwnerLease("controller", clock.value + 10), limit=2
+    )
+    assert [claim.command.command_id for claim in remaining] == ["control-1"]
+
+
+@pytest.mark.asyncio
+async def test_exact_execution_command_claim_and_finish_are_idempotent(
+    coordinator: RunCoordinator,
+    clock: FakeClock,
+) -> None:
+    await coordinator.submit(_request())
+    before = await coordinator.get_run("run-1")
+
+    claim = await coordinator.claim_command("command-1", OwnerLease("admission", clock.value + 10))
+    duplicate_claim = await coordinator.claim_command(
+        "command-1", OwnerLease("other", clock.value + 10)
+    )
+    assert claim is not None
+    assert claim.fence is not None
+    assert claim.run is not None
+    assert claim.run.owner_id == "admission"
+    assert claim.fence.lease_epoch == claim.run.lease_epoch
+    assert duplicate_claim is None
+    leased = await coordinator.get_run("run-1")
+    assert leased is not None
+    assert before is not None
+    assert leased.version == before.version
+    assert leased.lease_epoch == before.lease_epoch + 1
+
+    applied = await coordinator.finish_command(
+        claim.command_fence,
+        CommandStatus.APPLIED,
+        "",
+        '{"id":"run-1","queued":false}',
+    )
+    replay = await coordinator.finish_command(
+        claim.command_fence,
+        CommandStatus.APPLIED,
+        "",
+        '{"id":"run-1","queued":false}',
+    )
+    conflicting_replay = await coordinator.finish_command(
+        claim.command_fence,
+        CommandStatus.REJECTED,
+        "different outcome",
+        '{"error":"different outcome"}',
+    )
+    queried = await coordinator.get_command_by_key("key-1")
+
+    assert applied.decision is CoordinatorDecision.APPLIED
+    assert replay.decision is CoordinatorDecision.UNCHANGED
+    assert conflicting_replay.decision is CoordinatorDecision.REJECTED
+    assert conflicting_replay.reason is CoordinatorReason.OUTCOME_CONFLICT
+    assert queried is not None
+    assert queried.command.status is CommandStatus.APPLIED
+    assert queried.command.result_json == '{"id":"run-1","queued":false}'
+    assert await coordinator.get_run("run-1") == leased
+
+
+@pytest.mark.asyncio
+async def test_execution_rejection_atomically_terminals_created_run(
+    coordinator: RunCoordinator,
+    clock: FakeClock,
+) -> None:
+    await coordinator.submit(_request())
+    claim = await coordinator.claim_command("command-1", OwnerLease("admission", clock.value + 10))
+    assert claim is not None
+
+    rejected = await coordinator.finish_command(
+        claim.command_fence,
+        CommandStatus.REJECTED,
+        "approval denied",
+        '{"error":"approval denied","counted":true}',
+    )
+    run = await coordinator.get_run("run-1")
+
+    assert rejected.decision is CoordinatorDecision.APPLIED
+    assert rejected.value is not None
+    assert rejected.value.status is CommandStatus.REJECTED
+    assert run is not None
+    assert run.observed_state is ObservedState.TERMINAL
+    assert run.outcome is RunOutcome.FAILED
+    assert run.error == "approval denied"
+    assert await coordinator.claim_commands(OwnerLease("executor", clock.value + 10), limit=1) == []
 
 
 @pytest.mark.asyncio

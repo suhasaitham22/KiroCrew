@@ -297,6 +297,47 @@ class TestBuildSeatbeltProfile:
         for guard in guards:
             assert f'(deny file-write* (literal "{guard}"))' in profile
 
+    def test_run_coordinator_ledger_denies_parent_renames(
+        self, monkeypatch, tmp_path
+    ):
+        ledger = tmp_path / "custom-home" / "run-coordinator"
+        monkeypatch.setattr(
+            sandbox_mod, "_run_coordinator_hidden_dir", lambda: str(ledger)
+        )
+
+        profile = _build_seatbelt_profile("standard")
+
+        assert f'(deny file-read* (subpath "{ledger}"))' in profile
+        assert f'(deny file-write* (subpath "{ledger}"))' in profile
+        assert f'(deny file-link (subpath "{ledger}"))' in profile
+        for guard in sandbox_mod._literal_ancestor_guards((str(ledger),)):
+            assert f'(deny file-write* (literal "{guard}"))' in profile
+
+    def test_run_coordinator_anchor_is_hidden_in_every_os_sandbox(
+        self, monkeypatch, tmp_path
+    ):
+        anchor = tmp_path / ".kirocrew.run-coordinator"
+        ledger = tmp_path / "canonical-home" / "run-coordinator"
+        monkeypatch.setattr(
+            sandbox_mod, "run_coordinator_anchor_dir", lambda: anchor
+        )
+        monkeypatch.setattr(
+            sandbox_mod, "_run_coordinator_hidden_dir", lambda: str(ledger)
+        )
+
+        for sandbox_level in ("standard", "cc", "strict"):
+            script = _build_launcher_script(sandbox_level)
+            files = json.loads(
+                re.search(r"SENSITIVE_FILES = (\[.*?\])\n", script, re.S).group(1)
+            )
+            assert str(anchor) in files
+
+        profile = _build_seatbelt_profile("standard")
+        assert f'(deny file-read* (subpath "{anchor}"))' in profile
+        assert f'(deny file-write* (subpath "{anchor}"))' in profile
+        assert f'(deny file-link (subpath "{anchor}"))' in profile
+        assert f'(deny file-write* (literal "{anchor}"))' in profile
+
     def test_delegated_macos_agent_workspace_cannot_reach_voice_runtime(
         self, monkeypatch, tmp_path
     ):
@@ -783,6 +824,23 @@ class TestBuildSeatbeltProfile:
         for f in _CC_FILES:
             assert os.path.join(home, f) in profile
 
+    @pytest.mark.parametrize("sandbox_level", ("standard", "cc", "strict"))
+    def test_custom_data_home_coordinator_is_fully_denied(
+        self, tmp_path, monkeypatch, sandbox_level
+    ):
+        custom_home = tmp_path / "custom-crew-home"
+        monkeypatch.setenv("KIROCREW_HOME", str(custom_home))
+
+        profile = _build_seatbelt_profile(
+            sandbox_level,
+            extra_visible_dirs=(str(custom_home / "run-coordinator" / "keep"),),
+        )
+
+        escaped = str(custom_home / "run-coordinator").replace('"', '\\"')
+        assert f'(deny file-read* (subpath "{escaped}"))' in profile
+        assert f'(deny file-write* (subpath "{escaped}"))' in profile
+        assert f'(deny file-link (subpath "{escaped}"))' in profile
+
     def test_cc_mode_skips_aws_dir(self):
         """CC mode does NOT deny .aws as a directory (credential_process needs it)."""
         profile = _build_seatbelt_profile("cc")
@@ -919,6 +977,133 @@ class TestBuildLauncherScript:
         script = _build_launcher_script("standard")
         # Standard dirs don't include .aws
         assert "HIDE_SSH = False" in script
+
+    @pytest.mark.parametrize("sandbox_level", ("standard", "cc", "strict"))
+    @_POSIX_ONLY
+    def test_custom_data_home_coordinator_reaches_both_mask_loops(
+        self, tmp_path, monkeypatch, sandbox_level
+    ):
+        custom_home = tmp_path / "custom-crew-home"
+        monkeypatch.setenv("KIROCREW_HOME", str(custom_home))
+
+        script = _build_launcher_script(
+            sandbox_level,
+            extra_visible_dirs=(str(custom_home / "run-coordinator" / "keep"),),
+        )
+        dirs = json.loads(re.search(r"SENSITIVE_DIRS = (\[.*?\])\n", script, re.S).group(1))
+        files = json.loads(re.search(r"SENSITIVE_FILES = (\[.*?\])\n", script, re.S).group(1))
+        readonly = json.loads(re.search(r"READONLY_DIRS = (\[.*?\])\n", script, re.S).group(1))
+        pinned = json.loads(re.search(r"PINNED_DIRS = (\[.*?\])\n", script, re.S).group(1))
+        coordinator_dir = str(custom_home / "run-coordinator")
+
+        assert coordinator_dir in dirs
+        assert coordinator_dir in files
+        assert str(custom_home) in pinned
+        assert str(custom_home) not in readonly
+        pinned_loop = script.split("for d in PINNED_DIRS:", 1)[1].split(
+            "for d in SENSITIVE_DIRS:", 1
+        )[0]
+        assert "_MS_REMOUNT" not in pinned_loop
+
+    def test_pinned_coordinator_ancestors_keep_data_home_writable(
+        self, tmp_path, monkeypatch
+    ):
+        """Live Linux namespace: app writes work while ancestor renames fail."""
+        if sys.platform != "linux":
+            pytest.skip("sandbox launcher is Linux-only")
+        if not sandbox_mod._probe_unshare():
+            pytest.skip("user+mount namespaces unavailable on this host")
+
+        protected_ancestor = tmp_path / "protected-ancestor"
+        custom_home = protected_ancestor / "crew"
+        ledger = custom_home / "run-coordinator"
+        app_data = custom_home / "apps" / "example" / "data"
+        ledger.mkdir(parents=True)
+        app_data.mkdir(parents=True)
+        state_file = app_data / "state.json"
+        moved_ancestor = tmp_path / "moved-ancestor"
+        monkeypatch.setenv("KIROCREW_HOME", str(custom_home))
+
+        probe = tmp_path / "probe.py"
+        probe.write_text(
+            "from pathlib import Path\n"
+            "import os\n"
+            f"Path({str(state_file)!r}).write_text('ok', encoding='utf-8')\n"
+            "try:\n"
+            f"    os.rename({str(protected_ancestor)!r}, {str(moved_ancestor)!r})\n"
+            "except OSError as exc:\n"
+            "    print(f'RENAME_ERRNO_{exc.errno}')\n"
+            "else:\n"
+            "    print('RENAME_ALLOWED')\n",
+            encoding="utf-8",
+        )
+        launcher = tmp_path / "launcher.py"
+        launcher.write_text(_build_launcher_script("standard"), encoding="utf-8")
+
+        result = subprocess.run(
+            [sys.executable, str(launcher), sys.executable, str(probe)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=60,
+            cwd=tmp_path,
+        )
+        if "unshare(NEWUSER) failed" in result.stderr or "unshare(NEWNS) failed" in result.stderr:
+            pytest.skip("namespaces unavailable on this host")
+        assert result.returncode == 0, result.stderr
+        assert "RENAME_ERRNO_16" in result.stdout, result.stdout
+        assert state_file.read_text(encoding="utf-8") == "ok"
+
+    def test_linked_data_home_masks_and_pins_the_canonical_path(
+        self, tmp_path, monkeypatch
+    ):
+        """Live Linux namespace: aliases retain writes without exposing the ledger."""
+        if sys.platform != "linux":
+            pytest.skip("sandbox launcher is Linux-only")
+        if not sandbox_mod._probe_unshare():
+            pytest.skip("user+mount namespaces unavailable on this host")
+
+        protected_ancestor = tmp_path / "canonical-ancestor"
+        real_home = protected_ancestor / "crew"
+        ledger = real_home / "run-coordinator"
+        app_data = real_home / "apps" / "example" / "data"
+        ledger.mkdir(parents=True)
+        app_data.mkdir(parents=True)
+        linked_home = tmp_path / "linked-crew-home"
+        linked_home.symlink_to(real_home, target_is_directory=True)
+        state_file = linked_home / "apps" / "example" / "data" / "state.json"
+        moved_ancestor = tmp_path / "moved-canonical-ancestor"
+        monkeypatch.setenv("KIROCREW_HOME", str(linked_home))
+
+        probe = tmp_path / "linked-probe.py"
+        probe.write_text(
+            "from pathlib import Path\n"
+            "import os\n"
+            f"Path({str(state_file)!r}).write_text('ok', encoding='utf-8')\n"
+            "try:\n"
+            f"    os.rename({str(protected_ancestor)!r}, {str(moved_ancestor)!r})\n"
+            "except OSError as exc:\n"
+            "    print(f'RENAME_ERRNO_{exc.errno}')\n"
+            "else:\n"
+            "    print('RENAME_ALLOWED')\n",
+            encoding="utf-8",
+        )
+        launcher = tmp_path / "linked-launcher.py"
+        launcher.write_text(_build_launcher_script("standard"), encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, str(launcher), sys.executable, str(probe)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=60,
+            cwd=tmp_path,
+        )
+
+        if "unshare(NEWUSER) failed" in result.stderr or "unshare(NEWNS) failed" in result.stderr:
+            pytest.skip("namespaces unavailable on this host")
+        assert result.returncode == 0, result.stderr
+        assert "RENAME_ERRNO_16" in result.stdout, result.stdout
+        assert state_file.read_text(encoding="utf-8") == "ok"
 
     @_POSIX_ONLY
     def test_auth_staging_is_hidden_except_for_trusted_auth_spawn(self):
@@ -1470,6 +1655,71 @@ class TestSandboxExecArgv:
 
 @_POSIX_ONLY
 class TestNamespaceArgv:
+    @patch("kiro_crew.sandbox._resolve_agent_executable", return_value="/bin/true")
+    def test_prepares_owner_only_ledger_before_building_launcher(
+        self, _mock_resolve, tmp_path, monkeypatch
+    ):
+        ledger_dir = tmp_path / "crew" / "run-coordinator"
+        events: list[str] = []
+
+        def make_owner_only_dir(path):
+            assert Path(path) == ledger_dir
+            events.append("create")
+            Path(path).mkdir(parents=True)
+
+        def restrict_dir_to_owner(path):
+            assert Path(path) == ledger_dir
+            assert ledger_dir.is_dir()
+            events.append("restrict")
+
+        def build_launcher(*args, **kwargs):
+            assert ledger_dir.is_dir()
+            events.append("build")
+            return "pass\n"
+
+        monkeypatch.setattr(
+            "kiro_crew.sandbox._run_coordinator_hidden_dir",
+            lambda: str(ledger_dir),
+        )
+        monkeypatch.setattr(
+            "kiro_crew.sandbox.platform_compat.make_owner_only_dir",
+            make_owner_only_dir,
+        )
+        monkeypatch.setattr(
+            "kiro_crew.sandbox.platform_compat.restrict_dir_to_owner",
+            restrict_dir_to_owner,
+        )
+        monkeypatch.setattr("kiro_crew.sandbox._build_launcher_script", build_launcher)
+        monkeypatch.setattr("kiro_crew.sandbox._ensure_run_dir", lambda: str(tmp_path))
+
+        result = namespace_argv(["/bin/true"], "strict")
+        try:
+            assert events == ["create", "restrict", "build"]
+        finally:
+            os.unlink(result[3])
+
+    @patch("kiro_crew.sandbox._resolve_agent_executable", return_value="/bin/true")
+    def test_ledger_lockdown_failure_prevents_launcher_build(
+        self, _mock_resolve, tmp_path, monkeypatch
+    ):
+        ledger_dir = tmp_path / "crew" / "run-coordinator"
+        mock_build = MagicMock()
+
+        monkeypatch.setattr(
+            "kiro_crew.sandbox._run_coordinator_hidden_dir",
+            lambda: str(ledger_dir),
+        )
+        monkeypatch.setattr(
+            "kiro_crew.sandbox.platform_compat.restrict_dir_to_owner",
+            MagicMock(side_effect=OSError("lockdown failed")),
+        )
+        monkeypatch.setattr("kiro_crew.sandbox._build_launcher_script", mock_build)
+
+        with pytest.raises(OSError, match="lockdown failed"):
+            namespace_argv(["/bin/true"], "strict")
+
+        mock_build.assert_not_called()
+
     @patch("kiro_crew.sandbox._resolve_agent_executable", return_value="/usr/local/bin/kiro-cli")
     def test_wraps_with_python_launcher(self, mock_resolve):
         result = namespace_argv(["kiro-cli", "acp"], "strict")
@@ -2764,7 +3014,38 @@ class TestKiroInternalSandboxExclusion:
         if content is not None:
             p.write_text(content)
         monkeypatch.setattr("kiro_crew.sandbox._KIRO_INTERNAL_SETTINGS_PATH", str(p))
+        monkeypatch.setattr(
+            "kiro_crew.sandbox._run_coordinator_hidden_dir",
+            lambda: str(Path.home() / ".kiro" / "crew" / "run-coordinator"),
+        )
         return p
+
+    def test_default_ledger_alias_fails_closed_without_filesystem_io(self, monkeypatch):
+        """A distinct spelling disables delegation without probing filesystem identity."""
+        default_dir = os.path.abspath(
+            Path.home() / ".kiro" / "crew" / "run-coordinator"
+        )
+        equivalent_dir = default_dir.replace("/.kiro/", "/.KIRO/")
+        monkeypatch.setattr(
+            "kiro_crew.sandbox._run_coordinator_hidden_dir",
+            lambda: equivalent_dir,
+        )
+
+        with patch(
+            "kiro_crew.sandbox.os.path.samefile",
+            side_effect=AssertionError("spawn path must not perform filesystem I/O"),
+        ):
+            assert sandbox_mod._run_coordinator_uses_custom_home() is True
+
+    def test_distinct_ledger_path_fails_closed(self, tmp_path, monkeypatch):
+        """A distinct normalized path must not grant Kiro delegation."""
+        custom_dir = os.path.abspath(tmp_path / "run-coordinator")
+        monkeypatch.setattr(
+            "kiro_crew.sandbox._run_coordinator_hidden_dir",
+            lambda: custom_dir,
+        )
+
+        assert sandbox_mod._run_coordinator_uses_custom_home() is True
 
     # --- kiro_internal_sandbox_enabled() helper ---
 
@@ -2812,6 +3093,42 @@ class TestKiroInternalSandboxExclusion:
         # Delegation decided before backend detection (covers backend=none too)
         mock_detect.assert_not_called()
 
+    def test_darwin_default_home_needs_no_separate_anchor_contract(
+        self, tmp_path, monkeypatch
+    ):
+        """The default ledger remains within Kiro's protected data home."""
+        self._write_settings(tmp_path, monkeypatch, '{"sandbox": true}')
+        monkeypatch.setattr("kiro_crew.sandbox.sys.platform", "darwin")
+
+        with (
+            patch("kiro_crew.sel.sel", return_value=MagicMock()),
+            patch("kiro_crew.sandbox.detect_backend") as mock_detect,
+        ):
+            argv, cleanup = wrap_argv(["kiro-cli", "acp"], mode="auto")
+
+        assert argv[-2:] == ["kiro-cli", "acp"]
+        assert cleanup is None
+        mock_detect.assert_not_called()
+
+    def test_verified_nested_macos_sandbox_precedes_delegation_conflicts(
+        self, tmp_path, monkeypatch
+    ):
+        """An existing Crew sandbox already protects relocated coordinator state."""
+        self._write_settings(tmp_path, monkeypatch, '{"sandbox": true}')
+        monkeypatch.setattr("kiro_crew.sandbox.sys.platform", "darwin")
+        monkeypatch.setattr("kiro_crew.sandbox._inside_kirocrew_sandbox", lambda: True)
+        monkeypatch.setattr("kiro_crew.sandbox._macos_sandbox_state", lambda: True)
+        monkeypatch.setattr(
+            "kiro_crew.sandbox._run_coordinator_uses_custom_home", lambda: True
+        )
+
+        with patch("kiro_crew.sandbox.detect_backend") as mock_detect:
+            argv, cleanup = wrap_argv(["kiro-cli", "acp"], mode="auto")
+
+        assert argv == ["kiro-cli", "acp"]
+        assert cleanup is None
+        mock_detect.assert_not_called()
+
     def test_darwin_explicit_kiro_classification_delegates_nonstandard_path(
         self,
         tmp_path,
@@ -2844,6 +3161,34 @@ class TestKiroInternalSandboxExclusion:
         assert os.path.basename(argv[0]) == "env"
         assert "-u" in argv
         assert "AWS_SECRET_ACCESS_KEY" in argv
+
+    @pytest.mark.parametrize("mode", ["auto", "off"])
+    def test_darwin_custom_data_home_refuses_nested_sandbox_owners(
+        self, tmp_path, monkeypatch, mode
+    ):
+        self._write_settings(tmp_path, monkeypatch, '{"sandbox": true}')
+        custom_ledger = tmp_path / "custom-crew-home" / "run-coordinator"
+        monkeypatch.setattr(
+            "kiro_crew.sandbox._run_coordinator_hidden_dir",
+            lambda: str(custom_ledger),
+        )
+        monkeypatch.setattr(
+            "kiro_crew.sandbox._run_coordinator_uses_custom_home",
+            lambda: True,
+        )
+        monkeypatch.setattr("kiro_crew.sandbox.sys.platform", "darwin")
+
+        with (
+            patch("kiro_crew.sel.sel", return_value=MagicMock()),
+            patch("kiro_crew.sandbox.sandbox_exec_argv") as mock_sb,
+            pytest.raises(sandbox_mod.SandboxUnavailableError) as caught,
+        ):
+            wrap_argv(["kiro-cli", "acp"], mode=mode)
+
+        assert caught.value.kind == "foreign_sandbox"
+        assert "KIROCREW_HOME" in str(caught.value)
+        assert str(custom_ledger) in caught.value.detail
+        mock_sb.assert_not_called()
 
     def test_darwin_non_kiro_spawn_stays_wrapped(self, tmp_path, monkeypatch):
         """Non-kiro spawns have no internal sandbox — seatbelt stays on."""
@@ -2895,6 +3240,10 @@ class TestKiroInternalSandboxExclusion:
     def test_windows_explicit_kiro_backend_delegates_before_backend_probe(self, monkeypatch):
         """Fresh Windows installs use the positively identified Kiro sandbox."""
         monkeypatch.setattr("kiro_crew.sandbox.sys.platform", "win32")
+        monkeypatch.setattr(
+            "kiro_crew.sandbox._run_coordinator_uses_custom_home",
+            lambda: False,
+        )
         launch = r"C:\Program Files\Kiro\kiro-cli.exe"
         with (
             patch("kiro_crew.sel.sel", return_value=MagicMock()),
@@ -2912,6 +3261,59 @@ class TestKiroInternalSandboxExclusion:
             )
         assert argv == [launch, "acp"]
         assert cleanup is None
+        mock_detect.assert_not_called()
+
+    def test_windows_default_home_needs_no_separate_anchor_contract(self, monkeypatch):
+        """The ordinary Windows ledger is covered by Kiro's data-home sandbox."""
+        monkeypatch.setattr("kiro_crew.sandbox.sys.platform", "win32")
+        monkeypatch.setattr(
+            "kiro_crew.sandbox._run_coordinator_uses_custom_home",
+            lambda: False,
+        )
+
+        with (
+            patch("kiro_crew.sel.sel", return_value=MagicMock()),
+            patch("kiro_crew.sandbox.detect_backend") as mock_detect,
+        ):
+            argv, cleanup = wrap_argv(
+                [r"C:\Program Files\Kiro\kiro-cli.exe", "acp"],
+                mode="auto",
+                is_kiro_cli=True,
+            )
+
+        assert argv == [r"C:\Program Files\Kiro\kiro-cli.exe", "acp"]
+        assert cleanup is None
+        mock_detect.assert_not_called()
+
+    def test_windows_custom_data_home_refuses_kiro_delegation(
+        self, tmp_path, monkeypatch
+    ):
+        """A delegated Windows sandbox must not expose a relocated ledger."""
+        custom_ledger = tmp_path / "custom-crew-home" / "run-coordinator"
+        monkeypatch.setattr("kiro_crew.sandbox.sys.platform", "win32")
+        monkeypatch.setattr(
+            "kiro_crew.sandbox._run_coordinator_hidden_dir",
+            lambda: str(custom_ledger),
+        )
+        monkeypatch.setattr(
+            "kiro_crew.sandbox._run_coordinator_uses_custom_home",
+            lambda: True,
+        )
+
+        with (
+            patch("kiro_crew.sel.sel", return_value=MagicMock()),
+            patch("kiro_crew.sandbox.detect_backend") as mock_detect,
+            pytest.raises(sandbox_mod.SandboxUnavailableError) as caught,
+        ):
+            wrap_argv(
+                [r"C:\Program Files\Kiro\kiro-cli.exe", "acp"],
+                mode="auto",
+                is_kiro_cli=True,
+            )
+
+        assert caught.value.kind == "foreign_sandbox"
+        assert "KIROCREW_HOME" in str(caught.value)
+        assert str(custom_ledger) in caught.value.detail
         mock_detect.assert_not_called()
 
     @pytest.mark.parametrize("classification", [None, False])
@@ -2933,6 +3335,10 @@ class TestKiroInternalSandboxExclusion:
     def test_windows_kiro_with_extra_path_policy_fails_closed(self, monkeypatch):
         """Delegation cannot silently discard Crew-specific path restrictions."""
         monkeypatch.setattr("kiro_crew.sandbox.sys.platform", "win32")
+        monkeypatch.setattr(
+            "kiro_crew.sandbox._run_coordinator_uses_custom_home",
+            lambda: False,
+        )
         monkeypatch.setattr("kiro_crew.sandbox._allow_unsandboxed_exec", lambda: False)
         with (
             patch("kiro_crew.sandbox.detect_backend", return_value="none"),
@@ -2949,6 +3355,10 @@ class TestKiroInternalSandboxExclusion:
     def test_windows_sel_failure_refuses_delegation(self, monkeypatch):
         """An unaudited Windows delegation falls through to fail-closed policy."""
         monkeypatch.setattr("kiro_crew.sandbox.sys.platform", "win32")
+        monkeypatch.setattr(
+            "kiro_crew.sandbox._run_coordinator_uses_custom_home",
+            lambda: False,
+        )
         monkeypatch.setattr("kiro_crew.sandbox._allow_unsandboxed_exec", lambda: False)
         with (
             patch("kiro_crew.sel.sel", side_effect=RuntimeError("audit down")),

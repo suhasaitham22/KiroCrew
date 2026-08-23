@@ -5273,6 +5273,10 @@ _SENSITIVE_HOME_DIRS: list[str] = [
     # isolate another process running as the same UID, so every agent sandbox
     # and the shared read/write hook floor hide this fixed parent.
     ".kiro/crew-auth-staging",
+    # Canonical run-coordinator path records live outside a possibly symlinked
+    # data home so a later gateway process cannot be redirected to forged state.
+    # The gateway reads them directly; agents must neither read nor replace them.
+    ".kirocrew.run-coordinator",
     ".aws",
     ".ssh",
     ".gnupg",
