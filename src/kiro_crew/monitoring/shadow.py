@@ -69,13 +69,16 @@ async def run_shadow_probe(
     staged.last_probe_at = now
     staged.last_decision = decision
     staged.next_probe_at = now + staged.cadence_secs
-    if result.observation.status is MonitorObservationStatus.PROVIDER_ERROR:
+    observation = result.observation
+    staged.last_observation_status = observation.status
+    staged.last_observation_reason_code = observation.reason_code
+    if observation.status is MonitorObservationStatus.PROVIDER_ERROR:
         staged.provider_error_count += 1
         staged.consecutive_provider_errors += 1
-        staged.last_provider_error = result.observation.provider_error
+        staged.last_provider_error = observation.provider_error
     else:
         staged.last_observation = deepcopy(result.canonical)
-        staged.last_fingerprint = result.observation.fingerprint
+        staged.last_fingerprint = observation.fingerprint
         staged.last_observed_at = now
         staged.consecutive_provider_errors = 0
         staged.last_provider_error = None

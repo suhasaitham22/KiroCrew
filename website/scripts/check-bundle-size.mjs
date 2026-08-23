@@ -43,13 +43,10 @@ export const CHUNK_BUDGETS = {
   // ceiling catches is a NEW library or surface landing in the catalog chunk.
   // The built-in App Store guidance adds one use-case and one configuration
   // string for each of 23 apps across all 12 shipped catalogs. The Dev Fleet
-  // closed-PR prune group and the expanded Disconnect guidance are the largest
-  // recent catalog increments included in this measurement; Dev Fleet's
-  // per-pod system readout then adds its own strings across the same 12
-  // catalogs on top of that baseline. The Drive gallery's keys across 13
-  // catalogs ride inside the headroom that measurement already left, so this
-  // branch does not move the ceiling.
-  all: 10490 * KB, // measured 9985 KB before the pod-system catalog keys (~5% headroom)
+  // closed-PR prune group, expanded Disconnect guidance, per-pod system readout,
+  // Drive gallery, and structured-monitor form all add strings across those
+  // same catalogs.
+  all: 10990 * KB, // combined catalog surfaces with ~5% headroom; re-measure after build
 
   // The i18n RUNTIME — the i18next singleton, `initI18n`, the English catalog —
   // named after `src/i18n/t.ts`. Held separately from `all` above because
@@ -60,7 +57,8 @@ export const CHUNK_BUDGETS = {
   // Re-measured 2026-08-27 at 702 KB: the previous `measured 641 KB` note was
   // ~60 KB stale, which left main sitting a few hundred bytes under its own
   // ceiling, so any PR adding an English string tripped this gate rather than
-  // the new library or surface it exists to catch.
+  // the new library or surface it exists to catch. This measurement includes
+  // the structured-monitor form's labels and provider guidance.
   t: 740 * KB, // measured 702 KB
 
   // Pierre editor implementation (PR #4072 replaced Monaco, whose
