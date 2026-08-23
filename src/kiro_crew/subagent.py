@@ -2341,6 +2341,27 @@ class SubagentManager:
     async def announce_durable_rejection(self, info: SubagentInfo | AdmittedExecution) -> None:
         return await self._admission.announce_durable_rejection_impl(info)
 
+    def prepare_coordinator_rejection(
+        self,
+        run_id: str,
+        *,
+        batch_id: str = "",
+        batch_total: int = 0,
+    ) -> None:
+        """Prepare live delivery before a rejection event becomes claimable."""
+
+        for task_key in (f"reject-{run_id}", run_id):
+            report_task = self._tasks.pop(task_key, None)
+            if report_task is not None:
+                report_task.cancel()
+        if batch_id:
+            self._outbox_live_run_batches[run_id] = (batch_id, batch_total)
+
+    async def deliver_coordinator_event(self, event_id: str) -> None:
+        """Route one already-durable completion through the fenced outbox."""
+
+        await self._outbox_delivery.drain_once(event_id=event_id)
+
     def _rollback_unstarted_registration(
         self,
         info: SubagentInfo,

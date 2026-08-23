@@ -355,12 +355,15 @@ class TerminalCoordinator(ManagerComponent):
                     settle_digest=True,
                     teardown_done=None,
                 )
+            else:
+                self._manager._outbox_live_run_batches.pop(event.run_id, None)
             self._manager._outbox_contexts[event.event_id] = context
         info = context.info
         info._delivery_event_id = event.event_id
         # A deferred destination already accepted this stable event into its
-        # own queue or digest. Background retries keep its durable identity
-        # pending for acknowledgement without repeating routing or accounting.
+        # own queue or digest. Exact claims remain available to the eventual
+        # consumer for acknowledgement, but a background drain must not replay
+        # lifecycle callbacks or count the same wave member twice.
         if info._digest_held or info._delivery_queued:
             return False
         info._delivery_failed = False
