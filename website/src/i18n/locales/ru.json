@@ -8200,7 +8200,9 @@
       "updating": "Обновление…",
       "v": "v",
       "v_2": "· v",
-      "websocket_events": "События WebSocket"
+      "websocket_events": "События WebSocket",
+      "all_contributors": "Все контрибьюторы",
+      "contributors": "Контрибьюторы"
     },
     "appPage": {
       "loading_app": "Загрузка приложения…"

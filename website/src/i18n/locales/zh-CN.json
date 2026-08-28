@@ -7876,7 +7876,9 @@
       "updating": "正在更新…",
       "v": "v",
       "v_2": "· v",
-      "websocket_events": "WebSocket 事件"
+      "websocket_events": "WebSocket 事件",
+      "all_contributors": "所有贡献者",
+      "contributors": "贡献者"
     },
     "appPage": {
       "loading_app": "加载应用…"

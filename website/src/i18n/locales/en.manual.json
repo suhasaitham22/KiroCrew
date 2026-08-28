@@ -2739,6 +2739,8 @@
     },
     "appDetailPage": {
       "app_not_found_2": "App \"{{name}}\" not found",
+      "all_contributors": "All contributors",
+      "contributors": "Contributors",
       "disabled": "Disabled",
       "doesnt_exist": "\"{{name}}\" doesn't exist",
       "enabled": "Enabled",

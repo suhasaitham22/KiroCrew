@@ -7984,7 +7984,9 @@
       "updating": "আপডেট হচ্ছে…",
       "v": "v",
       "v_2": "· v",
-      "websocket_events": "WebSocket ইভেন্ট"
+      "websocket_events": "WebSocket ইভেন্ট",
+      "all_contributors": "সব অবদানকারী",
+      "contributors": "অবদানকারী"
     },
     "appPage": {
       "loading_app": "অ্যাপ লোড হচ্ছে…"

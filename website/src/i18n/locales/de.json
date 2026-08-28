@@ -7984,7 +7984,9 @@
       "updating": "Wird aktualisiert…",
       "v": "v",
       "v_2": "· v",
-      "websocket_events": "WebSocket-Ereignisse"
+      "websocket_events": "WebSocket-Ereignisse",
+      "all_contributors": "Alle Mitwirkenden",
+      "contributors": "Mitwirkende"
     },
     "appPage": {
       "loading_app": "App wird geladen…"

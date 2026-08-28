@@ -7876,7 +7876,9 @@
       "updating": "更新中…",
       "v": "v",
       "v_2": "· v",
-      "websocket_events": "WebSocket イベント"
+      "websocket_events": "WebSocket イベント",
+      "all_contributors": "すべての貢献者",
+      "contributors": "貢献者"
     },
     "appPage": {
       "loading_app": "アプリを読み込み中…"
