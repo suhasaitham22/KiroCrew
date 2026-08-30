@@ -1017,6 +1017,8 @@ class TestSlotWorkspace:
     @pytest.mark.asyncio
     async def test_switch_resets_the_session_and_repoints_the_project(self):
         slot = _ChatSlot("s1")
+        slot.project_id = "018f4f4a-760f-7a8b-a5d4-5a7e0f130d4e"
+        slot._project_brief = "stale Project instructions"
         state = _state(slot)
         with patch(f"{MOD}._reset_slot_session", new=AsyncMock()) as reset:
             with patch(f"{MOD}.default_project_dir", return_value="/tmp/ws-other"):
@@ -1025,6 +1027,8 @@ class TestSlotWorkspace:
         assert (status, body) == (200, {"ok": True, "workspace": "other"})
         assert slot.workspace == "other"
         assert slot.project == "/tmp/ws-other"
+        assert slot.project_id == ""
+        assert slot._project_brief == ""
         reset.assert_awaited_once()
         assert reset.await_args.args[2] == "dashboard:s1"
         state.push_slots_update.assert_called_once()

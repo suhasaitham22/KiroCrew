@@ -2935,6 +2935,8 @@ class _ChatSlot:
         "mode",
         "workspace",
         "project",
+        "project_id",
+        "_project_brief",
         "created_at",
         "messages",
         "total_messages",
@@ -3108,6 +3110,8 @@ class _ChatSlot:
         self.mode = mode
         self.workspace = workspace
         self.project: str = ""
+        self.project_id: str = ""
+        self._project_brief: str = ""
         self.created_at: str = datetime.now(timezone.utc).isoformat()
         self.messages: list[dict[str, Any]] = []
         self._buffers = SlotBufferCoordinator()

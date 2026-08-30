@@ -37,6 +37,8 @@ class TestChatSlotProject:
     @pytest.mark.asyncio
     async def test_set_project(self, tmp_path):
         slot = _ChatSlot("test")
+        slot.project_id = "018f4f4a-760f-7a8b-a5d4-5a7e0f130d4e"
+        slot._project_brief = "stale Project instructions"
         state = _mock_state(slot)
         with patch("kiro_crew.dashboard.chat_handlers._save_recent_project"):
             async with TestClient(TestServer(_make_app(state))) as client:
@@ -49,6 +51,8 @@ class TestChatSlotProject:
                 assert data["ok"] is True
                 assert data["project"] == str(tmp_path)
                 assert slot.project == str(tmp_path)
+                assert slot.project_id == ""
+                assert slot._project_brief == ""
 
     @pytest.mark.asyncio
     async def test_clear_project(self, tmp_path):

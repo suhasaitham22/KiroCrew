@@ -28,6 +28,7 @@ import { queryClient } from './api/queryClient'
 import ErrorBoundary from './components/ErrorBoundary'
 import DashboardBootstrap from './components/DashboardBootstrap'
 import { installPageZoomSuppression } from './utils/pageZoom'
+import { installHistoryLeaveGuard } from './utils/historyLeaveGuard'
 import 'katex/dist/katex.min.css'
 import './index.css'
 import './styles/cli-mode.css'
@@ -47,6 +48,10 @@ initI18n()
 // WebKit, which ignores both for user gestures. Installed before render so the
 // very first pinch is already suppressed. See utils/pageZoom.ts.
 installPageZoomSuppression()
+
+// BrowserRouter installs its POP listener during mount. Register the shared
+// dirty-editor guard first so a cancelled Back action never reaches the router.
+installHistoryLeaveGuard()
 
 // Auto-recover from stale lazy-chunk errors after a frontend rebuild.
 // Vite fires `vite:preloadError` on window when a dynamic import() of a

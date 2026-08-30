@@ -88,6 +88,17 @@ _IDENTITY_UNRESOLVED: tuple[str, str] = ("", "__unresolved__")
 _TITLE_ORIGINS = ("auto", "user")
 
 
+def _canonical_project_id(stored: object) -> str:
+    """Return a canonical persisted Project UUID, or fail closed."""
+    if not isinstance(stored, str):
+        return ""
+    try:
+        canonical = str(uuid.UUID(stored))
+    except (AttributeError, ValueError):
+        return ""
+    return stored if stored == canonical else ""
+
+
 def _rehydrate_title_origin(titled: bool, stored: object) -> str:
     """Resolve a rehydrated slot's title origin from persisted metadata.
 
@@ -963,6 +974,9 @@ def _rehydrate_slot_from_history(
             slot.workspace = meta["workspace"]
         if meta.get("project"):
             slot.project = meta["project"]
+        project_id = _canonical_project_id(meta.get("project_id"))
+        if project_id:
+            slot.project_id = project_id
         if meta.get("mode") and _member_identity is None:
             slot.mode = meta["mode"]
         if meta.get("folder_id"):
@@ -1442,6 +1456,9 @@ def _apply_recent_session(
         slot.workspace = meta["workspace"]
     if meta.get("project"):
         slot.project = meta["project"]
+    project_id = _canonical_project_id(meta.get("project_id"))
+    if project_id:
+        slot.project_id = project_id
     if meta.get("mode") and _member_identity is None:
         slot.mode = meta["mode"]
     if meta.get("folder_id"):
@@ -2686,6 +2703,8 @@ def _save_slot_to_history(
                     fields["workspace"] = slot.workspace
                 if slot.project:
                     fields["project"] = slot.project
+                if slot.project_id:
+                    fields["project_id"] = slot.project_id
                 if slot._app:
                     fields["app"] = slot._app
                 if slot._origin:
@@ -2960,6 +2979,8 @@ def _save_slot_to_history(
                 meta_line["workspace"] = slot.workspace
             if slot.project:
                 meta_line["project"] = slot.project
+            if slot.project_id:
+                meta_line["project_id"] = slot.project_id
             if slot.folder_id:
                 meta_line["folder_id"] = slot.folder_id
             if slot._channel_folder_filed or existing_meta.get("channel_folder_filed"):
