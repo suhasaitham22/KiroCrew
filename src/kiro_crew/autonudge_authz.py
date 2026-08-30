@@ -483,7 +483,11 @@ async def authorize_and_add_nudge(
         authorized_slot = state._slots.get(slot_key)
 
         def _dashboard_admission() -> bool:
-            return slot_key in state._slots and state._slots.get(slot_key) is authorized_slot
+            return (
+                slot_key in state._slots
+                and state._slots.get(slot_key) is authorized_slot
+                and not getattr(authorized_slot, "_closing", False)
+            )
 
         admission_check = _dashboard_admission
     if len(message) > 8000:

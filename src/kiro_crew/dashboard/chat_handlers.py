@@ -3755,6 +3755,10 @@ async def close_slot(
     # closed_at below — the save runs after the cancellation awaits, and
     # stamping save time would make channel activity landing in that window
     # compare as older than the close.
+    # Fence monitor admission for this exact slot generation before retirement:
+    # terminal replacement is otherwise allowed and could commit after this
+    # close observed the already-terminal record, leaving an active orphan.
+    slot._closing = True
     closed_at = note_slot_closed(state, name)
     # Retire the auto-nudge loop BEFORE the awaits below, so no nudge can expire
     # into the session being closed and resurrect it. See
@@ -3769,6 +3773,7 @@ async def close_slot(
         # the same way a failed history save does — the tab stays open and driven,
         # which is a state the user can see and retry, unlike a closed tab that
         # quietly wakes up later.
+        slot._closing = False
         await _restore_slot_nudge_loop(exc.loop, lambda: state.get_slot(name) is slot)
         logger.error("Failed to retire nudge loop for slot %s, close aborted", name)
         _sync_dashboard_slots(state)
@@ -3811,6 +3816,7 @@ async def close_slot(
         if not await notify_slot_closed(slot._app, name):
             # The app could not record the dismissal. Refuse the close rather
             # than leave a worker running behind a tab the user believes is gone.
+            slot._closing = False
             await _restore_slot_nudge_loop(retired_loop, lambda: state.get_slot(name) is slot)
             logger.error("Slot-close hook for app %r failed on %r, close aborted", slot._app, name)
             _sync_dashboard_slots(state)
@@ -3824,6 +3830,7 @@ async def close_slot(
         try:
             late_retired_loop = await _retire_slot_nudge_loop(name)
         except _NudgeRetireFailed as exc:
+            slot._closing = False
             await _restore_slot_nudge_loop(exc.loop, lambda: state.get_slot(name) is slot)
             from kiro_crew.apps.teardown import (
                 notify_slot_close_undone,  # circular: apps.teardown -> apps.bridges
@@ -3854,6 +3861,7 @@ async def close_slot(
         try:
             pre_pop_check()
         except SlotCloseError:
+            slot._closing = False
             await _restore_slot_nudge_loop(retired_loop, lambda: state.get_slot(name) is slot)
             if slot._app:
                 from kiro_crew.apps.teardown import (
@@ -3899,6 +3907,7 @@ async def close_slot(
         # Save failed — restore slot so data isn't lost
         logger.error("Failed to save slot %s to history, restoring", name, exc_info=True)
         state._slots[name] = slot
+        slot._closing = False
         # The close did not happen, so the loop retired for it must come back —
         # a restored session with no clock is an abandoned unattended worker.
         await _restore_slot_nudge_loop(retired_loop, lambda: state.get_slot(name) is slot)

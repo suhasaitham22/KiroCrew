@@ -1644,6 +1644,20 @@ class TestProvisionDependencyInstall:
 
 
 class TestPodEnv:
+    def test_redirects_provider_cli_credentials_into_pod_home(
+        self, cfg: PodConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        host_glab = tmp_path / "host" / ".config" / "glab-cli"
+        host_azure = tmp_path / "host" / ".azure"
+        monkeypatch.setenv("GLAB_CONFIG_DIR", str(host_glab))
+        monkeypatch.setenv("AZURE_CONFIG_DIR", str(host_azure))
+        home = tmp_path / "pod-home"
+
+        env = rt.build_pod_env(cfg, home, 7999, tmp_path / "co")
+
+        assert env["GLAB_CONFIG_DIR"] == str(home / ".config" / "glab-cli")
+        assert env["AZURE_CONFIG_DIR"] == str(home / ".azure")
+
     def test_scrubs_slack_and_nonaws_tokens_keeps_aws(
         self, cfg: PodConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

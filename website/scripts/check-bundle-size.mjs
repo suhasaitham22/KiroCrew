@@ -44,8 +44,8 @@ export const CHUNK_BUDGETS = {
   // The built-in App Store guidance adds one use-case and one configuration
   // string for each of 23 apps across all 12 shipped catalogs. The Dev Fleet
   // closed-PR prune group, expanded Disconnect guidance, per-pod system readout,
-  // Drive gallery, and structured-monitor form all add strings across those
-  // same catalogs.
+  // Drive gallery, structured-monitor form, and source-provider guidance all
+  // add strings across those same catalogs.
   all: 10990 * KB, // combined catalog surfaces with ~5% headroom; re-measure after build
 
   // The i18n RUNTIME — the i18next singleton, `initI18n`, the English catalog —
@@ -54,12 +54,9 @@ export const CHUNK_BUDGETS = {
   // `t()` no longer pull the other twelve catalogs in behind them. Sized for the
   // English catalog plus headroom; a jump here means a non-English catalog, or a
   // library, reached the runtime module.
-  // Re-measured 2026-08-27 at 702 KB: the previous `measured 641 KB` note was
-  // ~60 KB stale, which left main sitting a few hundred bytes under its own
-  // ceiling, so any PR adding an English string tripped this gate rather than
-  // the new library or surface it exists to catch. This measurement includes
-  // the structured-monitor form's labels and provider guidance.
-  t: 740 * KB, // measured 702 KB
+  // Re-measured with the structured-monitor form, source-provider guidance,
+  // Dev Fleet strings, and the other catalog additions named above.
+  t: 775 * KB, // measured 737 KB
 
   // Pierre editor implementation (PR #4072 replaced Monaco, whose
   // 'editor.api2' chunk this entry set used to carry) -- the code-editor

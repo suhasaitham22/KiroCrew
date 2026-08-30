@@ -125,15 +125,23 @@ async def test_nudge_expiring_during_the_persist_cannot_resurrect(tmp_path, monk
 async def test_loop_is_retired_before_the_persist_begins(tmp_path, monkeypatch) -> None:
     """Order, not end state: the retirement must precede the closure persist."""
     state = _state_with_slot(tmp_path)
+    slot = state._slots[NAME]
     svc = await _service(tmp_path, monkeypatch)
     await svc.add(NAME, "check the PR", idle_secs=15)
 
     order: list[str] = []
     svc.subscribe(lambda event, _lp: order.append(f"loop:{event}"))
+    original_retire = handlers._retire_slot_nudge_loop
+
+    async def _retire(slot_key: str):
+        assert slot._closing is True
+        return await original_retire(slot_key)
 
     async def _persist(*_a, **_kw) -> None:
         order.append("persist")
+        assert slot._closing is True
 
+    monkeypatch.setattr(handlers, "_retire_slot_nudge_loop", _retire)
     monkeypatch.setattr(handlers, "save_slot_off_loop", _persist)
     state.sessions.remove = AsyncMock(side_effect=lambda *_a: order.append("session_teardown"))
 
@@ -205,6 +213,7 @@ async def test_failed_persist_gives_the_session_its_clock_back(tmp_path, monkeyp
     assert replacement is not None, "the restored session was left with no clock"
     assert replacement.message == "check the PR"
     assert replacement.idle_secs == 300
+    assert state._slots[NAME]._closing is False
     # Remaining budget, never a fresh one: 3 cycles and 600s are already spent.
     assert replacement.max_cycles == 21
     assert 2900 < replacement.max_runtime_secs <= 3000
