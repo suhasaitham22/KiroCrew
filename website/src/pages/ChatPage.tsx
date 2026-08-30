@@ -8329,7 +8329,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               automationOpen={automationOpen}
               automationCreationReady={automationCreationReady}
               onAutomationChange={(next: AutomationRecord | null) => {
-                if (next) dispatch(sseAutomation(next))
+                if (next) {
+                  queryClient.setQueryData(['session-automation', next.slotKey], next)
+                  dispatch(sseAutomation(next))
+                }
                 else if (automation?.kind === 'legacy_goal_loop') {
                   queryClient.setQueryData(['session-automation', automation.slotKey], null)
                   dispatch(sseAutomation({ ...automation, active: false }))

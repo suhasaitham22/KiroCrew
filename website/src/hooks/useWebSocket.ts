@@ -370,6 +370,18 @@ export function useWebSocket() {
       automationSeedQueuedRef.current = false
       const seedGen = ++automationSeedGenRef.current
       const liveAtStart = new Map(automationLiveGenRef.current)
+      const cacheUpdatesAtStart = new Map<string, number>()
+      for (const [queryKey] of queryClient.getQueriesData<
+        ReturnType<typeof normalizeAutomationRecord>
+      >({ queryKey: ['session-automation'] })) {
+        if (queryKey.length === 2 && typeof queryKey[1] === 'string') {
+          const slotKey = dashboardAutomationSlotKey(queryKey[1])
+          cacheUpdatesAtStart.set(
+            slotKey,
+            queryClient.getQueryState(queryKey)?.dataUpdateCount ?? 0,
+          )
+        }
+      }
       // Fully best-effort, including SYNCHRONOUS failure. This runs early in the
       // connect handler, ahead of notification sync and the subagent subscribe, so
       // an exception escaping here would silently strand those — a cosmetic seed
@@ -422,12 +434,23 @@ export function useWebSocket() {
           const stillFresh = (record: NonNullable<ReturnType<typeof normalizeAutomationRecord>>) =>
             (automationLiveGenRef.current.get(record.slotKey) ?? 0)
               === (liveAtStart.get(record.slotKey) ?? 0)
-          const protectedSlots = [...automationLiveGenRef.current]
+          const protectedSlotSet = new Set([...automationLiveGenRef.current]
             .filter(([slot, generation]) => generation !== (liveAtStart.get(slot) ?? 0))
-            .map(([slot]) => slot)
-          const records = [...legacyRecords, ...structuredRecords].filter(stillFresh)
+            .map(([slot]) => slot))
+          for (const [queryKey] of queryClient.getQueriesData<
+            ReturnType<typeof normalizeAutomationRecord>
+          >({ queryKey: ['session-automation'] })) {
+            if (queryKey.length !== 2 || typeof queryKey[1] !== 'string') continue
+            const slotKey = dashboardAutomationSlotKey(queryKey[1])
+            const cachedUpdates = queryClient.getQueryState(queryKey)?.dataUpdateCount
+            if (cachedUpdates !== cacheUpdatesAtStart.get(slotKey)) {
+              protectedSlotSet.add(slotKey)
+            }
+          }
+          const protectedSlots = [...protectedSlotSet]
+          const records = [...legacyRecords, ...structuredRecords]
+            .filter(record => stillFresh(record) && !protectedSlotSet.has(record.slotKey))
           const presentSlots = new Set(records.map(record => record.slotKey))
-          const protectedSlotSet = new Set(protectedSlots)
           for (const [queryKey, cached] of queryClient.getQueriesData<
             ReturnType<typeof normalizeAutomationRecord>
           >({ queryKey: ['session-automation'] })) {
@@ -435,6 +458,11 @@ export function useWebSocket() {
               || queryKey.length !== 2
               || protectedSlotSet.has(cached.slotKey)
               || presentSlots.has(cached.slotKey)) continue
+            // A mutation or focused REST refetch may populate this per-slot
+            // cache while the reconnect snapshot is still in flight. Only an
+            // entry known to predate the seed can be absent authoritatively.
+            const cachedUpdates = queryClient.getQueryState(queryKey)?.dataUpdateCount
+            if (cachedUpdates !== cacheUpdatesAtStart.get(cached.slotKey)) continue
             const complete = cached.kind === 'legacy_goal_loop'
               ? legacyComplete
               : structuredComplete

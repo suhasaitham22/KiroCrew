@@ -1886,7 +1886,10 @@ removal, so `slack:<ts>` state addresses the visible `slack_<ts>` slot. A live
 frame for one slot does not discard unaffected legacy or terminal records from the
 seed. When a complete seed omits a cached slot, it tombstones that slot's React
 Query detail entry alongside the Redux removal, so the cold snapshot cannot
-revive the removed automation. Structured state wins if both responses name one slot.
+revive the removed automation. The omission may tombstone only a detail entry whose
+React Query update timestamp predates the seed; a mutation or focused REST refresh
+that lands while the seed is in flight is newer evidence and survives. Structured
+state wins if both responses name one slot.
 Chat detail and sidebar select from that collection, so target, status, activity
 lanes, and terminal retention cannot disagree because two components cached
 different wire records. Slot teardown clears ephemeral conversation state but

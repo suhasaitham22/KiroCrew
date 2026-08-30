@@ -305,6 +305,31 @@ describe('SessionAutomationPopover', () => {
     })
   })
 
+  it('does not resurrect a cleared monitor from a delayed create response', async () => {
+    let resolveCreate!: (value: unknown) => void
+    ;(api.monitorCreate as ReturnType<typeof vi.fn>).mockImplementation(() => (
+      new Promise(resolve => { resolveCreate = resolve })
+    ))
+    const { client, onChange, rerenderAutomation } = renderPopover(null)
+    const invalidate = vi.spyOn(client, 'invalidateQueries')
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Pull request URL' }), {
+      target: { value: 'https://github.com/kirodotdev/KiroCrew/pull/42' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Start monitor' }))
+    await waitFor(() => expect(api.monitorCreate).toHaveBeenCalled())
+
+    rerenderAutomation(activeMonitor)
+    rerenderAutomation(null)
+    await act(async () => {
+      resolveCreate({ ok: true, monitor: structuredMonitorLoop() })
+      await Promise.resolve()
+    })
+
+    expect(onChange).not.toHaveBeenCalled()
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['session-automation', 'chat-1'] })
+  })
+
   it('renders typed classification without decoding canonical provider facts', () => {
     const record = normalizeAutomationRecord(structuredMonitorLoop())
     expect(record?.kind).toBe('structured_monitor')
