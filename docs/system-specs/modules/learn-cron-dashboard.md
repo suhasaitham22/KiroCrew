@@ -1044,21 +1044,26 @@ secondary GraphQL dependency. An incomplete, malformed-node, missing-cursor, or 
 thread traversal is a pending fact and can never produce review-ready success.
 When GraphQL returns errors alongside usable thread nodes, the traversal remains
 incomplete but folds those nodes first, so an observed unresolved thread still wins
-as actionable evidence. An error response without a usable thread payload is a typed
-provider error instead of a pending observation, preserving the last valid facts and
-provider-error accounting in shadow persistence.
+as actionable evidence. If the supplemental review-thread request itself fails, the
+adapter retains actionable primary lifecycle, check, review, and mergeability facts
+and unresolved threads observed on earlier pages while marking thread evidence
+incomplete. A known blocker therefore remains actionable. Without a known blocker,
+the request failure remains a typed provider error so shadow persistence preserves the
+last valid observation.
 
 The durable observation is stable canonical JSON containing only normalized target
 identity, head revision, lifecycle/draft state, sorted check identities by outcome,
 normalized review/blocking state, unresolved-thread count/completeness, and
-mergeability. Provider ordering, timestamps, URLs, request/cursor ids, titles,
+mergeability. Repeated check identities retain their multiplicity because display
+labels cannot prove that provider rows describe the same logical job. Provider
+ordering, timestamps, URLs, request/cursor ids, titles,
 bodies, comments, and logs do not enter it. Provider-controlled check labels pass
 through credential redaction and unconditional URL removal before persistence. The
-GitHub check-run and legacy status-context namespaces remain distinct during rerun
-collapse. Check-run attempts collapse only when their canonical GitHub Actions
-details URLs prove the same workflow-run id and check name; separate runs with the
-same display labels remain independent, as do rows without that provider-stable
-identity, so a same-label success cannot hide a failure. GraphQL owner, repository,
+GitHub check-run and legacy status-context namespaces remain distinct. A workflow
+name plus display name is not a stable logical job identity: independent jobs may
+share both, and the rollup does not expose a stable workflow-file identity. Check runs
+therefore remain independent so a newer success cannot hide a known failure from a
+different workflow definition. Workflowless rows remain independent. GraphQL owner,
 and cursor variables use raw string fields; only the pull-request number uses typed
 conversion.
 SHA-256 fingerprint covers the compact sorted serialization; a collection reorder or
@@ -1073,7 +1078,10 @@ unknown checks, incomplete review-thread evidence, and unknown mergeability rema
 pending. Mergeability succeeds only for the explicit settled `CLEAN`, `HAS_HOOKS`,
 and `UNSTABLE` states, so empty or future provider values fail closed as pending;
 failed checks, requested changes, unresolved threads, conflicts, a behind head, and
-branch-protection blocks are actionable. A requested-changes decision or an unresolved
+concrete branch-protection failures are actionable. GitHub's generic `BLOCKED`
+merge-state is pending because it also represents an otherwise healthy pull request
+waiting for required checks or reviews; the specific check and review facts determine
+whether the observation is actionable. A requested-changes decision or an unresolved
 thread already observed remains actionable even when the unseen review-thread tail is
 incomplete; incomplete evidence can prevent success but cannot erase a known blocker.
 Rate limits and transport/provider

@@ -23,9 +23,6 @@ from kiro_crew.security import redact
 _GITHUB_HOST = "github.com"
 _SEGMENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _URL_IN_CHECK_IDENTITY_RE = re.compile(r"https?://\S+", re.IGNORECASE)
-_ACTIONS_JOB_PATH_RE = re.compile(
-    r"^/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/actions/runs/([1-9][0-9]*)/job/[1-9][0-9]*$"
-)
 _PROBE_TIMEOUT_SECS = 30.0
 _REVIEW_THREAD_PAGE_SIZE = 100
 _REVIEW_THREAD_MAX_PAGES = 10
@@ -147,7 +144,15 @@ class GitHubPullRequestProvider:
             if response.state not in {"merged", "closed"}:
                 unresolved, complete = self._review_threads(gh, target)
                 if isinstance(unresolved, GitHubPullRequestProbeResult):
-                    return unresolved
+                    known_blocker = (
+                        any(check.state == "failed" for check in response.checks)
+                        or response.review_decision == "changes_requested"
+                        or bool(response.unresolved_review_threads)
+                        or response.mergeability in {"conflicting", "behind"}
+                    )
+                    if not known_blocker:
+                        return unresolved
+                    unresolved, complete = 0, False
                 response = replace(
                     response,
                     unresolved_review_threads=unresolved,
@@ -228,6 +233,8 @@ class GitHubPullRequestProvider:
             )
             failure = _process_failure(proc)
             if failure is not None:
+                if unresolved:
+                    return unresolved, False
                 return failure, False
             raw = _json_object(proc.stdout)
             has_errors = bool(raw.get("errors"))
@@ -247,11 +254,13 @@ class GitHubPullRequestProvider:
                 raise ValueError("GitHub review-thread response is malformed") from exc
             if not isinstance(nodes, list) or not isinstance(page_info, Mapping):
                 raise ValueError("GitHub review-thread response is malformed")
+            nodes_complete = True
             for node in nodes:
                 if not isinstance(node, Mapping) or not isinstance(node.get("isResolved"), bool):
-                    return unresolved, False
+                    nodes_complete = False
+                    continue
                 unresolved += int(not node["isResolved"])
-            if has_errors:
+            if has_errors or not nodes_complete:
                 return unresolved, False
             has_next = page_info.get("hasNextPage")
             if has_next is False:
@@ -362,13 +371,16 @@ def _normalize_response(
 def _normalize_checks(raw: object) -> tuple[GitHubCheck, ...]:
     if not isinstance(raw, list):
         raise ValueError("GitHub check rollup is malformed")
-    grouped: dict[tuple[str, ...], tuple[str, list[tuple[str, str]]]] = {}
+    grouped: dict[
+        tuple[str, ...],
+        tuple[str, list[tuple[str, str]]],
+    ] = {}
     for row_index, item in enumerate(raw):
         if not isinstance(item, Mapping):
             raise ValueError("GitHub check rollup is malformed")
         identity, state, recency, group_key = _normalize_check(item)
         if group_key is None:
-            group_key = ("workflowless_check_run", str(row_index))
+            group_key = ("independent_check_run", str(row_index))
         _, candidates = grouped.setdefault(group_key, (identity, []))
         candidates.append((recency, state))
     normalized: list[GitHubCheck] = []
@@ -414,8 +426,7 @@ def _normalize_check(
             normalized_recency = recency
         else:
             normalized_recency = "\uffff" if state == "pending" else ""
-        group_key = _check_run_group_key(raw, name) if workflow else None
-        return identity, state, normalized_recency, group_key
+        return identity, state, normalized_recency, None
     if typename == "StatusContext":
         context = raw.get("context")
         if not isinstance(context, str) or not context:
@@ -433,37 +444,6 @@ def _normalize_check(
             state = "unknown"
         return context, state, "", ("status_context", context)
     raise ValueError("GitHub check rollup is malformed")
-
-
-def _check_run_group_key(
-    raw: Mapping[str, object],
-    name: str,
-) -> tuple[str, ...] | None:
-    """Return the GitHub Actions run identity shared by rerun attempts."""
-    details_url = raw.get("detailsUrl")
-    if not isinstance(details_url, str):
-        return None
-    parsed = urlparse(details_url)
-    try:
-        host = (parsed.hostname or "").lower()
-        port = parsed.port
-    except ValueError:
-        return None
-    if (
-        parsed.scheme != "https"
-        or host != _GITHUB_HOST
-        or parsed.username is not None
-        or parsed.password is not None
-        or port is not None
-        or parsed.query
-        or parsed.fragment
-    ):
-        return None
-    match = _ACTIONS_JOB_PATH_RE.fullmatch(parsed.path)
-    if match is None:
-        return None
-    owner, repo, run_id = match.groups()
-    return ("check_run", owner.casefold(), repo.casefold(), run_id, name)
 
 
 def _normalize_pr_state(raw: str) -> str:
@@ -501,7 +481,7 @@ def _normalize_mergeability(mergeable: str, merge_state: str) -> str:
 
 def _canonical_response(response: GitHubPullRequestResponse) -> dict[str, object]:
     checks = {
-        state: sorted({check.identity for check in response.checks if check.state == state})
+        state: sorted(check.identity for check in response.checks if check.state == state)
         for state in ("failed", "passed", "pending", "unknown")
     }
     if response.review_decision == "changes_requested":
@@ -553,9 +533,7 @@ def _actionable_fingerprint_facts(canonical: Mapping[str, object]) -> dict[str, 
         "failed_checks": checks["failed"],
         "head_revision": canonical["head_revision"],
         "kind": canonical["kind"],
-        "mergeability": (
-            mergeability if mergeability in {"conflicting", "behind", "blocked"} else "none"
-        ),
+        "mergeability": (mergeability if mergeability in {"conflicting", "behind"} else "none"),
         "state": canonical["state"],
         "target": canonical["target"],
     }
@@ -581,8 +559,6 @@ def _classify_response(
         return MonitorObservationStatus.ACTIONABLE, "merge_conflict"
     if response.mergeability == "behind":
         return MonitorObservationStatus.ACTIONABLE, "branch_behind"
-    if response.mergeability == "blocked":
-        return MonitorObservationStatus.ACTIONABLE, "merge_blocked"
     if response.draft:
         return MonitorObservationStatus.PENDING, "pull_request_draft"
     if "pending" in check_states:
@@ -595,7 +571,7 @@ def _classify_response(
         return MonitorObservationStatus.PENDING, "review_state_unknown"
     if response.review_decision == "review_required":
         return MonitorObservationStatus.PENDING, "review_required"
-    if response.mergeability == "pending":
+    if response.mergeability in {"pending", "blocked"}:
         return MonitorObservationStatus.PENDING, "mergeability_pending"
     return MonitorObservationStatus.SUCCESS, "review_ready"
 
