@@ -113,11 +113,17 @@ class MonitorController:
         state = getattr(loop, "monitor", None)
         if state is None:
             raise ValueError("structured monitor state is required")
-        # A terminal record may briefly retain an in-flight correlation while
-        # its already-started action turn reaches raw completion. It is still
-        # inert: no probe, BUSY redispatch, or evidence-expiry transition may
-        # replace the retained outcome.
         if state.outcome is not None:
+            if (
+                state.wake_in_flight
+                and state.completion_evidence_deadline > 0
+                and now >= state.completion_evidence_deadline
+            ):
+                await self._service.record_monitor_completion_evidence_unavailable(
+                    loop.id,
+                    state.last_wake_fingerprint,
+                    now=now,
+                )
             return MonitorDecision.STOP_BLOCKED
         if state.wake_in_flight:
             deadline = state.completion_evidence_deadline

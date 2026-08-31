@@ -722,7 +722,8 @@ class TurnDriver:
                 # perform itself (it holds no session key).
                 self.last_stop_reason = event.stop_reason or ""
                 if self.monitor_completion is not None and is_monitor_completion_evidence(
-                    event.stop_reason
+                    event.stop_reason,
+                    synthetic=event.synthetic_completion,
                 ):
                     try:
                         await self.monitor_completion.complete(

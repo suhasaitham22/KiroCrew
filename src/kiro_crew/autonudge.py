@@ -1697,7 +1697,7 @@ class AutoNudgeService:
                     staged_state.stopped_at = now
             await self._persist_staged_monitor_locked(loop, staged)
             if not loop.active:
-                self._cancel_timer(loop.id)
+                self._sync_terminal_completion_timer(loop)
         self._emit("updated", loop)
         return decision
 
@@ -1724,7 +1724,7 @@ class AutoNudgeService:
             # the still-active record on disk so restart cannot resurrect work
             # the current process already considers stopped.
             await self._persist_staged_monitor_locked(loop, stopped)
-            self._cancel_timer(loop.id)
+            self._sync_terminal_completion_timer(loop)
         self._emit("updated", loop)
         return loop
 
@@ -1744,16 +1744,12 @@ class AutoNudgeService:
             staged_state = staged.monitor
             assert staged_state is not None
             staged.active = False
-            # Closing a slot is transactional with history persistence. Keep a
-            # dispatched claim intact so a failed close can restore the exact
-            # completion-evidence deadline instead of losing the only callback
-            # that can account for the accepted action turn.
+            self._retain_accepted_terminal_completion(staged, stopped_at=stopped_at)
             staged_state.outcome = MonitorOutcome.SESSION_CLOSE
             staged_state.stopped_reason = MONITOR_STOP_SESSION_CLOSE
             staged_state.stopped_at = stopped_at
-            self._set_monitor_deadline(staged, 0.0)
             await self._persist_staged_monitor_locked(loop, staged)
-            self._cancel_timer(loop.id)
+            self._sync_terminal_completion_timer(loop)
         self._emit("updated", loop)
         return loop
 
@@ -1922,7 +1918,7 @@ class AutoNudgeService:
                 dispatched = True
             await self._persist_staged_monitor_locked(loop, staged)
             if not loop.active:
-                self._cancel_timer(loop.id)
+                self._sync_terminal_completion_timer(loop)
         self._emit("updated", loop)
         return dispatched
 
@@ -1966,7 +1962,9 @@ class AutoNudgeService:
             if completion.output_tokens is not None:
                 staged_state.output_tokens += completion.output_tokens
             reason = monitor_budget_reason(staged_state, now=completion.completed_ts)
-            if reason and staged_state.outcome is None:
+            if staged_state.outcome is not None:
+                self._set_monitor_deadline(staged, 0.0)
+            elif reason:
                 self._apply_monitor_budget_stop(
                     staged,
                     reason,
@@ -1988,7 +1986,7 @@ class AutoNudgeService:
                 )
             await self._persist_staged_monitor_locked(loop, staged)
             if not loop.active:
-                self._cancel_timer(loop.id)
+                self._sync_terminal_completion_timer(loop)
             if loop.active and state.outcome is None:
                 if loop.id in self._firing:
                     self._rearm_pending.add(loop.id)
@@ -2008,10 +2006,7 @@ class AutoNudgeService:
         if state is None:
             return
         loop.active = False
-        state.wake_in_flight = False
-        state.wake_delivery = None
-        state.completion_evidence_deadline = 0.0
-        self._set_monitor_deadline(loop, 0.0)
+        self._retain_accepted_terminal_completion(loop, stopped_at=stopped_at)
         state.outcome = MonitorOutcome.BUDGET
         state.stopped_reason = reason
         state.stopped_at = stopped_at
@@ -2022,21 +2017,58 @@ class AutoNudgeService:
         if state is None:
             return
         loop.active = False
-        # A stop directive can be consumed by an accepted action turn before
-        # that stream emits its authoritative completion. Keep only a
-        # accepted claim long enough for the callback to charge exactly once.
-        # The channel marks acceptance synchronously at provider entry and the
-        # runtime marker survives DISPATCHED until completion. A recovered
-        # claim has no such marker and must remain restartable.
+        self._retain_accepted_terminal_completion(loop, stopped_at=stopped_at)
+        state.outcome = MonitorOutcome.USER_STOP
+        state.stopped_reason = MONITOR_STOP_USER
+        state.stopped_at = stopped_at
+
+    def _retain_accepted_terminal_completion(
+        self,
+        loop: NudgeLoop,
+        *,
+        stopped_at: float,
+    ) -> None:
+        """Bound an accepted terminal claim until completion or evidence expiry."""
+        state = loop.monitor
+        if state is None:
+            return
         accepted = self._accepted_monitor_turns.get(loop.id) == state.last_wake_fingerprint
         if not accepted:
             state.wake_in_flight = False
             state.wake_delivery = None
-        state.completion_evidence_deadline = 0.0
-        state.outcome = MonitorOutcome.USER_STOP
-        state.stopped_reason = MONITOR_STOP_USER
-        state.stopped_at = stopped_at
-        self._set_monitor_deadline(loop, 0.0)
+            state.completion_evidence_deadline = 0.0
+            self._set_monitor_deadline(loop, 0.0)
+            return
+        deadline = state.completion_evidence_deadline
+        if deadline <= stopped_at:
+            deadline = stopped_at + MONITOR_COMPLETION_EVIDENCE_TIMEOUT_SECS
+            state.completion_evidence_deadline = deadline
+        self._set_monitor_deadline(loop, deadline)
+
+    def _waits_for_terminal_completion(self, loop: NudgeLoop) -> bool:
+        """Whether a terminal row still owns a finite accepted-turn correlation."""
+        state = loop.monitor
+        return bool(
+            state is not None
+            and state.outcome
+            in {
+                MonitorOutcome.BUDGET,
+                MonitorOutcome.SESSION_CLOSE,
+                MonitorOutcome.USER_STOP,
+            }
+            and state.wake_in_flight
+            and state.completion_evidence_deadline > 0
+        )
+
+    def _sync_terminal_completion_timer(self, loop: NudgeLoop) -> None:
+        """Keep only the timer needed to expire an accepted terminal claim."""
+        if self._waits_for_terminal_completion(loop):
+            if loop.id in self._firing:
+                self._rearm_pending.add(loop.id)
+            else:
+                self._arm_from_deadline(loop)
+            return
+        self._cancel_timer(loop.id)
 
     async def _write_monitor_snapshot_locked(self, payload: dict | None = None) -> None:
         """Persist a monitor transition without releasing ``_lock`` mid-write."""
@@ -2163,7 +2195,7 @@ class AutoNudgeService:
                 )
             await self._persist_staged_monitor_locked(loop, staged)
             if not loop.active:
-                self._cancel_timer(loop.id)
+                self._sync_terminal_completion_timer(loop)
             if loop.active:
                 if loop.id in self._firing:
                     self._rearm_pending.add(loop.id)
@@ -2215,29 +2247,37 @@ class AutoNudgeService:
     ) -> None:
         """Fail closed when an accepted wake never reports raw completion."""
         async with self._lock:
-            if self._accepted_monitor_turns.get(monitor_id) == fingerprint:
-                self._accepted_monitor_turns.pop(monitor_id, None)
             loop = self._loops.get(monitor_id)
             state = loop.monitor if loop is not None else None
             if (
                 loop is None
                 or state is None
-                or state.outcome is not None
                 or not state.wake_in_flight
                 or state.last_wake_fingerprint != fingerprint
                 or state.completion_evidence_deadline <= 0
                 or now < state.completion_evidence_deadline
             ):
                 return
+            terminal = state.outcome is not None
+            if terminal and state.outcome not in {
+                MonitorOutcome.BUDGET,
+                MonitorOutcome.SESSION_CLOSE,
+                MonitorOutcome.USER_STOP,
+            }:
+                return
+            if self._accepted_monitor_turns.get(monitor_id) == fingerprint:
+                self._accepted_monitor_turns.pop(monitor_id, None)
             staged = deepcopy(loop)
             staged_state = staged.monitor
             assert staged_state is not None
             staged_state.wake_in_flight = False
+            staged_state.wake_delivery = None
             staged_state.completion_evidence_deadline = 0.0
-            staged.active = False
-            staged_state.outcome = MonitorOutcome.BLOCKED
-            staged_state.stopped_reason = MONITOR_STOP_COMPLETION_UNAVAILABLE
-            staged_state.stopped_at = now
+            if not terminal:
+                staged.active = False
+                staged_state.outcome = MonitorOutcome.BLOCKED
+                staged_state.stopped_reason = MONITOR_STOP_COMPLETION_UNAVAILABLE
+                staged_state.stopped_at = now
             self._set_monitor_deadline(staged, 0.0)
             await self._persist_staged_monitor_locked(loop, staged)
             self._cancel_timer(loop.id)
@@ -2478,9 +2518,17 @@ class AutoNudgeService:
         if shutdown_event.is_set():
             return
         if loop.monitor is not None:
-            if not loop.active:
+            waiting_for_terminal_completion = self._waits_for_terminal_completion(loop)
+            if not loop.active and not waiting_for_terminal_completion:
                 return
             if self._on_monitor_tick is None:
+                if waiting_for_terminal_completion:
+                    await self.record_monitor_completion_evidence_unavailable(
+                        loop.id,
+                        loop.monitor.last_wake_fingerprint,
+                        now=time.time(),
+                    )
+                    return
                 # A structured record must never fall through to legacy prompt
                 # delivery when its typed controller is unavailable.
                 await self._deactivate_unwired_monitor(loop.id)
@@ -2493,7 +2541,11 @@ class AutoNudgeService:
             finally:
                 self._firing.discard(loop.id)
                 self._rearm_pending.discard(loop.id)
-                if loop.active and loop.id in self._loops and loop.next_due_ts > 0:
+                if (
+                    (loop.active or self._waits_for_terminal_completion(loop))
+                    and loop.id in self._loops
+                    and loop.next_due_ts > 0
+                ):
                     self._arm_from_deadline(loop)
             return
         # Kill switch: sentinel file present?

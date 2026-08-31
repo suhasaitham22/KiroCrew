@@ -794,7 +794,9 @@ class TestFireSlackNudgeGuards:
         order: list[str] = []
 
         async def _stream(*_args, **kwargs):
-            kwargs["on_complete"](SimpleNamespace(stop_reason="max_tokens"))
+            kwargs["on_complete"](
+                SimpleNamespace(stop_reason="max_tokens", synthetic_completion=False)
+            )
             if times_out:
                 await asyncio.Event().wait()
             return "reply body"

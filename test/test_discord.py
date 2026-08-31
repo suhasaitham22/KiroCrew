@@ -277,6 +277,7 @@ class _Ev:
         self.title = title
         self.context_usage_pct = 0.0
         self.usage = None
+        self.synthetic_completion = False
 
 
 class FakeProvider:

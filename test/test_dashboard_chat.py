@@ -6077,7 +6077,7 @@ class TestTokenPersistenceBackfill:
             LLMEvent(kind=EVENT_TEXT_CHUNK, text="done"),
             LLMEvent(
                 kind=EVENT_COMPLETE,
-                stop_reason="max_tokens",
+                stop_reason="end_turn",
                 usage=TurnUsage(input_tokens=12, output_tokens=4),
             ),
         ]
@@ -6104,7 +6104,7 @@ class TestTokenPersistenceBackfill:
         )
 
         assert len(completions) == 1
-        assert completions[0].disposition is MonitorActionDisposition.FAILURE
+        assert completions[0].disposition is MonitorActionDisposition.SUCCESS
         assert completions[0].input_tokens == 12
         assert completions[0].output_tokens == 4
 
@@ -6125,6 +6125,43 @@ class TestTokenPersistenceBackfill:
         state = self._make_state_for_run_chat(tmp_path, monkeypatch)
         slot = state.get_or_create_slot("s1")
         client = self._make_mock_client([LLMEvent(kind=EVENT_TEXT_CHUNK, text="partial"), event])
+        client.context_used_tokens = MagicMock(return_value=0)
+        client.context_window_tokens = MagicMock(return_value=0)
+        state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner.generate_session_summary",
+            AsyncMock(return_value=None),
+        )
+        completions: list[MonitorActionCompletion] = []
+
+        async def _capture(completion: MonitorActionCompletion) -> None:
+            completions.append(completion)
+
+        await _run_chat(
+            state,
+            slot,
+            "hello",
+            monitor_completion=MonitorCompletionHook("monitor1", "failure-a", _capture),
+        )
+
+        assert completions == []
+
+    @pytest.mark.asyncio
+    async def test_synthesized_end_turn_does_not_report_monitor_usage(self, tmp_path, monkeypatch):
+        from kiro_crew.dashboard.chat import _run_chat
+        from kiro_crew.monitoring.completion import MonitorCompletionHook
+        from kiro_crew.monitoring.models import MonitorActionCompletion
+        from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
+
+        event = LLMEvent(
+            kind=EVENT_COMPLETE,
+            stop_reason="end_turn",
+            synthetic_completion=True,
+            usage=TurnUsage(input_tokens=12, output_tokens=4),
+        )
+        state = self._make_state_for_run_chat(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        client = self._make_mock_client([LLMEvent(kind=EVENT_TEXT_CHUNK, text="done"), event])
         client.context_used_tokens = MagicMock(return_value=0)
         client.context_window_tokens = MagicMock(return_value=0)
         state.sessions.get_or_create = AsyncMock(return_value=(client, True, False))

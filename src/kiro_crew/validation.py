@@ -1155,12 +1155,8 @@ MONITOR_WATCH_SCHEMA = ToolSchema(
         FieldSpec("max_runtime_secs", int, min_val=1, max_val=MAX_MONITOR_RUNTIME_SECS),
         FieldSpec("max_agent_turns", int, min_val=1, max_val=MAX_MONITOR_AGENT_TURNS),
         FieldSpec("max_tokens", int, min_val=1, max_val=MAX_MONITOR_TOKENS),
-        FieldSpec(
-            "max_provider_errors", int, min_val=1, max_val=MAX_MONITOR_PROVIDER_ERRORS
-        ),
-        FieldSpec(
-            "wake_instructions", str, max_len=MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS
-        ),
+        FieldSpec("max_provider_errors", int, min_val=1, max_val=MAX_MONITOR_PROVIDER_ERRORS),
+        FieldSpec("wake_instructions", str, max_len=MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS),
     ],
 )
 
@@ -1201,12 +1197,8 @@ MONITOR_UPDATE_SCHEMA = ToolSchema(
         FieldSpec("objective", str, allowed=frozenset({"review_ready"})),
         FieldSpec("max_agent_turns", int, min_val=1, max_val=MAX_MONITOR_AGENT_TURNS),
         FieldSpec("max_tokens", int, min_val=1, max_val=MAX_MONITOR_TOKENS),
-        FieldSpec(
-            "max_provider_errors", int, min_val=1, max_val=MAX_MONITOR_PROVIDER_ERRORS
-        ),
-        FieldSpec(
-            "wake_instructions", str, max_len=MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS
-        ),
+        FieldSpec("max_provider_errors", int, min_val=1, max_val=MAX_MONITOR_PROVIDER_ERRORS),
+        FieldSpec("wake_instructions", str, max_len=MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS),
     ],
 )
 

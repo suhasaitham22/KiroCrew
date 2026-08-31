@@ -1001,9 +1001,12 @@ non-negative token counts, and records token usage as unknown when authoritative
 counts are unavailable. Duplicate, removed, replaced, legacy, and mismatched
 callbacks are no-ops. Recovery resumes an accepted in-flight wake toward its
 persisted completion-evidence deadline and a BUSY claim toward its persisted retry
-deadline. A user stop writes its terminal replacement snapshot before mutating the
-live record or cancelling its timer, so a failed disk write leaves memory, disk, and
-the active schedule aligned instead of allowing a later restart to resurrect work.
+deadline. A user or budget stop that races an accepted action keeps or re-arms that
+finite evidence deadline; completion still charges exactly once, while expiry clears
+only the stale correlation and preserves the terminal outcome. A user stop writes its
+terminal replacement snapshot before mutating the live record or cancelling its timer,
+so a failed disk write leaves memory, disk, and the active schedule aligned instead of
+allowing a later restart to resurrect work.
 A legacy claim with neither typed delivery nor an evidence deadline
 deactivates with `completion_evidence_unavailable` while retaining the
 acknowledged fingerprint, so restart cannot duplicate the wake. Completion stops
@@ -1699,10 +1702,11 @@ status counts only; provider-controlled check identities remain available to the
 human inspection surface but never become prompt text. Only Task 2's raw
 provider-completion hook clears
 the claim and charges the action-turn/token budgets. Dispatch or stream return is
-not completion evidence. Slack's legacy callback rejects synthetic timeout
-completions before shared monitor accounting, so even a structured record routed
-through that compatibility path cannot be charged from fabricated evidence. A
-raw completion received before a transport timeout
+not completion evidence. Genuine provider `end_turn` is successful completion;
+the ACP compatibility path marks its fabricated `end_turn` terminal with
+`synthetic_completion`, and every surface rejects that provenance together with
+synthetic timeout/error terminals before shared monitor accounting. A raw
+completion received before a transport timeout
 remains authoritative and is charged once even when the enclosing stream later
 times out. A pre-turn delivery failure retires the record as
 target unavailable without charging a turn or immediately retrying the same
@@ -1729,8 +1733,9 @@ retries, restart recovery, duplicate reports, and `UNAVAILABLE` do not increment
 it.
 
 Session close is a retained terminal transition, but history persistence owns
-whether that close commits. Retirement disarms the timer while preserving any
-accepted wake claim, delivery marker, and completion-evidence deadline. If
+whether that close commits. Retirement preserves any accepted wake claim,
+delivery marker, and completion-evidence deadline, and keeps only the bounded
+expiry timer needed to release that claim when raw completion never arrives. If
 retirement persistence fails, its transactional rollback leaves the active
 structured record in place and the generic close rollback never routes it
 through legacy `add()`. If history persistence fails after retirement commits,

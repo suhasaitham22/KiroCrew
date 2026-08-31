@@ -22,7 +22,6 @@ MonitorAcceptanceCallback = Callable[[], None]
 _SYNTHETIC_STOP_REASONS = frozenset(
     {
         "",
-        TURN_STOP_REASON_END_TURN,
         "timeout",
         "stale_recover",
         "error: cancel unacked",
@@ -32,9 +31,13 @@ _SYNTHETIC_STOP_REASONS = frozenset(
 )
 
 
-def is_monitor_completion_evidence(stop_reason: str) -> bool:
+def is_monitor_completion_evidence(
+    stop_reason: str,
+    *,
+    synthetic: bool = False,
+) -> bool:
     """Return whether a terminal event proves that an agent turn completed."""
-    return stop_reason not in _SYNTHETIC_STOP_REASONS
+    return not synthetic and stop_reason not in _SYNTHETIC_STOP_REASONS
 
 
 def disposition_for_stop_reason(stop_reason: str) -> MonitorActionDisposition:

@@ -804,6 +804,58 @@ async def test_cadence_edits_during_dispatch_preserve_evidence_deadline(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_terminal_claim_expiry_clears_only_the_correlation(tmp_path):
+    """An accepted stop remains terminal when its completion evidence expires."""
+    service, loop, controller = await _armed(
+        tmp_path,
+        result=_result(MonitorObservationStatus.ACTIONABLE),
+        dispatch=AsyncMock(),
+    )
+    assert await service.mark_monitor_action_in_flight(loop.id, "fp-1", now=120.0)
+    service.mark_monitor_turn_accepted(loop.id, "fp-1")
+    await service.record_monitor_dispatched(loop.id, "fp-1", now=121.0)
+    assert loop.monitor is not None
+    evidence_deadline = loop.monitor.completion_evidence_deadline
+    await service.stop_monitor(loop.id, now=122.0)
+
+    decision = await controller.tick(loop, now=evidence_deadline)
+
+    assert decision is MonitorDecision.STOP_BLOCKED
+    assert loop.monitor.outcome is MonitorOutcome.USER_STOP
+    assert not loop.monitor.wake_in_flight
+    assert loop.monitor.completion_evidence_deadline == 0.0
+    assert loop.next_due_ts == 0.0
+    service.stop()
+
+
+@pytest.mark.asyncio
+async def test_session_close_claim_expiry_clears_only_the_correlation(tmp_path):
+    """A session-close stop keeps its accepted claim bounded until expiry."""
+    service, loop, controller = await _armed(
+        tmp_path,
+        result=_result(MonitorObservationStatus.ACTIONABLE),
+        dispatch=AsyncMock(),
+    )
+    assert await service.mark_monitor_action_in_flight(loop.id, "fp-1", now=120.0)
+    service.mark_monitor_turn_accepted(loop.id, "fp-1")
+    await service.record_monitor_dispatched(loop.id, "fp-1", now=121.0)
+    assert loop.monitor is not None
+    evidence_deadline = loop.monitor.completion_evidence_deadline
+    await service.retire_monitor_for_session_close(loop.id, now=122.0)
+
+    assert loop.next_due_ts == evidence_deadline
+    assert service._timers.get(loop.id) is not None
+    decision = await controller.tick(loop, now=evidence_deadline)
+
+    assert decision is MonitorDecision.STOP_BLOCKED
+    assert loop.monitor.outcome is MonitorOutcome.SESSION_CLOSE
+    assert not loop.monitor.wake_in_flight
+    assert loop.monitor.completion_evidence_deadline == 0.0
+    assert loop.next_due_ts == 0.0
+    service.stop()
+
+
+@pytest.mark.asyncio
 async def test_unavailable_delivery_is_terminal_without_retry(tmp_path):
     """Only a proven unroutable target retires an accepted wake."""
     service, loop, controller = await _armed(

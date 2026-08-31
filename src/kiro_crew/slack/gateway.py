@@ -5435,7 +5435,10 @@ class GatewayOrchestrator:
             if wake_message is None:
 
                 def _capture_raw_completion(event: LLMEvent) -> None:
-                    if is_monitor_completion_evidence(event.stop_reason):
+                    if is_monitor_completion_evidence(
+                        event.stop_reason,
+                        synthetic=event.synthetic_completion,
+                    ):
                         _raw_dispositions.append(disposition_for_stop_reason(event.stop_reason))
 
                 response = await asyncio.wait_for(

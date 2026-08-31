@@ -126,7 +126,6 @@ class TestTurnDriverTranslation:
         "stop_reason",
         [
             "",
-            "end_turn",
             "timeout",
             "stale_recover",
             "error: cancel unacked",
@@ -152,6 +151,48 @@ class TestTurnDriverTranslation:
 
         hook = MonitorCompletionHook("monitor1", "failure-a", _capture)
         _run(p, r, monitor_completion=hook)
+
+        assert completions == []
+
+    def test_real_end_turn_reports_monitor_success(self):
+        r = _RecordingRenderer()
+        p = _ScriptedProvider(
+            [
+                AcpEvent(
+                    kind=EVENT_COMPLETE,
+                    stop_reason="end_turn",
+                    usage=TurnUsage(input_tokens=20, output_tokens=5),
+                )
+            ]
+        )
+        completions: list[MonitorActionCompletion] = []
+
+        async def _capture(completion: MonitorActionCompletion) -> None:
+            completions.append(completion)
+
+        _run(p, r, monitor_completion=MonitorCompletionHook("monitor1", "failure-a", _capture))
+
+        assert len(completions) == 1
+        assert completions[0].disposition is MonitorActionDisposition.SUCCESS
+
+    def test_synthesized_end_turn_does_not_report_monitor_action(self):
+        r = _RecordingRenderer()
+        p = _ScriptedProvider(
+            [
+                AcpEvent(
+                    kind=EVENT_COMPLETE,
+                    stop_reason="end_turn",
+                    synthetic_completion=True,
+                    usage=TurnUsage(input_tokens=20, output_tokens=5),
+                )
+            ]
+        )
+        completions: list[MonitorActionCompletion] = []
+
+        async def _capture(completion: MonitorActionCompletion) -> None:
+            completions.append(completion)
+
+        _run(p, r, monitor_completion=MonitorCompletionHook("monitor1", "failure-a", _capture))
 
         assert completions == []
 

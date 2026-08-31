@@ -8003,7 +8003,8 @@ async def _run_chat(
                 _native_subagent_close_all(state, slot, _native_tracker, _native_card_output)
                 _u = event.usage
                 if monitor_completion is not None and is_monitor_completion_evidence(
-                    event.stop_reason
+                    event.stop_reason,
+                    synthetic=event.synthetic_completion,
                 ):
                     try:
                         await monitor_completion.complete(

@@ -578,7 +578,7 @@ async def _autonudge_stop(slot: Any, session_key: str, args: dict[str, Any]) -> 
             caller="autonudge-stop-compat",
         )
         if error is not None:
-            return f"Failed to stop structured monitor: {error}"
+            raise _DirectiveDenied(f"Failed to stop structured monitor: {error}")
     elif is_owned_research_slot(binding, str(getattr(slot, "_app", "") or "")):
         await svc.update(loop_id, active=False, stopped_reason=AUTONUDGE_STOP_REASON)
     else:
