@@ -1589,6 +1589,20 @@ can adapt (an allowed alternative, a different tool) or stop on its own with a
 stated reason. The synthetic prompt is never mirrored to a linked Slack thread
 as user input (`_is_recovery` guard).
 
+The continuation **leads with remediation guidance** when the refusal classifies:
+`deny_guidance.remediation_for` supplies one paragraph per deny class,
+de-duplicated so several refusals of the same class contribute it once. Without
+it the model receives a reason and no sanctioned path, which is what produced the
+reported failure mode — an agent that retries the same shape under a different
+reader and then reports the capability missing.
+
+That guidance is rendered as **indented prose, never as `- ` bullets**. The
+frontend's `RecoveryCard` counts every bullet in this body as one blocked tool
+call (`BULLET_RE`), so a guidance paragraph written as a list makes one refusal
+plus its advice read as two blocked calls. A future edit that tidies the prose
+into a list would reintroduce that miscount silently; `toolBlockedCard.test.ts`
+pins the count.
+
 By design there is **no retry cap**: the model decides when to stop, and the
 user's Stop button remains the hard breaker (a stop clears the queue and aborts
 the chain). All four permission paths that can process PreToolUse script hooks

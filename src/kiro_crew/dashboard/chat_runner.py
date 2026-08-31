@@ -156,6 +156,12 @@ from kiro_crew.dashboard.turn_dispatch import (
     spawn_guarded_turn,
     tool_approval_timeout_secs,
 )
+from kiro_crew.deny_guidance import (
+    DENY_CLASS_AWS_CREDENTIAL,
+    DENY_CLASS_SSO_CREDENTIAL,
+    classify_deny,
+    resolve_credential_tool_hint,
+)
 from kiro_crew.executors import run_in_embed_pool, subprocess_executor
 from kiro_crew.hooks import (
     HOOK_EVENT_AGENT_SPAWN,
@@ -530,6 +536,28 @@ def _refined_tool_row_content(existing: str, new_title: str) -> str | None:
     return f"{prefix} {new_title}"
 
 
+#: Deny classes a credential-vending MCP server can actually resolve. Only these
+#: justify the capability-manager lookup: the hint is appended for them alone, so
+#: probing on any other refusal would spend a subprocess to produce a string
+#: nothing reads.
+_CREDENTIAL_HINT_CLASSES = frozenset({DENY_CLASS_AWS_CREDENTIAL, DENY_CLASS_SSO_CREDENTIAL})
+
+
+async def _credential_tool_hint_for(reason: str, cause: str, subject: str = "") -> str:
+    """The host's credential-vendor hint, when *reason* is a refusal it can answer.
+
+    Gated on the class rather than resolved unconditionally because the lookup
+    shells out to the edition's package manager. A refusal is already a bad moment
+    to add latency to, and for every non-credential class the result would be
+    discarded by :func:`build_refusal_steer_notice` anyway.
+    """
+    if cause != DENY_CAUSE_POLICY:
+        return ""
+    if classify_deny(reason, subject) not in _CREDENTIAL_HINT_CLASSES:
+        return ""
+    return await resolve_credential_tool_hint()
+
+
 async def _steer_policy_notice(
     client: Any,
     title: str,
@@ -567,7 +595,12 @@ async def _steer_policy_notice(
     """
     if not getattr(client, "supports_steer", False):
         return False
-    notice = build_refusal_steer_notice(title, reason, cause=cause)
+    notice = build_refusal_steer_notice(
+        title,
+        reason,
+        cause=cause,
+        credential_tool_hint=await _credential_tool_hint_for(reason, cause, title),
+    )
     if not notice:
         return False
     try:
@@ -9136,7 +9169,16 @@ async def _run_chat(
             notices_sent=len(_refusal_notices) + _refusal_notices_settled,
             notices_pending=len(_refusal_notices),
         ):
-            _recovery_body = build_refusal_recovery_prompt(_refusal_reasons)
+            _recovery_hint = ""
+            for _r_title, _r_reason in _refusal_reasons:
+                _recovery_hint = await _credential_tool_hint_for(
+                    _r_reason, DENY_CAUSE_POLICY, _r_title
+                )
+                if _recovery_hint:
+                    break
+            _recovery_body = build_refusal_recovery_prompt(
+                _refusal_reasons, credential_tool_hint=_recovery_hint
+            )
             if _recovery_body:
                 _queue_recovery(
                     0,

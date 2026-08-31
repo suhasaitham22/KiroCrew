@@ -53,6 +53,7 @@ from kiro_crew.dashboard.slot_queue_repository import SlotQueueRepository
 from kiro_crew.dashboard.slot_registry import SlotRegistry
 from kiro_crew.dashboard.system_notices import is_system_notice
 from kiro_crew.dashboard.websocket_hub import WebSocketHub
+from kiro_crew.deny_guidance import remediation_for
 from kiro_crew.history import latest_transcript_ts, monotonic_transcript_ts
 from kiro_crew.knowledge.store import KnowledgeStore
 from kiro_crew.loop_lock import LoopBoundLock
@@ -2573,7 +2574,9 @@ def parse_hook_continuations(stdouts: list[str]) -> list[str]:
     return reasons
 
 
-def build_refusal_recovery_prompt(refusals: list[tuple[str, str]]) -> str:
+def build_refusal_recovery_prompt(
+    refusals: list[tuple[str, str]], *, credential_tool_hint: str = ""
+) -> str:
     """Build the body of an automatic continuation after a recoverable tool refusal.
 
     When a tool call is refused for a recoverable, system-side reason — a
@@ -2620,6 +2623,25 @@ def build_refusal_recovery_prompt(refusals: list[tuple[str, str]]) -> str:
         "you genuinely cannot proceed — say so and stop. Otherwise continue the "
         "task where you left off.",
     ]
+    # Per-class remediation, de-duplicated across the turn's refusals: several
+    # blocked calls in one turn are usually the same wall hit from different
+    # angles, and repeating identical prose per bullet buries the one instruction
+    # that differs. Ordered by first appearance so the earliest refusal's
+    # guidance leads.
+    guidance: list[str] = []
+    for title, reason in refusals:
+        text = remediation_for(reason, title, credential_tool_hint=credential_tool_hint)
+        if text and text not in guidance:
+            guidance.append(text)
+    if guidance:
+        # NOT rendered as `  - ` bullets: RecoveryCard counts every bullet-shaped
+        # line in this body as one blocked tool call (`BULLET_RE`), so guidance in
+        # that shape would inflate the card's "N blocked" count with prose. The
+        # bullet list above is the wire form of the blocked-item count; this
+        # section is prose about it, and the two must stay distinguishable.
+        lines += ["", "How to do this properly:"]
+        for text in guidance:
+            lines += [f"    {text}"]
     return "\n".join(lines)
 
 
@@ -2657,7 +2679,13 @@ _DENY_CAUSE_TEXT: dict[str, tuple[str, str]] = {
 }
 
 
-def build_refusal_steer_notice(title: str, reason: str, *, cause: str = DENY_CAUSE_POLICY) -> str:
+def build_refusal_steer_notice(
+    title: str,
+    reason: str,
+    *,
+    cause: str = DENY_CAUSE_POLICY,
+    credential_tool_hint: str = "",
+) -> str:
     """Body of the in-band deny notice steered into the RUNNING turn.
 
     Sent BEFORE the permission rejection goes back on the wire, which is what
@@ -2692,6 +2720,17 @@ def build_refusal_steer_notice(title: str, reason: str, *, cause: str = DENY_CAU
         return ""
     clause, guidance = _DENY_CAUSE_TEXT.get(cause, _DENY_CAUSE_TEXT[DENY_CAUSE_POLICY])
     what = f"{title}: {reason}" if reason else title
+    # Class-specific remediation, for the policy cause only. The other two causes
+    # judged nothing about the action — an invalid tool name is the model's own
+    # malformed output and a hook fault is a host fault — so naming a sanctioned
+    # alternative there would answer a question nobody asked and imply the action
+    # itself had been refused.
+    remediation = (
+        remediation_for(reason, title, credential_tool_hint=credential_tool_hint)
+        if cause == DENY_CAUSE_POLICY
+        else ""
+    )
+    tail = f"\n\nHow to do this properly: {remediation}" if remediation else ""
     # "host notice", not "policy notice": the tag has to be true for all three
     # causes, and only one of them IS a policy. Naming the ACTOR is also what the
     # notice exists to do — the model has just been told the user denied this, and
@@ -2704,7 +2743,7 @@ def build_refusal_steer_notice(title: str, reason: str, *, cause: str = DENY_CAU
         '"User denied tool execution".\n\n'
         f"Blocked: {what}\n\n"
         "Do not apologise for a cancellation and do not ask the user whether to "
-        f"retry. Decide and continue in this same turn: {guidance}"
+        f"retry. Decide and continue in this same turn: {guidance}{tail}"
     )
 
 
