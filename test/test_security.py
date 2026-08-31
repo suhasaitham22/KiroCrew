@@ -8037,3 +8037,680 @@ class TestModelWeightsAreWriteProtected:
     def test_an_unrelated_path_named_models_is_not_fenced(self) -> None:
         """Scoped to the crew home, so an ordinary project directory is unaffected."""
         assert security.is_sensitive_write_path("~/code/myproject/models/weights.bin") is False
+
+
+class TestPublishFloorNestedPayloads:
+    """The publish floor must descend into nested shell payloads.
+
+    Every git-publish rule is stripped from the regex tier, so
+    ``_is_git_publish`` is the SOLE enforcement for pushes. It matched only the
+    top-level text, so a single wrapper was a complete bypass -- while the
+    self-protection floor beside it was already immune because it re-tokenizes
+    payloads through the same walk. These pin that the two floors now share it.
+    """
+
+    WRAPPED_PROTECTED = (
+        "bash -c 'git push origin main'",
+        "sh -c 'git push origin main'",
+        "bash -lc 'git push --force origin main'",
+        "bash -c -- 'git push origin mainline'",
+        "eval 'git push origin main'",
+        "bash <<< 'git push origin main'",
+        "bash -c 'bash -c \"git push origin main\"'",  # nested two deep
+        "$SHELL -c 'git push origin mainline'",
+        "bash -c 'git push --mirror origin'",
+        "echo 'git push origin main' | bash",
+    )
+
+    def test_wrapped_protected_push_denied(self) -> None:
+        from kiro_crew.security import is_denied
+
+        for cmd in self.WRAPPED_PROTECTED:
+            assert is_denied(cmd) is not None, cmd
+
+    def test_end_of_options_terminator_does_not_hide_the_payload(self) -> None:
+        """``--`` ends option parsing, so the script is the token AFTER it.
+
+        ``eval -- '<script>'`` yielded the literal ``--`` as the payload, so the
+        real script was never walked and the push executed. The ``-c`` branch
+        already skipped the terminator; the verb branch did not.
+        """
+        from kiro_crew.security import _shell_payload_sources, is_denied
+
+        assert "git push origin main" in _shell_payload_sources("eval -- 'git push origin main'")
+        for cmd in (
+            "eval -- 'git push origin main'",
+            "eval -- -- 'git push origin mainline'",
+            "bash -c -- 'git push origin main'",
+        ):
+            assert is_denied(cmd) is not None, cmd
+
+    def test_eval_concatenates_its_arguments_into_one_command(self) -> None:
+        """``eval a b c`` evaluates ``a b c``, so no single argument looks like one.
+
+        Taking only the first argument let the publish through: the walk handed
+        the hooks the bare program name and the verb sat in the next word, which
+        no check ever saw. Splitting across MORE words was already caught, because
+        each word then appears as its own token -- the gap was specifically the
+        program alone in one word and the whole verb-and-args tail glued into the
+        next.
+        """
+        from kiro_crew.security import _shell_payload_sources, is_denied
+
+        assert "git push origin main" in _shell_payload_sources("eval 'git' 'push origin main'")
+        for cmd in (
+            "eval 'git' 'push origin main'",
+            "eval -- 'git' 'push origin main'",
+            "eval 'git' 'push --force origin mainline'",
+            "eval 'git push' 'origin main'",
+        ):
+            assert is_denied(cmd) is not None, cmd
+
+    def test_eval_join_does_not_over_block_ordinary_multi_word_eval(self) -> None:
+        from kiro_crew.security import is_denied
+
+        for cmd in (
+            "eval 'ls' '-la'",
+            "eval 'echo' 'hello world'",
+            "eval 'git' 'status'",
+            "eval 'git' 'push origin my-feature'",
+        ):
+            assert is_denied(cmd) is None, cmd
+
+    def test_a_wrapped_feature_branch_push_is_not_blocked(self) -> None:
+        """The over-block: ordinary work refused along with the protected case.
+
+        Admitting ``(`` as a leading separator makes the OUTER wrapper line
+        match the publish detector, because the ``(`` sits right after the
+        wrapper's quote. That line is not itself a push -- the push text lives
+        inside one quoted argument -- so no ``git`` token is there to parse, and
+        the "detected but unparseable" rule denied it. That rule is for
+        obfuscation, which a quoted payload is not, so a FEATURE-branch push
+        inside a subshell inside a wrapper was refused.
+        """
+        from kiro_crew.security import is_denied
+
+        for cmd in (
+            "bash -c '(git push origin my-feature)'",
+            'bash -c "(git push origin my-feature)"',
+            "bash -c '(cd /tmp && git push origin my-feature)'",
+            "bash -c \"(git push origin 'release/x')\"",
+            "sh -c '(git push origin fix/some-branch)'",
+        ):
+            assert is_denied(cmd) is None, cmd
+
+    def test_the_wrapped_protected_push_is_still_denied(self) -> None:
+        """The deferral must not cost the denial it exists alongside.
+
+        These need the payload descent AND the quote-aware operator cut
+        together: the ref is quoted inside a subshell inside a wrapper.
+        """
+        from kiro_crew.security import is_denied
+
+        for cmd in (
+            "bash -c '(git push origin main)'",
+            "bash -c \"(git push origin 'main')\"",
+            "sh -c \"(cd /tmp; git push origin 'main')\"",
+            "bash -c \"(git push --force origin 'mainline')\"",
+            "eval \"(git push origin 'mainline')\"",
+        ):
+            assert is_denied(cmd) is not None, cmd
+
+    def test_a_verb_named_argument_does_not_buy_a_deferral(self) -> None:
+        """The deferral must key on a payload that is itself a publish.
+
+        Asking only whether a payload EXISTS was a bypass. A remote or refspec
+        that happens to share a name with a shell verb makes the payload walk
+        report a payload, and QUOTING the program defeats the ``git`` anchor so
+        the args come back None. Together those two let a protected-branch
+        publish through: nothing downstream ever judged it, because the payload
+        the outer line deferred to was the bare word ``main``, which is not a
+        publish and answers nothing.
+        """
+        from kiro_crew.security import is_denied
+
+        for cmd in (
+            '"git" push eval main',
+            "'git' push eval main",
+            '"git" push source main',
+            '"git" push . main',
+            '"git" push origin main',
+            "git push eval main",
+            "git push source main",
+            "git push origin eval main",
+        ):
+            assert is_denied(cmd) is not None, cmd
+
+    def test_the_publish_floor_returns_a_decision_when_the_walk_raises(self) -> None:
+        """The gate must DECIDE, never raise.
+
+        The floor's payload enumeration ran unguarded, so a helper that exploded
+        escaped ``is_denied`` and the PreToolUse gate crashed instead of denying.
+        On failure it degrades to the top-level reading -- exactly what this
+        floor checked before it learned to descend -- so a broken walk costs the
+        nested coverage and nothing else.
+        """
+        import kiro_crew.security as sec
+
+        def boom(*_a: object, **_k: object) -> object:
+            raise RuntimeError("payload walk exploded")
+
+        original = sec._nested_shell_payloads
+        try:
+            sec._nested_shell_payloads = boom  # type: ignore[assignment]
+            # Decides rather than raising, and the top-level reading still holds.
+            assert sec.is_denied("git push origin main") is not None
+            assert sec.is_denied("rm -rf /") is not None
+            assert sec.is_denied("git push origin my-feature") is None
+        finally:
+            sec._nested_shell_payloads = original  # type: ignore[assignment]
+
+    def test_an_operator_in_an_executable_path_is_not_a_shell_operator(self) -> None:
+        """Punctuation inside an already-tokenized word belongs to the word.
+
+        The normalizer has tokenized and dequoted before this detector runs, so
+        replacing each token with its operator-cut form truncated a legal
+        executable path (``/opt/my(dir)/git`` -> ``/opt/my``, whose basename is
+        not ``git``). Detection was NARROWED and a protected push through such a
+        path went from denied to allowed. Both spellings are consulted now, so
+        the widen-only property actually holds.
+        """
+        from kiro_crew.security import is_denied
+
+        for cmd in (
+            '"/opt/my(dir)/git" push origin main',
+            "'/opt/my(dir)/git' push origin main",
+            '"/opt/my(dir)/git" push origin mainline',
+            '"/opt/a(b)/git" push --force origin main',
+            "/usr/bin/git push origin main",
+            '"/usr/bin/git" push origin main',
+        ):
+            assert is_denied(cmd) is not None, cmd
+
+        # The glued-operator spellings the cut exists for still resolve.
+        for cmd in ("(git push origin main)", "(git push origin 'main')"):
+            assert is_denied(cmd) is not None, cmd
+
+    def test_obfuscation_with_no_payload_still_fails_closed(self) -> None:
+        """The deferral is NOT a general escape hatch.
+
+        The outer reading defers only when a nested payload exists to defer TO.
+        Glue-evasion carries no payload, so it must still be denied on the spot.
+        """
+        from kiro_crew.security import is_denied
+
+        for cmd in (
+            "git$(echo ' ')push origin main",
+            "git`echo ' '`push origin main",
+            "git push origin ma$(echo)in",
+            "git push",
+            "git push --mirror origin",
+        ):
+            assert is_denied(cmd) is not None, cmd
+
+    def test_the_eval_join_stays_linear(self) -> None:
+        """A join is O(N), so one per verb token would be quadratic.
+
+        The nested-payload walk was deliberately made linear and is pinned that
+        way, but those shapes use shell-program tokens only, so this path is not
+        covered there. Bounding the join to once per walk keeps it linear, and
+        one is enough because it runs to the END of the token list and therefore
+        already spans every later verb's own suffix.
+        """
+        import time
+
+        from kiro_crew.security import _nested_shell_payloads
+
+        def elapsed(n: int) -> float:
+            tokens = ["eval", "a", "b"] * n
+            start = time.perf_counter()
+            _nested_shell_payloads(list(tokens))
+            return time.perf_counter() - start
+
+        def best(n: int, samples: int = 3) -> float:
+            return min(elapsed(n) for _ in range(samples))
+
+        elapsed(500)
+        small, large = best(4000), best(8000)
+        assert large < small * 3, f"{small:.4f}s -> {large:.4f}s looks super-linear"
+        assert large < 1.0, f"24k tokens took {large:.3f}s"
+
+    def test_only_one_joined_payload_is_produced_per_walk(self) -> None:
+        """The bound above is what keeps it linear, so pin the bound itself."""
+        from kiro_crew.security import _nested_shell_payloads
+
+        tokens = ["eval", "git", "push origin main", "eval", "x", "y"]
+        payloads = _nested_shell_payloads(list(tokens))
+        joined = [p for p in payloads if " " in p and p.count(" ") > 1]
+        assert len(joined) == 1, payloads
+        # The one join reaches the end, so the later verb's suffix is inside it.
+        assert joined[0].endswith("x y"), joined
+        assert "push origin main" in joined[0], joined
+
+    def test_source_arguments_are_not_joined(self) -> None:
+        """``source``/``.`` take a FILE; the rest are positional parameters.
+
+        Joining them would invent a command line bash never runs, so the
+        concatenation is scoped to ``eval`` alone.
+        """
+        from kiro_crew.security import _nested_shell_payloads, normalize_shell_command
+
+        for cmd in ("source setup.sh arg1 arg2", ". setup.sh arg1 arg2"):
+            payloads = _nested_shell_payloads(normalize_shell_command(cmd))
+            assert payloads == ["setup.sh"], (cmd, payloads)
+
+    def test_prefix_forms_of_a_real_push_still_denied(self) -> None:
+        """Guards against narrowing detection to fix the ``echo`` false positive.
+
+        Requiring ``git`` to sit in ``_argv_programs`` command position was tried
+        and silently broke all five of these, so the walk deliberately still
+        scans every token.
+        """
+        from kiro_crew.security import is_denied
+
+        for cmd in (
+            "/usr/bin/git push origin main",
+            "env FOO=1 git push origin main",
+            "sudo git push origin main",
+            "nohup git push origin main",
+            "command git push origin main",
+            "bash -c 'env X=1 git push origin mainline'",
+        ):
+            assert is_denied(cmd) is not None, cmd
+
+    def test_wrapped_feature_push_still_allowed(self) -> None:
+        from kiro_crew.security import is_denied
+
+        # The floor decides protected-vs-feature, so widening DETECTION must not
+        # turn ordinary work into a denial.
+        for cmd in (
+            "bash -c 'git push origin my-feature'",
+            "sh -c 'git push origin fix/thing'",
+        ):
+            assert is_denied(cmd) is None, cmd
+
+    def test_wrapped_benign_not_overblocked(self) -> None:
+        from kiro_crew.security import is_denied
+
+        for cmd in (
+            "bash -c 'echo remember to push later'",
+            "bash -c 'git fetch origin main'",
+            "bash -c 'ls -la'",
+            "git stash push -m wip",
+        ):
+            assert is_denied(cmd) is None, cmd
+
+    def test_self_protection_floor_shares_the_walk(self) -> None:
+        from kiro_crew.security import is_denied
+
+        # Same walk now feeds both floors; the self-protection side must not
+        # regress when the publish side starts consuming it.
+        for cmd in (
+            "bash -c 'kirocrew token'",
+            "bash -c 'kirocrew restart'",
+            "cat <(kirocrew token)",
+        ):
+            assert is_denied(cmd) is not None, cmd
+
+    def test_payload_sources_and_frames_agree(self) -> None:
+        from kiro_crew.security import _self_token_frames, _shell_payload_sources
+
+        # The two views are projections of ONE walk, so they must stay the same
+        # length -- a drift here is the class of bug this refactor removes.
+        cmd = "bash -c 'git push origin main'"
+        assert len(_shell_payload_sources(cmd)) == len(_self_token_frames(cmd))
+        assert cmd in _shell_payload_sources(cmd)
+        assert "git push origin main" in _shell_payload_sources(cmd)
+
+
+class TestImdsMixedBaseEncodings:
+    """The IMDS gate must fold every base in every octet position.
+
+    ``canonicalize_ip`` already resolved all of these; the EXTRACTION regex
+    could not capture them whole, so it handed the canonicalizer a truncated
+    substring that folded to a harmless address while the OS resolver still
+    routed the full token to 169.254.169.254 (credential-theft SSRF).
+    Ground truth for each host below: ``socket.getaddrinfo`` resolves it to the
+    IMDS address on glibc.
+    """
+
+    #: Every spelling here genuinely resolves to the IMDS address.
+    IMDS_FORMS = (
+        "025177524776",  # zero-padded/octal single integer, >10 digits
+        "169.254.0251.0376",  # decimal + octal octets mixed
+        "0251.0376.169.254",  # octal leading, decimal trailing
+        "169.254.0xa9.0376",  # hex + octal in non-leading positions
+        "0251.16689662",  # octal 2-part inet_aton short form
+        "169.254.169.0376",  # octal final octet only
+        "0000000169.254.169.254",  # arbitrary zero padding
+    )
+
+    def test_mixed_base_imds_encodings_blocked(self) -> None:
+        from kiro_crew.security import _check_imds_access, canonicalize_ip
+
+        for host in self.IMDS_FORMS:
+            assert canonicalize_ip(host) == "169.254.169.254", host
+            cmd = f"curl http://{host}/latest/meta-data/iam/security-credentials/"
+            assert _check_imds_access(cmd) is not None, host
+            assert is_sensitive_bash_command(cmd) is not None, host
+
+    def test_padded_hex_imds_encodings_blocked(self) -> None:
+        """A length cap on the extraction regex is itself the bypass.
+
+        Capping the hex run truncated a zero-padded spelling into a DIFFERENT,
+        harmless address -- ``0x0a9fea9fe`` folded to 10.159.234.159 -- so the
+        gate failed open on a form glibc ``inet_aton`` accepts and routes to
+        IMDS. The components are plain character classes with no nested
+        quantifier, so an unbounded run is linear and the cap bought nothing.
+        """
+        from kiro_crew.security import _check_imds_access, canonicalize_ip
+
+        for host in (
+            "0x0a9fea9fe",  # leading-zero hex, 9 digits
+            "0x00000000a9fea9fe",  # heavily padded hex
+            "169.254.0x00000000a9.0376",  # padded hex component mid-token
+        ):
+            assert canonicalize_ip(host) == "169.254.169.254", host
+            cmd = f"curl http://{host}/latest/meta-data/iam/security-credentials/"
+            assert _check_imds_access(cmd) is not None, host
+            assert is_sensitive_bash_command(cmd) is not None, host
+
+    def test_unbounded_extraction_stays_linear(self) -> None:
+        import time
+
+        from kiro_crew.security import _check_imds_access
+
+        # Guards the reason the caps are gone: unbounded runs over plain
+        # character classes must not backtrack. Generous bound -- the observed
+        # cost is single-digit milliseconds.
+        for payload in ("9" * 40000, "0" * 40000, "0x" + "a" * 40000):
+            start = time.monotonic()
+            _check_imds_access(f"curl http://{payload}/x")
+            assert time.monotonic() - start < 5.0, payload
+
+    def test_mixed_base_non_imds_not_overblocked(self) -> None:
+        from kiro_crew.security import _check_imds_access, canonicalize_ip
+
+        # 169.0000254.169.254 is a legal mixed encoding that resolves to
+        # 169.172.169.254 (0254 octal == 172), NOT to IMDS -- widening the
+        # extraction must not turn "looks like an IP" into "is IMDS".
+        assert canonicalize_ip("169.0000254.169.254") == "169.172.169.254"
+        assert _check_imds_access("curl http://169.0000254.169.254/x") is None
+        # Out-of-range single integer stays unparsed and unflagged.
+        assert _check_imds_access("curl http://02511777524776/x") is None
+        # A long digit run that is not an address at all (timestamp/id).
+        assert _check_imds_access("echo 17251234567890123") is None
+
+
+class TestGitPublishSubshellGluing:
+    """``(`` and ``)`` are shell OPERATORS, so they cannot hide a git push.
+
+    Every git-publish rule is stripped from the regex tier, which makes
+    ``_is_git_publish`` the SOLE enforcement for pushes. A paren glued to the
+    program (``(git push``) defeated the detector, and a paren glued to the ref
+    (``main)``) defeated the protected-name compare -- the latter also emitted a
+    SEL ``push_allowed`` event labelled ``feature_branch_push`` for a
+    protected-branch force-push.
+    """
+
+    GLUED_PROTECTED_PUSHES = (
+        "(git push origin main)",
+        "((git push origin main))",
+        "(cd /tmp; git push origin main)",
+        "(cd /tmp && git push origin mainline)",
+        "(cd /tmp; git push --force origin mainline)",
+        "(true; git push origin head:main)",
+        "(git push --mirror origin)",
+    )
+
+    def test_glued_subshell_protected_push_denied(self) -> None:
+        from kiro_crew.security import is_denied
+
+        for cmd in self.GLUED_PROTECTED_PUSHES:
+            assert is_denied(cmd) is not None, cmd
+
+    def test_glued_subshell_push_reaches_protected_branch_check(self) -> None:
+        from kiro_crew.security import _is_push_to_protected_branch
+
+        # Not merely denied: the branch check must SEE the protected target, or
+        # the allow-audit records a protected push as a feature-branch push.
+        for cmd in (
+            "(cd /tmp; git push origin main)",
+            "(cd /tmp; git push --force origin mainline)",
+            "(git push origin mainline)",
+        ):
+            assert _is_push_to_protected_branch(cmd.lower()) is True, cmd
+
+    GLUED_OPERATOR_PUSHES = (
+        "(git push origin main)&",  # trailing background operator
+        "(git push origin main);",
+        "(git push origin main)|cat",
+        "(git push origin mainline)>log",  # operator MID-token, strip cannot reach it
+        "(cd /tmp; git push origin main)&",
+        "{ git push origin main; }",
+        "(git push --force origin mainline)&",
+    )
+
+    def test_glued_operator_on_the_ref_is_not_part_of_the_name(self) -> None:
+        """bash reads ``main)&`` as the ref ``main`` plus two operators.
+
+        Stripping only parens left ``main)&``, which never equalled ``main``, so a
+        protected push was allowed AND audited as a feature-branch push. A
+        redirection glued mid-token (``mainline)>log``) is why this cuts at the
+        first operator instead of stripping the ends.
+        """
+        from kiro_crew.security import _is_push_to_protected_branch, is_denied
+
+        for cmd in self.GLUED_OPERATOR_PUSHES:
+            assert _is_push_to_protected_branch(cmd.lower()) is True, cmd
+            assert is_denied(cmd) is not None, cmd
+
+    def test_cut_at_operator_preserves_a_quoted_ref(self) -> None:
+        from kiro_crew.security import _cut_at_operator
+
+        # Unquoted: operators are structure, so cut.
+        assert _cut_at_operator("(git") == "git"
+        assert _cut_at_operator("main)&") == "main"
+        assert _cut_at_operator("mainline)>log") == "mainline"
+        assert _cut_at_operator("my-feature") == "my-feature"
+        # Quoted: operators are literal text belonging to the ref name.
+        assert _cut_at_operator("'(main)'") == "'(main)'"
+        assert _cut_at_operator('"(main)"') == '"(main)"'
+
+    def test_quoted_paren_ref_is_not_a_protected_branch(self) -> None:
+        from kiro_crew.security import _is_push_to_protected_branch
+
+        # Grouping parens are stripped BEFORE the quotes come off, so a paren the
+        # user QUOTED as part of the ref name survives: a branch literally named
+        # ``(main)`` is not ``main`` and must stay pushable.
+        for cmd in ("git push origin '(main)'", 'git push origin "(main)"'):
+            assert _is_push_to_protected_branch(cmd.lower()) is False, cmd
+
+    QUOTED_REF_GLUED_OPERATOR_PUSHES = (
+        "(git push origin 'main')",
+        '(git push origin "main")',
+        "(git push origin 'mainline')",
+        '(git push origin "mainline")',
+        "(cd /tmp; git push origin 'main')",
+        "(git push --force origin 'mainline')",
+        "(git push origin 'main')&",
+        "{ git push origin 'main'; }",
+    )
+
+    def test_quoting_the_ref_does_not_hide_the_glued_operator(self) -> None:
+        """A quoted ref can still carry an operator OUTSIDE its quotes.
+
+        Bailing on the mere PRESENCE of a quote reopened the very class this
+        cut exists to close: ``(git push origin 'main')`` hands the ref token
+        ``'main')``, whose trailing ``)`` is unquoted. Left in place, the ref
+        resolved to ``main)``, never equalled ``main``, and the protected push
+        was allowed AND audited as ``feature_branch_push``. One quote character
+        was the whole bypass.
+        """
+        from kiro_crew.security import _is_push_to_protected_branch, is_denied
+
+        for cmd in self.QUOTED_REF_GLUED_OPERATOR_PUSHES:
+            assert _is_push_to_protected_branch(cmd.lower()) is True, cmd
+            assert is_denied(cmd) is not None, cmd
+
+    def test_cut_at_operator_cuts_outside_quotes_only(self) -> None:
+        from kiro_crew.security import _cut_at_operator
+
+        # Operator OUTSIDE the quotes is structure -> cut.
+        assert _cut_at_operator("'main')") == "'main'"
+        assert _cut_at_operator('"main")') == '"main"'
+        assert _cut_at_operator("'main')&") == "'main'"
+        # Operator INSIDE the quotes is part of the ref name -> keep.
+        assert _cut_at_operator("'(main)'") == "'(main)'"
+        assert _cut_at_operator("'a;b'") == "'a;b'"
+        assert _cut_at_operator("'weird&name'") == "'weird&name'"
+        # An unbalanced quote reads the remainder as quoted, so nothing is cut.
+        # Safe: bash never runs a command with an unterminated quote.
+        assert _cut_at_operator("'main)") == "'main)"
+
+    def test_a_quoted_program_still_anchors_the_push(self) -> None:
+        """A quoted ``"git"`` is still the git program to bash.
+
+        Matching the raw token missed it and anchored on a LATER unquoted
+        ``git push``, returning only that push's arguments. Appending a benign
+        second push therefore hid the first one's protected ref completely and
+        turned a fail-closed segment into an allow.
+        """
+        from kiro_crew.security import _git_push_args, is_denied
+
+        assert _git_push_args('"git" push eval main git push origin my-feature') == [
+            "eval",
+            "main",
+            "git",
+            "push",
+            "origin",
+            "my-feature",
+        ]
+        for cmd in (
+            '"git" push eval main git push origin my-feature',
+            "'git' push eval main git push origin my-feature",
+            '"git" push origin main git push origin my-feature',
+            '"git" push origin main',
+            "'git' push origin mainline",
+            '"git" push eval main',
+        ):
+            assert is_denied(cmd) is not None, cmd
+
+    def test_the_anchor_view_does_not_double_dequote_the_refs(self) -> None:
+        """The returned tokens must KEEP their quoting.
+
+        Callers dequote them once more, so stripping quotes here too would read
+        a literal ``'(main)'`` ref as the operators ``(``/``)`` around ``main``
+        and deny a branch that is legitimately pushable. That is why the
+        dequoting is done on a separate anchor view rather than on the tokens.
+        """
+        from kiro_crew.security import _git_push_args, _is_push_to_protected_branch
+
+        assert _git_push_args("git push origin '(main)'") == ["origin", "'(main)'"]
+        assert _is_push_to_protected_branch("git push origin '(main)'") is False
+
+    def test_quoted_operator_ref_names_stay_pushable(self) -> None:
+        """The no-over-block half: these are legal, unprotected branch names."""
+        from kiro_crew.security import _is_push_to_protected_branch, is_denied
+
+        for cmd in (
+            "git push origin '(main)'",
+            "(git push origin '(main)')",
+            "(git push origin 'release/x')",
+            "git push origin 'feature|x'",
+            "git push origin 'weird&name'",
+            "git push origin 'a;b'",
+            "git push origin 'mainly'",
+        ):
+            assert _is_push_to_protected_branch(cmd.lower()) is False, cmd
+            assert is_denied(cmd) is None, cmd
+
+    def test_feature_branch_push_still_allowed_in_subshell(self) -> None:
+        # The whole point of the branch check is that ordinary work still runs.
+        for cmd in (
+            "git push origin my-feature",
+            "(cd /tmp; git push origin my-feature)",
+            "(git push origin fix/imds-encodings)",
+        ):
+            from kiro_crew.security import _is_push_to_protected_branch
+
+            assert _is_push_to_protected_branch(cmd.lower()) is False, cmd
+
+
+class TestMaskedSubstitutionKeepsAdjacentLiterals:
+    """A masked substitution must not swallow the literal text after it.
+
+    The placeholder was a BARE ``$__kc_subst``, so bash-identifier characters
+    following the substitution were absorbed into the placeholder's own name and
+    silently deleted from the path -- the unresolved reading of
+    ``~/.a$(echo '')ws/credentials`` became the benign ``~/.a/credentials``.
+    Masking is a defence, so a form where it DESTROYS the signal is strictly
+    worse than not masking; the brace form keeps the literal separate, which is
+    why the ``${UNSET}`` equivalent was already denied.
+    """
+
+    def test_substitution_glued_to_literal_is_denied(self) -> None:
+        for cmd in (
+            "cat ~/.a$(echo '')ws/credentials",
+            "cat ~/.k$(echo '')iro/crew/token_signing.key",
+            "cat ~/.a`echo`ws/credentials",
+        ):
+            assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    def test_matches_the_unset_variable_equivalent(self) -> None:
+        # The brace-delimited unset-variable form was already denied; the masked
+        # substitution is unresolvable for the same reason, so it must agree.
+        assert is_sensitive_bash_command("cat ~/.a${UNSETX}ws/credentials") is not None
+        assert is_sensitive_bash_command("cat ~/.a$(echo '')ws/credentials") is not None
+
+    def test_unvalued_placeholder_is_brace_delimited(self) -> None:
+        from kiro_crew.security import _SUBST_PLACEHOLDER_NAME, _mask_substitutions
+
+        # The NAME must stay brace-free so the reserved-name refusal still matches.
+        assert "{" not in _SUBST_PLACEHOLDER_NAME
+        assert "}" not in _SUBST_PLACEHOLDER_NAME
+        masked = _mask_substitutions("cat ~/.a$(echo '')ws/credentials")
+        assert "${" in masked and "}ws" in masked, masked
+
+    def test_valued_placeholder_stays_bare(self) -> None:
+        """The asymmetry is deliberate: the two passes fail closed differently.
+
+        The valued pass records a GUESSED value, so a resolvable reference
+        substitutes that guess. Bare, a trailing literal is absorbed into the
+        name, which is then absent from ``values`` and reads as unresolved --
+        the absorption is what makes this pass fail closed. Bracing it let the
+        guess resolve and lost that reading.
+        """
+        from kiro_crew.security import _mask_substitutions_valued
+
+        numbered, values = _mask_substitutions_valued("cat $(pwd)x $(pwd)y")
+        assert "$__kc_subst1x" in numbered, numbered
+        assert "$__kc_subst2y" in numbered, numbered
+        # The absorbed spellings are NOT recorded, which is the fail-closed part.
+        assert "__kc_subst1x" not in values, values
+        assert "__kc_subst2y" not in values, values
+
+    def test_a_wrong_path_guess_cannot_resolve_away_the_unresolved_reading(self) -> None:
+        """Regression: bracing the valued placeholder allowed a credential read.
+
+        ``_substitution_path_guess`` vouches for the LAST path-like word, which
+        here is the redirection ``</dev/null`` rather than a path at all. With
+        the valued placeholder braced, that guess resolved and the following
+        credential read went from denied to allowed. Reported separately: making
+        the guess genuinely additive is the deeper fix.
+        """
+        for cmd in (
+            "cd $(printf /home/ </dev/null)alice; cat .aws/credentials",
+            "cd $(printf /home/ 2>/dev/null)alice; cat .aws/credentials",
+            "cd $(printf /home/)alice; cat .aws/credentials",
+        ):
+            assert is_sensitive_bash_command(cmd) is not None, cmd
+
+    def test_benign_globs_and_paths_not_overblocked(self) -> None:
+        for cmd in (
+            "cat ~/notes/*.md",
+            "ls ~/*.txt",
+            "cat ~/.config/app/settings.json",
+            "echo $(date)x",
+        ):
+            assert is_sensitive_bash_command(cmd) is None, cmd
