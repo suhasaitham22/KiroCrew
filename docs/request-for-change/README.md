@@ -25,6 +25,7 @@ was added 2026-08-27. The `rfc-crew-agent-sdk-boundary` row was added 2026-08-28
 
 | Document | Status | What is actually on main |
 |---|---|---|
+| [rfc-central-governance-ceiling.md](rfc-central-governance-ceiling.md) | `in-progress` | Steps 1-6 are on this branch: the MDM-managed tier, its root-owned trust check, central-above-env precedence, tighten-only subordinates, Ed25519 policy signing, and the dated `break_glass` grant. Step 7 (server-side attestation, the only step that binds local root) is a documented non-goal |
 | [rfc-transcript-section-markers.md](rfc-transcript-section-markers.md) | `draft` | Nothing. No `section_marker` role exists; every collapse affordance is intra-turn (`CollapsibleToolGroup`, `TurnBlock`, `ToolCallLine`) and nothing collapses rows above a point |
 | [rfc-crew-agent-sdk-boundary.md](rfc-crew-agent-sdk-boundary.md) | `draft` | Nothing. Audited at `dc88f142b`: `providers/base.py:30` still aliases `AcpEvent` as the "provider-agnostic" event type, 68 direct `kiro_crew.acp` import edges remain across 42 files outside `acp/` and `providers/`, and `acp/worker_pool.py:49` still imports back from `session_pid.py` behind a cycle guard. No `agent_sdk` package and no import ratchet exist |
 | [rfc-global-workflow-library.md](rfc-global-workflow-library.md) | `in-progress` | Nothing. The active detached worktree adds the global definition library, local adaptation and lineage, exact `/workflow <name>` invocation, MCP/HTTP contracts, and the Agent Capabilities management surface |
