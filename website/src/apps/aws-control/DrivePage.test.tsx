@@ -32,6 +32,7 @@ vi.mock('./api', async () => {
       costs: vi.fn(),
       library: vi.fn(),
       libraryPush: vi.fn(),
+      libraryRemove: vi.fn(),
       backup: vi.fn(),
       backupRun: vi.fn(),
       backupNightly: vi.fn(),
@@ -735,6 +736,80 @@ describe('DrivePage', () => {
     expect(screen.queryByTestId('library-push')).toBeNull()
   })
 
+  /**
+   * Removal is gated on a cloud copy existing: a synced card offers Remove, an
+   * unsynced one has nothing to empty. The gate matters more than the button --
+   * one synced fixture would look identical whether the control were gated or
+   * hardcoded.
+   */
+  it('offers Remove on synced cards only, behind an inline confirm', async () => {
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({ files: [], folders: [] })
+    vi.mocked(awsControlApi.library).mockResolvedValue({
+      artifacts: [
+        { slug: 'notes', name: 'Notes', kind: 'markdown', version: 4, updatedAt: '2026-08-20T00:00:00Z', pushedVersion: 4, pushedAt: '2026-08-20T00:00:00Z' },
+        { slug: 'draft', name: 'Draft', kind: 'markdown', version: 2, updatedAt: '2026-08-20T00:00:00Z', pushedVersion: null, pushedAt: null },
+      ],
+    })
+    vi.mocked(awsControlApi.libraryRemove).mockResolvedValue({ removed: true } as never)
+
+    await renderDrive('library')
+    fireEvent.click(await screen.findByTestId('library-add-open'))
+    await screen.findByTestId('library-add-dialog')
+
+    // Only the synced card carries the trigger.
+    expect(await screen.findAllByTestId('library-tile')).toHaveLength(2)
+    expect(screen.getAllByTestId('library-remove')).toHaveLength(1)
+
+    // The trigger opens a named confirm; nothing is deleted yet.
+    fireEvent.click(screen.getByTestId('library-remove'))
+    const confirm = await screen.findByTestId('library-remove-confirm')
+    expect(confirm).toBeTruthy()
+    // The removal is slug-keyed: `libraryRemove` empties `library/<slug>/`, and
+    // the ledger that lit this tile is keyed by slug alone, so a reused slug can
+    // point the delete at a different artifact's cloud copy. The confirm must
+    // name that cloud folder, not only the local artifact, so the destructive
+    // click is confirmed against the identity the deletion actually uses.
+    expect(confirm).toHaveTextContent('library/notes/')
+    expect(awsControlApi.libraryRemove).not.toHaveBeenCalled()
+
+    // Cancel closes the strip without a call.
+    fireEvent.click(screen.getByTestId('library-remove-cancel'))
+    expect(screen.queryByTestId('library-remove-confirm')).toBeNull()
+    expect(awsControlApi.libraryRemove).not.toHaveBeenCalled()
+
+    // Confirming actually removes.
+    fireEvent.click(screen.getByTestId('library-remove'))
+    fireEvent.click(await screen.findByTestId('library-remove-action'))
+    await waitFor(() => expect(awsControlApi.libraryRemove).toHaveBeenCalledWith(ACCOUNT.account, 'notes'))
+  })
+
+  /**
+   * A failed cloud delete must render, not vanish: the strip closing before the
+   * outcome was known hid the failure entirely (the reviewed-away bug), so the
+   * strip stays open and delete_failed appears on the card.
+   */
+  it('keeps the confirm open and says so when the removal fails', async () => {
+    stubDrivePresent()
+    vi.mocked(awsControlApi.driveList).mockResolvedValue({ files: [], folders: [] })
+    vi.mocked(awsControlApi.library).mockResolvedValue({
+      artifacts: [
+        { slug: 'notes', name: 'Notes', kind: 'markdown', version: 4, updatedAt: '2026-08-20T00:00:00Z', pushedVersion: 4, pushedAt: '2026-08-20T00:00:00Z' },
+      ],
+    })
+    vi.mocked(awsControlApi.libraryRemove).mockRejectedValue(new Error('boom'))
+
+    await renderDrive('library')
+    fireEvent.click(await screen.findByTestId('library-add-open'))
+    fireEvent.click(await screen.findByTestId('library-remove'))
+    fireEvent.click(await screen.findByTestId('library-remove-action'))
+
+    // The failure renders on the card, and the strip is still there to retry
+    // or cancel -- a silent close was the bug this design replaces.
+    expect(await screen.findByTestId('library-remove-error')).toBeTruthy()
+    expect(screen.getByTestId('library-remove-confirm')).toBeTruthy()
+  })
+
   it('the picker searches by name and reports when nothing matches', async () => {
     stubDrivePresent()
     vi.mocked(awsControlApi.driveList).mockResolvedValue({ files: [], folders: [] })
@@ -1245,14 +1320,16 @@ describe('DrivePage', () => {
   })
 
   /**
-   * The no-removal disclosure must reach the person doing the adding.
+   * The cost disclosure must reach the person doing the adding.
    *
-   * Adding fills storage the user pays for and there is no in-app removal yet.
-   * The folder's own hint was the only place that said so -- and the empty
-   * state's button opens this dialog directly, so a first-time user skipped it
-   * entirely. A warning on a path the reader never takes is not a warning.
+   * Adding fills storage the account pays for, and the empty state's button
+   * opens this dialog directly, so a first-time user never passes the folder's
+   * own copy. A warning on a path the reader never takes is not a warning.
+   *
+   * COST only: the picker's cards carry a Remove control, so a banner claiming
+   * removal is unavailable would be disproved by a button in the same dialog.
    */
-  it('states inside the picker that adding cannot be undone here', async () => {
+  it('states the storage cost inside the picker', async () => {
     stubDrivePresent()
     vi.mocked(awsControlApi.driveList).mockResolvedValue({ files: [], folders: [] })
     vi.mocked(awsControlApi.library).mockResolvedValue({
@@ -1262,16 +1339,16 @@ describe('DrivePage', () => {
     })
 
     await renderDrive('library')
-    // Open from the EMPTY STATE button, the path that bypassed the folder hint.
+    // Open from the EMPTY STATE button, the path that bypasses the folder blurb.
     fireEvent.click(await screen.findByTestId('library-empty-add'))
     const dialog = await screen.findByTestId('library-add-dialog')
-    expect(screen.getByTestId('library-add-oneway').textContent)
-      .toBe(i18nT('apps.awsControl.console.library_add_oneway'))
-    // Scoped to the DIALOG: the folder behind the overlay still shows its own
-    // hint, and should. What must not appear in here is that hint's pointer at
-    // the "Where this lives" drawer, which the reader cannot reach from this
-    // dialog.
-    expect(within(dialog).queryByText(i18nT('apps.awsControl.console.library_remove_hint'))).toBeNull()
+    const banner = within(dialog).getByTestId('library-add-oneway')
+    expect(banner.textContent).toBe(i18nT('apps.awsControl.console.library_add_oneway'))
+    // Pinned as a SUBSTRING guard rather than only as an equality, so it keeps
+    // biting through a reword: what this banner must never say again is that
+    // removal is unavailable, because Remove sits one card below it in the very
+    // same overlay.
+    expect(banner.textContent).not.toMatch(/remov/i)
   })
 
   /**

@@ -369,19 +369,7 @@ function LibrarySection({ account, bucket }: { account: string; bucket: string }
           back in as the listing resolves. */}
       {!(listQ.isSuccess && slugs.length === 0) && (
       <p className="mb-3 text-[12px] text-muted" data-testid="library-blurb">
-        {i18nT('apps.awsControl.console.library_blurb')}{' '}
-        {/* This folder can be filled from the picker and not emptied from here
-            yet, and storage costs money. Saying where the exit is beats letting
-            someone discover there isn't one.
-
-            Only once there is something to remove, though: on an empty folder it
-            warned about copies that do not exist, which is noise in front of the
-            one screen whose job is explaining what the folder is FOR. The picker
-            carries its own one-way warning, so the person about to create the
-            first copy is still told. */}
-        {slugs.length > 0 && (
-          <span data-testid="library-remove-hint">{i18nT('apps.awsControl.console.library_remove_hint')}</span>
-        )}
+        {i18nT('apps.awsControl.console.library_blurb')}
       </p>
       )}
 
@@ -734,6 +722,10 @@ function AddFromArtifactsDialog({ account, onClose }: { account: string; onClose
    */
   const [addingSlugs, setAddingSlugs] = useState<ReadonlySet<string>>(new Set())
   const [failedSlugs, setFailedSlugs] = useState<ReadonlySet<string>>(new Set())
+  // Removals share the per-slug discipline for the same reason: a removal's
+  // outcome must not depend on another removal (or an add) being in flight.
+  const [removingSlugs, setRemovingSlugs] = useState<ReadonlySet<string>>(new Set())
+  const [removeFailedSlugs, setRemoveFailedSlugs] = useState<ReadonlySet<string>>(new Set())
   const withoutSlug = (set: ReadonlySet<string>, slug: string) => {
     const next = new Set(set)
     next.delete(slug)
@@ -755,6 +747,23 @@ function AddFromArtifactsDialog({ account, onClose }: { account: string; onClose
       setFailedSlugs((prev) => new Set(prev).add(slug))
     } finally {
       setAddingSlugs((prev) => withoutSlug(prev, slug))
+    }
+  }
+  const removeOne = async (slug: string) => {
+    setRemovingSlugs((prev) => new Set(prev).add(slug))
+    setRemoveFailedSlugs((prev) => withoutSlug(prev, slug))
+    try {
+      await awsControlApi.libraryRemove(account, slug)
+      // Same two keys as addOne: the ledger forgot the record AND the folder
+      // behind this dialog lost the artifact's objects.
+      qc.invalidateQueries({ queryKey: ['aws-control', 'library', account] })
+      qc.invalidateQueries({ queryKey: ['aws-control', 'drive', account] })
+    } catch {
+      // The failure must render (delete_failed on the card); closing the
+      // confirm strip before the outcome is known was the reviewed-away bug.
+      setRemoveFailedSlugs((prev) => new Set(prev).add(slug))
+    } finally {
+      setRemovingSlugs((prev) => withoutSlug(prev, slug))
     }
   }
 
@@ -804,17 +813,16 @@ function AddFromArtifactsDialog({ account, onClose }: { account: string; onClose
           </button>
         </div>
 
-        {/* The disclosure has to be HERE, where the adding happens.
-            Adding fills storage the user pays for and there is no in-app
-            removal yet, and the folder's own hint was the only place that said
-            so -- which the empty-state button skips entirely, opening this
-            dialog directly. A warning the reader never passes is not a warning.
+        {/* The disclosure has to be HERE, where the adding happens: adding fills
+            storage the account pays for, and the empty-state button opens this
+            dialog directly, so a warning the reader never passes is not a
+            warning.
 
-            Its OWN string, not the folder's: that one ends by pointing at the
-            "Where this lives" drawer, which sits behind this overlay rather than
-            in it, so reusing it here would name something the reader cannot
-            find -- the same dangling pointer that copy was just fixed to
-            remove. */}
+            The COST is all it says, and that constraint is load-bearing: the
+            cards below carry a Remove control, so any claim about removal being
+            unavailable would be disproved by a button in the same dialog on
+            every open, and a banner a button contradicts costs the reader their
+            trust in both. */}
         <p className="border-b border-border px-4 py-2 text-[12px] leading-snug text-muted" data-testid="library-add-oneway">
           {i18nT('apps.awsControl.console.library_add_oneway')}
         </p>
@@ -901,6 +909,9 @@ function AddFromArtifactsDialog({ account, onClose }: { account: string; onClose
                     onPush={() => { void addOne(a.slug) }}
                     pushing={addingSlugs.has(a.slug)}
                     failed={failedSlugs.has(a.slug)}
+                    onRemove={() => { void removeOne(a.slug) }}
+                    removing={removingSlugs.has(a.slug)}
+                    removeFailed={removeFailedSlugs.has(a.slug)}
                   />
                 ))}
               </div>
@@ -913,11 +924,14 @@ function AddFromArtifactsDialog({ account, onClose }: { account: string; onClose
 }
 
 /** One candidate in the picker: a real preview, and one action. */
-function PickerCard({ artifact, onPush, pushing, failed }: {
+function PickerCard({ artifact, onPush, pushing, failed, onRemove, removing, removeFailed }: {
   artifact: LibraryArtifact
   onPush: () => void
   pushing: boolean
   failed: boolean
+  onRemove: () => void
+  removing: boolean
+  removeFailed: boolean
 }) {
   const synced = artifact.pushedVersion !== null
   const upToDate = artifact.pushedVersion === artifact.version
@@ -926,6 +940,9 @@ function PickerCard({ artifact, onPush, pushing, failed }: {
      than only grey out its button, because images are the bulk of a real
      library and a disabled control with no reason reads as a bug. */
   const notPushable = artifact.kind === 'image'
+  // A bare click must not delete a paid-bucket object, so removal is revealed
+  // behind an inline Cancel + danger confirm, mirroring the drive folder delete.
+  const [confirmRemove, setConfirmRemove] = useState(false)
   return (
     <div className="mb-3 mr-3 overflow-hidden rounded-lg border border-border bg-card" data-testid="library-tile">
       <div className="pointer-events-none">
@@ -950,6 +967,11 @@ function PickerCard({ artifact, onPush, pushing, failed }: {
             {i18nT('apps.awsControl.console.library_push_failed')}
           </p>
         )}
+        {removeFailed && (
+          <p className="mt-2 text-[11px] leading-snug text-danger" data-testid="library-remove-error">
+            {i18nT('apps.awsControl.console.delete_failed')}
+          </p>
+        )}
         {!notPushable && (
           <div className="mt-2.5">
             {/* Sync state is now a LABEL, not a locked door. The ledger is local,
@@ -962,25 +984,85 @@ function PickerCard({ artifact, onPush, pushing, failed }: {
                 was up to date. A same-version push is idempotent (it rewrites the
                 same key plus its sidecar), so the worst case is one redundant
                 upload and the best case is recovering a copy you cannot
-                otherwise restore. */}
+                otherwise restore.
+
+                Neither the backend reconcile nor Remove makes the door safe to
+                lock. Reconcile is slug-granular: it prunes a record only when the
+                WHOLE `artifacts/<slug>/` prefix is absent, so a copy that lost
+                its content key but kept its sidecar still lists as present and
+                still reads as up to date. And Remove empties the prefix -- it
+                never puts the content back, so it is not the restore path a
+                disabled Push would need. */}
             {upToDate && (
               <p className="mb-1.5 text-[11px] text-muted" data-testid="library-already">
                 {i18nT('apps.awsControl.console.library_in_cloud')}
               </p>
             )}
-            <Btn onClick={onPush} disabled={pushing} data-testid="library-push">
-              <Upload size={13} />
-              {pushing
-                ? i18nT('apps.awsControl.console.library_adding')
-                : upToDate
-                  ? i18nT('apps.awsControl.console.library_add_again')
-                  : synced
-                    ? i18nT('apps.awsControl.console.library_update')
-                    : i18nT('apps.awsControl.console.library_add_one')}
-            </Btn>
+            <div className="flex flex-wrap items-center gap-2">
+              <Btn onClick={onPush} disabled={pushing} data-testid="library-push">
+                <Upload size={13} />
+                {pushing
+                  ? i18nT('apps.awsControl.console.library_adding')
+                  : upToDate
+                    ? i18nT('apps.awsControl.console.library_add_again')
+                    : synced
+                      ? i18nT('apps.awsControl.console.library_update')
+                      : i18nT('apps.awsControl.console.library_add_one')}
+              </Btn>
+              {/* A remove control only makes sense once an artifact has a cloud
+                  copy; an unsynced card has nothing to empty. */}
+              {synced && !confirmRemove && (
+                <Btn onClick={() => setConfirmRemove(true)} data-testid="library-remove">
+                  <Trash2 size={13} />
+                  {i18nT('apps.awsControl.console.library_remove')}
+                </Btn>
+              )}
+            </div>
           </div>
         )}
       </div>
+      {synced && confirmRemove && (
+        <div className="flex flex-wrap items-center gap-2 px-3 pb-3 text-[12px]" data-testid="library-remove-confirm">
+          {/* Removal targets the SLUG, not this local artifact: `libraryRemove`
+              empties the `library/<slug>/` cloud prefix, and the ledger that
+              lit this tile's synced flag is keyed by slug alone (see the
+              identity note in LibrarySection). Slugs come from names and are
+              reused -- delete a pushed artifact locally, create another that
+              takes the same slug, and its never-pushed tile inherits the old
+              push record and offers this Remove, which would empty a DIFFERENT
+              artifact's cloud copy. This machine cannot prove the copy is this
+              artifact's without reading the pushed meta.json sidecar (the
+              cause-level fix, #6987), so the confirm names the cloud folder it
+              will actually empty rather than only the local name, turning a
+              silent wrong-target delete into one the reader confirms against its
+              true identity. */}
+          <span className="min-w-0 flex-1 text-text" data-testid="library-remove-confirm-text">
+            {i18nT('apps.awsControl.console.library_remove_confirm', { name: artifact.name })}{' '}
+            <span className="text-muted">
+              {i18nT('apps.awsControl.console.library_remove_confirm_slug')}{' '}
+              <code className="text-[11px] text-muted">library/{artifact.slug}/</code>
+            </span>
+          </span>
+          <Btn onClick={() => setConfirmRemove(false)} disabled={removing} data-testid="library-remove-cancel">
+            {i18nT('apps.awsControl.console.cancel')}
+          </Btn>
+          {/* The strip stays open while the request runs: closing it eagerly hid
+              the outcome entirely (the reviewed bug). On success the card's
+              synced flag flips false via the query invalidation, which unmounts
+              both the strip and its trigger; on failure the strip stays with the
+              button re-enabled and delete_failed rendered above, so a retry or a
+              Cancel are both one click. */}
+          <Btn
+            danger
+            disabled={removing}
+            onClick={onRemove}
+            data-testid="library-remove-action"
+          >
+            <Trash2 size={13} />
+            {i18nT('apps.awsControl.console.library_remove')}
+          </Btn>
+        </div>
+      )}
     </div>
   )
 }
