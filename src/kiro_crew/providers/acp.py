@@ -51,6 +51,7 @@ from kiro_crew.providers.base import (
     CancelOutcome,
     LLMEvent,
     LLMProvider,
+    SessionMcpReport,
     resolve_billing_stats,
 )
 from kiro_crew.providers.cleanup import _is_safe_path
@@ -926,6 +927,14 @@ class AcpProvider(LLMProvider):
         Claude list) rather than a hardcoded set.
         """
         return self._client.available_models()
+
+    def mcp_session_report(self) -> SessionMcpReport:
+        """This session's MCP registration report, kept on the inner client.
+
+        The dedicated transport owns one client per session, so its report IS the
+        session's. The shared runtime answers the same call from its handle.
+        """
+        return self._client.mcp_session_report()
 
     def get_valid_effort_levels(self) -> list[str]:
         """Effort levels the backend reported for the CURRENT model, in ACP order.

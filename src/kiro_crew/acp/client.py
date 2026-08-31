@@ -53,6 +53,7 @@ from kiro_crew.acp.liveness import (
     _consume_future_exception,
     consult_offloaded,
 )
+from kiro_crew.acp.mcp_session_report import McpSessionReport
 from kiro_crew.acp.prompt_blocks import build_prompt_blocks
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
@@ -2306,6 +2307,15 @@ class AcpClient:
         self._next_id = 1
         self._buffer: deque[JsonRpcMessage] = deque(maxlen=100)
         self._mcp_notifications: list[JsonRpcMessage] = []
+        # What THIS session's MCP servers reported at init. The frames arrive
+        # during _drain_notifications and were previously reduced to one log
+        # line and dropped, so a session that started without a server had no
+        # way to say so. Read via mcp_session_report().
+        self._mcp_report = McpSessionReport()
+        #: Index into ``_mcp_notifications`` below which frames belong to a PRIOR
+        #: session attempt and must not reach the report. See
+        #: ``_begin_session_report``.
+        self._mcp_report_frame_floor = 0
         # MCP OAuth requests collected during session init from
         # `_kiro.dev/mcp/oauth_request` notifications. Drained by callers via
         # `pop_pending_oauth_requests()` after `ensure_ready()` so the UI can
@@ -3477,6 +3487,15 @@ class AcpClient:
         self._last_stop_reason = ""
         self._pending_oauth_requests.clear()
         self._oauth_emitted_servers.clear()
+        # A retired session's report must not be read as the next one's. This
+        # view exists to be evidence, and stale evidence is worse than none:
+        # the replacement process re-initializes its servers from scratch and
+        # will report again.
+        self._mcp_report = McpSessionReport()
+        #: Index into ``_mcp_notifications`` below which frames belong to a PRIOR
+        #: session attempt and must not reach the report. See
+        #: ``_begin_session_report``.
+        self._mcp_report_frame_floor = 0
         # Untrack PIDs from the orphan tracking files — but ONLY those confirmed
         # dead. A child or root still alive after teardown survived the kill
         # (killpg only reaches the kiro-cli process group, so children in other
@@ -3566,6 +3585,11 @@ class AcpClient:
         }
         if self._is_claude:
             new_params["_meta"] = {"claudeCode": {"options": {}}}
+
+        # The roster this session put ON THE WIRE. Distinct from the agent spec
+        # on disk: the backend starts the spec's own servers too, so the frames
+        # that come back are a superset of this list.
+        self._begin_session_report(new_params.get("mcpServers"))
 
         self._last_substitution_model = None
         session_id = await self._send_request(METHOD_SESSION_NEW, new_params)
@@ -3688,6 +3712,7 @@ class AcpClient:
                         load_params["_meta"] = {"claudeCode": {"options": {}}}
                     else:
                         load_params["_meta"] = {"_kiro.dev/session_file": session_file}
+                    self._begin_session_report(load_params.get("mcpServers"))
                     load_id = await self._send_request(METHOD_SESSION_LOAD, load_params)
                     load_resp = await self._wait_for_response(
                         load_id,
@@ -4265,16 +4290,32 @@ class AcpClient:
                 self._handle_config_option_update(msg)
 
         # Process notifications buffered during _wait_for_response
-        for msg in self._mcp_notifications:
+        for idx, msg in enumerate(self._mcp_notifications):
             drained += 1
             _capture_oauth(msg)
             _capture_config_update(msg)
+            # Frames below the floor were buffered by an EARLIER session attempt
+            # (a session/load that failed before the fallback session/new). The
+            # OAuth and config captures above still want them — the user must
+            # answer that authorization either way — but the report must not
+            # credit this session with a server that reported to another attempt.
+            if idx >= self._mcp_report_frame_floor:
+                # Owned by construction: this transport runs one session per
+                # process, so there is no co-tenant whose frame could arrive
+                # here. Stated rather than defaulted so a transport that gains
+                # tenants has to answer the question instead of inheriting a
+                # yes.
+                self._mcp_report.record_frame(msg, owned=True)
             name = ""
             if isinstance(msg.params, dict):
                 name = msg.params.get("name") or msg.params.get("serverName") or ""
             if name or "mcp" in (msg.method or ""):
                 mcp_servers.append(name or msg.method or "unknown")
         self._mcp_notifications.clear()
+        # The floor indexes INTO that buffer, so it has to fall with it —
+        # otherwise the next attempt's frames land below a stale floor and are
+        # dropped from the report instead of the previous attempt's.
+        self._mcp_report_frame_floor = 0
 
         while True:
             # Single time snapshot per iteration so the deadline and idle checks
@@ -4300,6 +4341,7 @@ class AcpClient:
                 drained += 1
                 _capture_oauth(read_msg)
                 _capture_config_update(read_msg)
+                self._mcp_report.record_frame(read_msg, owned=True)
                 if "mcp" in (read_msg.method or ""):
                     name = ""
                     if isinstance(read_msg.params, dict):
@@ -4322,6 +4364,35 @@ class AcpClient:
         out = list(self._pending_oauth_requests)
         self._pending_oauth_requests.clear()
         return out
+
+    def _begin_session_report(self, servers: Any) -> None:
+        """Start the MCP report for a new session attempt.
+
+        A failed ``session/load`` still buffers the notifications it received
+        before it raised, and the client then falls back to ``session/new``.
+        Replaying those frames into the replacement session's report would
+        attribute a server to a session that never came up — the same
+        cross-attempt leak ``begin_session`` closes for the derived buckets, one
+        layer earlier.
+
+        The buffer itself is NOT cleared: it is shared with the OAuth and
+        config-option captures, and an authorization request from the failed
+        attempt is still one the user has to answer. Only the report's view is
+        floored.
+        """
+        self._mcp_report_frame_floor = len(self._mcp_notifications)
+        self._mcp_report.begin_session(servers)
+
+    def mcp_session_report(self) -> McpSessionReport:
+        """This session's MCP registration report (see ``mcp_session_report``).
+
+        Unlike :meth:`pop_pending_oauth_requests` this does NOT drain: the report
+        is the session's standing answer to "which servers actually started
+        here", read repeatedly and still true. Callers must render an unreported
+        server as *not reported*, never as *not mounted* — the drain is time
+        bounded and a late frame still arrives mid-turn.
+        """
+        return self._mcp_report
 
     # ── Prompt Loop Helpers ──
 

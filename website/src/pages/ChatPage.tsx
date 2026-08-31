@@ -358,6 +358,14 @@ export function ChatHeaderMenu({ activeSlot, agent, onReveal, onRename, mode }: 
   )
   const sessionMessages = useAppSelector(s => s.chat.messages)
   const loadedTools = useMemo(() => deriveLoadedMcpTools(sessionMessages), [sessionMessages])
+  // What this slot's session actually reported about its MCP servers. Pushed by
+  // the gateway onto the same `slots` array the snapshot rehydrates, so it needs
+  // no query of its own — and unlike the ['mcp-servers'] query above it is keyed
+  // by SLOT, which is the whole point: that query answers a question about the
+  // agent's configuration and this answers one about this session.
+  const sessionReport = useAppSelector(
+    s => (activeSlot ? s.dashboard.slots?.find(sl => sl.key === activeSlot)?.mcp_report : null) ?? null,
+  )
 
   return (
     <DropdownMenu open={open} onOpenChange={setOpen}>
@@ -388,6 +396,7 @@ export function ChatHeaderMenu({ activeSlot, agent, onReveal, onRename, mode }: 
                   loaded={loadedTools}
                   toolSearchOn={toolSearchOn}
                   loading={servers.length === 0}
+                  sessionReport={sessionReport}
                 />
               </DropdownMenuSubContent>
             </DropdownMenuSub>,

@@ -227,6 +227,7 @@ from kiro_crew.providers.base import (
     EVENT_TOOL_CALL_UPDATE,
     EVENT_TOOL_RESULT,
     LLMEvent,
+    SessionMcpReport,
 )
 from kiro_crew.quick_prompts import QUICK_PROMPTS
 from kiro_crew.safety_override import safety_override
@@ -1674,6 +1675,82 @@ async def _drain_session_init_oauth_requests(
         )
 
 
+def _session_mcp_report(provider: Any) -> "SessionMcpReport | None":
+    """The provider's per-session MCP report, or None when it keeps none.
+
+    Reached through the ``LLMProvider`` contract, NOT by probing an attribute.
+    The probe this replaces asked the provider's inner ``.client`` — which the
+    shared runtime's provider does not have, so it silently answered None there
+    and the whole report went missing on that transport while looking fine on the
+    dedicated one. A declared method with a safe default cannot fail that way.
+    """
+    if provider is None:
+        return None
+    try:
+        report = provider.mcp_session_report()
+    except Exception:  # pragma: no cover — a report is never worth a failed turn
+        logger.debug("Failed to read the session MCP report", exc_info=True)
+        return None
+    return report if isinstance(report, SessionMcpReport) else None
+
+
+def _publish_session_mcp_report(state: "DashboardState", slot: "_ChatSlot", provider: Any) -> None:
+    """Store this session's MCP report on the slot and push the delta.
+
+    What the session's backend actually reported about its servers, which is a
+    different fact from the agent spec on disk or the gateway's own probe. It is
+    published so a reader can tell "configured" from "started here" instead of
+    having to infer one from the other.
+
+    Takes the PROVIDER, not its inner client: the shared runtime's provider has
+    no ``.client``, so reaching through one dropped the report on that transport
+    entirely.
+    """
+    report = _session_mcp_report(provider)
+    if report is None:
+        return
+    # Stamp the payload with the session it describes. This copy outlives its
+    # owner — the report itself lives on the transport and is inherently that
+    # session's — so without the id a reader cannot tell a current answer from a
+    # replaced session's, which is the leak every teardown patch chased.
+    session_id = str(getattr(provider, "session_id", "") or "")
+    payload = report.payload()
+    if slot.set_mcp_report(payload, session_id):
+        state.broadcast_ws(
+            "mcp_report_update",
+            {"slot": slot.key, "mcp_report": payload},
+        )
+
+
+def _record_session_mcp_event(
+    state: "DashboardState",
+    slot: "_ChatSlot",
+    provider: Any,
+    kind: str,
+    server_name: str,
+    error: str = "",
+    *,
+    fanout_no_owner: bool = False,
+) -> None:
+    """Fold a mid-turn MCP registration event into the slot's report.
+
+    The init drain has already consumed the frames it saw, so a server that
+    finishes init after an OAuth callback (or fails later) shows up only here.
+    Without this the report would freeze at its init-time answer and keep
+    showing a server as unreported after it came up.
+
+    ``fanout_no_owner`` comes from ``AcpEvent.runtime_global``: the banner is
+    still surfaced for an ownerless event, only the report mutation is gated —
+    the same split the compaction path already makes.
+    """
+    report = _session_mcp_report(provider)
+    if report is None or not report.record_event(
+        kind, server_name, error, fanout_no_owner=fanout_no_owner
+    ):
+        return
+    _publish_session_mcp_report(state, slot, provider)
+
+
 def _mark_mcp_oauth_completed(
     state: "DashboardState", slot: "_ChatSlot", server_name: str, success: bool, error: str = ""
 ) -> None:
@@ -3113,6 +3190,10 @@ async def _consume_pending_reset(
             torn_down = True
             if slot._pending_discard_conversation_key == discard_key:
                 slot._pending_discard_conversation_key = None
+            # The discarded conversation's MCP report describes a session that no
+            # longer exists; the fresh one will report for itself.
+            if slot.clear_mcp_report():
+                state.broadcast_ws("mcp_report_update", {"slot": slot.key, "mcp_report": None})
         except Exception:
             logger.warning(
                 "Failed to consume pending conversation discard for slot %s",
@@ -5522,6 +5603,14 @@ async def _run_chat(
         except Exception:  # pragma: no cover — never let UI surfacing kill chat init
             logger.warning("Failed to surface pending MCP OAuth requests", exc_info=True)
 
+        # Publish what this session's servers actually reported while starting.
+        # Same duck-typed reach as the OAuth drain above; a report is never worth
+        # a failed session init, so it is best-effort.
+        try:
+            _publish_session_mcp_report(state, slot, client)
+        except Exception:  # pragma: no cover
+            logger.warning("Failed to publish the session MCP report", exc_info=True)
+
         # Publish this turn's session identity so managed MCP tools resolve
         # X-Session-Key; one shared writer lives in messaging.identity.
         await publish_turn_identity(state.sessions, session_key)
@@ -7903,15 +7992,40 @@ async def _run_chat(
                 # has expired or never existed. Surface as an inline banner —
                 # kiro-cli's local callback handles the rest of the OAuth flow.
                 _emit_mcp_oauth_request(state, slot, event.server_name, event.oauth_url)
+                _record_session_mcp_event(
+                    state,
+                    slot,
+                    client,
+                    event.kind,
+                    event.server_name,
+                    fanout_no_owner=event.runtime_global,
+                )
             elif event.kind == EVENT_MCP_SERVER_INITIALIZED:
                 # kiro-cli emits this once an MCP server has finished init
                 # (typically right after a successful OAuth callback completes).
                 # Patch the matching mcp_oauth banner so the user sees a
                 # confirmation instead of a stale "Authorize" prompt.
                 _mark_mcp_oauth_completed(state, slot, event.server_name, success=True)
+                _record_session_mcp_event(
+                    state,
+                    slot,
+                    client,
+                    event.kind,
+                    event.server_name,
+                    fanout_no_owner=event.runtime_global,
+                )
             elif event.kind == EVENT_MCP_SERVER_INIT_FAILURE:
                 _mark_mcp_oauth_completed(
                     state, slot, event.server_name, success=False, error=event.text or ""
+                )
+                _record_session_mcp_event(
+                    state,
+                    slot,
+                    client,
+                    event.kind,
+                    event.server_name,
+                    event.text or "",
+                    fanout_no_owner=event.runtime_global,
                 )
             elif event.kind == EVENT_TODO_UPDATE:
                 # Agent's own TODO list. Store on the slot (so /api/chat/slots

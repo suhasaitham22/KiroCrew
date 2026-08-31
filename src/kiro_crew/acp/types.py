@@ -515,8 +515,11 @@ class AcpEvent:
     #: True when the frame behind this event named no owner and was fanned out to
     #: several sessions on one runtime (see ``JsonRpcMessage.fanout_no_owner``).
     #: A consumer must not read such an event as ITS OWN activity -- it is
-    #: another tenant's traffic. Only the roster broadcast sets this today; the
-    #: same event kind reached through a routed ``session/update`` (the KAS
+    #: another tenant's traffic. Set by the roster broadcast (which never names
+    #: an owner) and by the MCP registration notifications when the frame did
+    #: not name this session -- a registration frame MAY carry a
+    #: ``params.sessionId``, and one that does is owned by the session it names.
+    #: The same event kind reached through a routed ``session/update`` (the KAS
     #: sub-agent lifecycle path) leaves it False, because that frame belongs to
     #: exactly one session.
     runtime_global: bool = False

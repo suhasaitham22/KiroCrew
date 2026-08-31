@@ -1233,6 +1233,14 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # hygiene so a response echoing a credential or exfiltration URL cannot
         # leak into the log ring / /api/logs stream; not an egress boundary.
         "task_planner.py",
+        # Capture-side, not egress: the per-session MCP report scrubs a server
+        # name and a failing server's startup error as it RECORDS them, so a
+        # credential never enters the accumulator at all. Deliberately earlier
+        # than the boundary — redacting first is what stops a credential being
+        # split across this module's own length cap and surviving in halves. The
+        # surfaces that SHOW the report are the registered sinks (the dashboard
+        # slot snapshot and the live stream).
+        "acp/mcp_session_report.py",
         # Audit-side log hygiene: log_decline scrubs the model-authored tool
         # title before writing the shared auto_approve_declined SEL row. The
         # audit log is a gate-side record, not an output bound for a human or
