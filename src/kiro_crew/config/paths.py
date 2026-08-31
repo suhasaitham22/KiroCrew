@@ -446,6 +446,25 @@ def _under_system_tmp(path: Path) -> bool:
     and one a checkout may legitimately live under. Windows keeps
     ``gettempdir()`` (``%TEMP%``) as its only root. A root that cannot be
     resolved is skipped rather than guessed.
+
+    Deliberately does NOT try to distinguish an operator-selected ``TMPDIR``
+    from the OS's own general-purpose default. A round of this fence tried
+    excluding ``gettempdir()``'s result whenever ``TMPDIR``/``TEMP``/``TMP`` was
+    SET, reasoning that a set variable meant a deliberate operator choice worth
+    protecting like any other ancestor. That reasoning does not hold cross-
+    platform: macOS sets ``TMPDIR`` via launchd for every process regardless of
+    operator intent, so the exclusion fired unconditionally there, made
+    ``gettempdir()``'s own per-user temp root (``/var/folders/.../T``) stop
+    being treated as a boundary, and reopened the exact regression this
+    predicate exists to prevent — refusing an ordinary command merely naming
+    that directory — on every macOS run, including this project's own
+    ``Gateway Tests (macOS)`` CI job, which pins ``KIROCREW_HOME`` under it for
+    the identical isolation reason Linux CI does. There is no cheap, reliable
+    signal for "this environment variable reflects a deliberate choice" that
+    holds across every platform's own default, so a caller that needs to
+    distinguish an operator-selected root takes the cost on its own side
+    instead — ``sandbox.py``'s ancestor walk protects one unconditionally,
+    since doing so there is free.
     """
     roots: list[Path] = []
     candidates: list[str] = []
@@ -501,6 +520,10 @@ def _is_system_tmp_root(path: Path) -> bool:
     ancestor walk needs to know exactly where the SHARED territory begins so it can
     keep protecting everything below that point and stop exactly there -- not
     stop at the first step that happens to already be under the root.
+
+    Answers with `_under_system_tmp`'s single, platform-uniform root list -- see
+    that function's own docstring for why it does NOT try to distinguish an
+    operator-selected ``TMPDIR`` from the OS's own general-purpose default.
     """
     if not _under_system_tmp(path):
         return False

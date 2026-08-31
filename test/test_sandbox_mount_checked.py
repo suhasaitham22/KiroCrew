@@ -131,6 +131,11 @@ def _run(
     fail_at: int | None,
     err: int = errno.EPERM,
     script: str | None = None,
+    extra_sensitive_files: "list[str] | None" = None,
+    sensitive_file_placeholders: "dict[str, str] | None" = None,
+    keystone_files: "list[str] | None" = None,
+    extra_sensitive_dirs: "list[str] | None" = None,
+    trust_root_dirs: "list[str] | None" = None,
 ) -> tuple[_FakeLibc, str | None]:
     """Run the mount region. Returns ``(fake_libc, refusal_message_or_None)``.
 
@@ -176,9 +181,12 @@ def _run(
         "_src_prefix": "kirocrew_sb_%d_" % os.getpid(),
         "expose_data": {},
         "EXPOSE_FILES": [],
-        "SENSITIVE_DIRS": [str(aws)],
+        "SENSITIVE_DIRS": [str(aws)] + (extra_sensitive_dirs or []),
+        "TRUST_ROOT_DIRS": trust_root_dirs or [],
         "READONLY_DIRS": [str(cache)],
-        "SENSITIVE_FILES": [str(lone)],
+        "SENSITIVE_FILES": [str(lone)] + (extra_sensitive_files or []),
+        "SENSITIVE_FILE_PLACEHOLDERS": sensitive_file_placeholders or {},
+        "KEYSTONE_FILES": keystone_files or [],
         "SSH_DIR": str(ssh),
         "SSH_KNOWN_HOSTS": str(ssh / "known_hosts"),
         "HIDE_SSH": True,
@@ -195,6 +203,232 @@ def _run(
 # --------------------------------------------------------------------------
 # Behavioural assertions
 # --------------------------------------------------------------------------
+
+
+def test_an_absent_registered_keystone_file_is_materialized_then_mounted(
+    tmp_path: Path,
+) -> None:
+    """GPT review: `mount(2)` needs an existing target, so a keystone file this
+    box never configured got no hiding mount at all -- run through the REAL,
+    verbatim-extracted region (not a hand-copy) so this cannot drift from what
+    the shipped launcher actually executes. A registered-but-ABSENT file must be
+    materialized with its placeholder content and THEN mounted over, exactly
+    like an already-existing sensitive file is.
+    """
+    absent = tmp_path / "home" / "computer_use.json"
+    libc, refusal = _run(
+        tmp_path,
+        fail_at=None,
+        extra_sensitive_files=[str(absent)],
+        sensitive_file_placeholders={str(absent): "{}"},
+    )
+    assert refusal is None
+    assert absent.read_text() == "{}"
+    # propagation + credential dir + read-only bind + its seal + 2 files + ssh
+    assert len(libc.calls) == 7
+    mounted_targets = [call[1] for call in libc.calls]
+    assert str(absent).encode() in mounted_targets
+
+
+def test_a_symlinked_sensitive_file_refuses_the_spawn(tmp_path: Path) -> None:
+    """GPT review: `isfile()` follows a symlink and reports True for one
+    pointing at a real file, so the shipped loop would happily bind-mount
+    THROUGH it -- hiding the CONTENT the link points to while leaving the
+    link's own directory-entry slot exactly as replaceable as ever. Run
+    through the REAL, verbatim-extracted region so this cannot drift from what
+    the shipped launcher actually executes: a symlinked keystone file must
+    refuse the spawn, the same fail-closed answer a symlinked container
+    directory already gets.
+    """
+    real_policy = tmp_path / "home" / "real_security_policy.json"
+    real_policy.parent.mkdir(parents=True, exist_ok=True)
+    real_policy.write_text('{"version": 1}')
+    symlinked = tmp_path / "home" / "security_policy.json"
+    symlinked.symlink_to(real_policy)
+    libc, refusal = _run(
+        tmp_path,
+        fail_at=None,
+        extra_sensitive_files=[str(symlinked)],
+        keystone_files=[str(symlinked)],
+    )
+    assert refusal is not None
+    assert "sandbox: BLOCKED" in refusal
+    assert "symlink" in refusal
+    assert str(symlinked) in refusal
+    # No mount was attempted for the symlinked file or anything after it in
+    # the loop -- the refusal fires before the mount call, not alongside it.
+    mounted_targets = [call[1] for call in libc.calls]
+    assert str(symlinked).encode() not in mounted_targets
+
+
+def test_a_symlinked_trust_root_directory_refuses_the_spawn(tmp_path: Path) -> None:
+    """GPT review: `os.path.isdir()` follows a symlink and reports True for one
+    pointing at a real directory, so the shipped loop would happily bind-mount
+    THROUGH it -- hiding the CONTENT the link points to for the session while
+    leaving the link's own directory-entry slot exactly as replaceable as
+    ever, same as the file case above and the container's own `UNRENAMABLE_DIRS`
+    check this mirrors. Run through the REAL, verbatim-extracted region: a
+    symlinked `profiles/` (a TRUST_ROOT_DIRS entry) must refuse the spawn
+    rather than silently protect the wrong directory.
+    """
+    real_profiles = tmp_path / "home" / "real_profiles"
+    real_profiles.mkdir(parents=True, exist_ok=True)
+    symlinked = tmp_path / "home" / ".kiro" / "crew" / "profiles"
+    symlinked.parent.mkdir(parents=True, exist_ok=True)
+    symlinked.symlink_to(real_profiles, target_is_directory=True)
+    libc, refusal = _run(
+        tmp_path,
+        fail_at=None,
+        extra_sensitive_dirs=[str(symlinked)],
+        trust_root_dirs=[str(symlinked)],
+    )
+    assert refusal is not None
+    assert "sandbox: BLOCKED" in refusal
+    assert "symlink" in refusal
+    assert str(symlinked) in refusal
+    # No mount was attempted for the symlinked directory or anything after it
+    # in the loop -- the refusal fires before the mount call, not alongside it.
+    mounted_targets = [call[1] for call in libc.calls]
+    assert str(symlinked).encode() not in mounted_targets
+
+
+def test_a_symlinked_non_trust_root_directory_binds_through_instead_of_refusing(
+    tmp_path: Path,
+) -> None:
+    """The property that must NOT regress: the new check is scoped to
+    `TRUST_ROOT_DIRS` only. `SENSITIVE_DIRS` also carries ordinary credential
+    directories (`.aws`, `.gnupg`, `.docker`, ...), and those are legitimately
+    symlinked by dotfile managers (stow, chezmoi) -- `_is_profiles_dir`'s own
+    docstring already declines to widen this to every dir-list entry for
+    exactly that reason. A symlinked credential directory NOT in
+    `TRUST_ROOT_DIRS` must keep the pre-existing behavior (bind-mount through
+    the link, hiding its target's content) rather than abort the spawn.
+    """
+    real_dir = tmp_path / "home" / "real_gnupg"
+    real_dir.mkdir(parents=True, exist_ok=True)
+    symlinked_dir = tmp_path / "home" / ".gnupg"
+    symlinked_dir.symlink_to(real_dir, target_is_directory=True)
+    libc, refusal = _run(tmp_path, fail_at=None, extra_sensitive_dirs=[str(symlinked_dir)])
+    assert refusal is None
+    mounted_targets = [call[1] for call in libc.calls]
+    assert str(symlinked_dir).encode() in mounted_targets
+
+
+def test_a_symlinked_directory_entry_in_the_same_list_is_unaffected(
+    tmp_path: Path,
+) -> None:
+    """The property that must NOT regress: `SENSITIVE_FILES` also carries
+    DIRECTORY entries folded in from `hidden_dirs`, and a symlinked directory
+    (real, unrelated dotfile-management setups symlink `~/.aws`/`~/.ssh`) must
+    not trip this FILE-scoped refusal -- `isfile()` is already False for a
+    directory regardless of symlink status, which is what keeps it out."""
+    real_dir = tmp_path / "home" / "real_dir"
+    real_dir.mkdir(parents=True, exist_ok=True)
+    symlinked_dir = tmp_path / "home" / "symlinked_dir"
+    symlinked_dir.symlink_to(real_dir, target_is_directory=True)
+    libc, refusal = _run(tmp_path, fail_at=None, extra_sensitive_files=[str(symlinked_dir)])
+    assert refusal is None
+    mounted_targets = [call[1] for call in libc.calls]
+    assert str(symlinked_dir).encode() not in mounted_targets
+
+
+def test_a_dangling_symlink_refuses_the_spawn(tmp_path: Path) -> None:
+    """GPT review: `isfile()` answers False for a DANGLING symlink -- one whose
+    target (here, the target's own PARENT directory) does not exist -- exactly
+    as it does for a genuinely absent path. That let a dangling symlink at a
+    registered keystone-file location fall through BOTH the absent-file
+    placeholder loop (its own `open(target, "x")` silently no-ops on ANY
+    symlink, dangling or not: POSIX `O_CREAT|O_EXCL` against a symlink always
+    fails EEXIST, caught there) AND the symlink refusal (`isfile()` is False),
+    leaving the link -- and whatever a later write makes it point at --
+    completely unprotected. Registered WITH a placeholder (`computer_use.json`,
+    GPT's own exact PoC), since that is the shape that used to reach the
+    placeholder loop's silent no-op before ever reaching the refusal.
+    """
+    dangling = tmp_path / "home" / "computer_use.json"
+    dangling.parent.mkdir(parents=True, exist_ok=True)
+    dangling.symlink_to(tmp_path / "missing_parent" / "evil.json")
+    libc, refusal = _run(
+        tmp_path,
+        fail_at=None,
+        extra_sensitive_files=[str(dangling)],
+        sensitive_file_placeholders={str(dangling): "{}"},
+        keystone_files=[str(dangling)],
+    )
+    assert refusal is not None
+    assert "sandbox: BLOCKED" in refusal
+    assert "symlink" in refusal
+    assert str(dangling) in refusal
+    # No placeholder was written through the dangling link, and no mount was
+    # attempted for it either -- the refusal fires before either happens.
+    assert not (tmp_path / "missing_parent").exists()
+    mounted_targets = [call[1] for call in libc.calls]
+    assert str(dangling).encode() not in mounted_targets
+
+
+def test_a_symlinked_non_keystone_credential_file_binds_through_instead_of_refusing(
+    tmp_path: Path,
+) -> None:
+    """Opus review: the symlink refusal above is scoped to `KEYSTONE_FILES`
+    only. `SENSITIVE_FILES` also carries `_CC_FILES` entries (`.npmrc`,
+    `.pypirc`, `.netrc`, `.git-credentials`) in `cc`/`strict` mode, and those
+    are legitimately symlinked by dotfile managers (stow, chezmoi) -- the
+    Seatbelt profile's own comment already states this posture on purpose:
+    credential files "keep read-deny only... turning that into a hard
+    failure is a separate decision from closing the ceiling." An unscoped
+    refusal aborted every sandboxed spawn for an operator with a symlinked
+    `.npmrc`, where the pre-existing behavior (bind-mount through the link,
+    hiding its CONTENT) was correct and intended."""
+    real_npmrc = tmp_path / "home" / "real_npmrc"
+    real_npmrc.parent.mkdir(parents=True, exist_ok=True)
+    real_npmrc.write_text("registry=https://example.com\n")
+    symlinked = tmp_path / "home" / ".npmrc"
+    symlinked.symlink_to(real_npmrc)
+    libc, refusal = _run(tmp_path, fail_at=None, extra_sensitive_files=[str(symlinked)])
+    assert refusal is None
+    mounted_targets = [call[1] for call in libc.calls]
+    assert str(symlinked).encode() in mounted_targets
+
+
+def test_an_absent_unregistered_file_gets_no_mount_same_as_before(
+    tmp_path: Path,
+) -> None:
+    """The property that must NOT regress: a file with no registered placeholder
+    keeps the pre-existing behavior exactly -- absent, not materialized, no
+    mount attempted for it."""
+    absent = tmp_path / "home" / "security_policy.json"
+    libc, refusal = _run(
+        tmp_path,
+        fail_at=None,
+        extra_sensitive_files=[str(absent)],
+        sensitive_file_placeholders={},
+    )
+    assert refusal is None
+    assert not absent.exists()
+    mounted_targets = [call[1] for call in libc.calls]
+    assert str(absent).encode() not in mounted_targets
+    # Unaffected: same 6 calls as the plain happy path, the extra file
+    # contributed nothing since it was never registered.
+    assert len(libc.calls) == 6
+
+
+def test_an_already_existing_registered_file_is_left_untouched(tmp_path: Path) -> None:
+    """A file that already holds real content must not be clobbered by the
+    exclusive-create materialize step -- it is simply mounted over, same as
+    always."""
+    existing = tmp_path / "home" / "denied_commands.json"
+    existing.parent.mkdir(parents=True, exist_ok=True)
+    existing.write_text('{"disable_all": true}')
+    libc, refusal = _run(
+        tmp_path,
+        fail_at=None,
+        extra_sensitive_files=[str(existing)],
+        sensitive_file_placeholders={str(existing): "{}"},
+    )
+    assert refusal is None
+    assert existing.read_text() == '{"disable_all": true}'
+    mounted_targets = [call[1] for call in libc.calls]
+    assert str(existing).encode() in mounted_targets
 
 
 def test_all_mounts_succeeding_lets_the_exec_proceed(tmp_path: Path) -> None:

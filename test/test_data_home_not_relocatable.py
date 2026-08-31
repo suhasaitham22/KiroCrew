@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import pathlib
 import sys
+import time
 
 import pytest
 
@@ -271,8 +272,11 @@ class TestTheFencedPathsAreHiddenFromSubprocesses:
     # command-gate half of the coupling cannot be asserted on this base yet. Listed
     # separately rather than dropped: the hide list is the half that stops a
     # subprocess, and it is correct to ship it whether or not the name fence exists.
+    #
+    # `.kiro/crew/variables` itself is NOT listed here: this branch creates and reads
+    # no such store (that lands with #4371), so hiding it protects nothing yet and
+    # belongs with the PR that adds the store (First Principles review).
     HIDDEN_AHEAD_OF_ITS_NAME_FENCE = [
-        ".kiro/crew/variables",
         # Persisted authorship records. Same reasoning: the flag is derived carefully
         # in process and forgeable on disk, so the file has to be out of reach. Name
         # fence lands with the crew-variables work; the hide list is independent.
@@ -301,6 +305,7 @@ class TestTheFencedPathsAreHiddenFromSubprocesses:
         ".kiro/crew/computer_use.json",
         ".kiro/crew/crons.json",
         ".kiro/crew/autonudge.json",
+        ".kiro/crew/denied_commands.json",
     ]
 
     @pytest.mark.skipif(
@@ -355,7 +360,7 @@ class TestTheFencedPathsAreHiddenFromSubprocesses:
     def test_the_directories_still_hold_on_every_tier(self) -> None:
         from kiro_crew import sandbox
 
-        for d in (".kiro/crew/variables", ".kiro/crew/profiles"):
+        for d in (".kiro/crew/profiles",):
             for tier in ("_STRICT_DIRS", "_STANDARD_DIRS", "_CC_DIRS"):
                 assert d in getattr(sandbox, tier), f"{d} missing from {tier}"
 
@@ -405,7 +410,7 @@ class TestTheFencedPathsAreHiddenFromSubprocesses:
 
         for name in ("_STRICT_DIRS", "_STANDARD_DIRS", "_CC_DIRS"):
             entries = getattr(sandbox, name)
-            assert ".kiro/crew/variables" in entries, f"{name} does not hide the store"
+            assert ".kiro/crew/profiles" in entries, f"{name} does not hide the store"
 
 
 class TestTheMatcherDoesNotDivergeFromBash:
@@ -518,7 +523,7 @@ class TestBraceOverflowFailsClosedWithoutOverReaching:
         [
             "cp /data/img{a..z}{a..z}.jpg /out/",
             "ls /tmp/{a..z}{a..z}",
-            "echo {1..100}",
+            "echo x{1..100}",
             "mv /var/log/{a,b,c}{1..40} /backup/",
         ],
     )
@@ -657,9 +662,25 @@ class TestTheMatcherStopsPretendingToBeAShell:
         assert _blocked("shopt -s dotglob; mv ~/* /tmp/x")
         assert _blocked("setopt globdots; mv ~/* /tmp/x")
 
-    def test_without_dotglob_an_ordinary_home_listing_is_untouched(self) -> None:
+    def test_without_dotglob_an_ordinary_home_listing_is_untouched(self, monkeypatch) -> None:
         """The reason this is conditional rather than always-on: refusing `ls ~/*`
-        outright would be a false positive on one of the commonest commands there is."""
+        outright would be a false positive on one of the commonest commands there is.
+
+        Ancestor discovery is stubbed to empty here, deliberately: this test's own
+        `KIROCREW_HOME` is whatever the autouse test-isolation fixture pinned it to
+        (nowhere near a real `.kiro`-shaped home), and on Windows that pinned path
+        is nested INSIDE the real user profile -- unlike POSIX, where a temp root
+        and `$HOME` are normally disjoint trees, Windows' `%TEMP%` sits under
+        `C:\\Users\\<user>\\...`. Walking up from it lands on an ANCESTOR one level
+        under home (`AppData`) that, unlike the FIXED container dirs this test
+        means to exercise, is not dot-prefixed -- so it carries none of the
+        dotfile protection the assertion below is actually testing, and a bare
+        `mv ~/* /tmp/x` legitimately (and correctly) matches it under
+        `bare_trust_root_read`'s write-verb fail-closed direction. That is a
+        property of this TEST's own isolation setup, not of a real KIROCREW_HOME
+        -- which is always `.kiro`-shaped by this project's own convention -- so
+        it is isolated here rather than accepted as a false positive."""
+        monkeypatch.setattr(security, "_custom_home_ancestors", lambda: [])
         assert not _blocked("ls ~/*")
         assert not _blocked("mv ~/* /tmp/x")
 
@@ -1007,7 +1028,7 @@ class TestTheHideListFollowsTheDataHome:
 
         monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "crewdata"))
         script = sandbox._build_launcher_script("strict")
-        for leaf in ("variables", "profiles", ".vault"):
+        for leaf in ("profiles", ".vault"):
             expected = str(tmp_path / "crewdata" / leaf)
             assert expected in script, f"{expected} is not hidden under a custom data home"
 
@@ -1042,7 +1063,7 @@ class TestTheDataHomeReanchoringItself:
     -- covering none of this.
     """
 
-    @pytest.mark.parametrize("leaf", ["variables", "profiles", ".vault"])
+    @pytest.mark.parametrize("leaf", ["profiles", ".vault"])
     def test_a_crew_relative_entry_is_reanchored(self, monkeypatch, tmp_path, leaf) -> None:
         from kiro_crew import sandbox
 
@@ -1064,8 +1085,8 @@ class TestTheDataHomeReanchoringItself:
         from kiro_crew import sandbox
 
         monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "crewdata"))
-        assert ".kiro/crew/variables" in sandbox._STRICT_DIRS
-        assert ".kirocrew/variables" in sandbox._STRICT_DIRS
+        assert ".kiro/crew/profiles" in sandbox._STRICT_DIRS
+        assert ".kirocrew/profiles" in sandbox._STRICT_DIRS
 
 
 class TestRepeatedTrailingSeparators:
@@ -1385,11 +1406,22 @@ class TestTheSeatbeltProfileMatchesTheLinuxLauncher:
         assert '(deny file-read* (literal "%s"))' % target in profile
         assert '(deny file-write* (literal "%s"))' % target in profile
 
-    @pytest.mark.parametrize("leaf", ["variables", "profiles"])
+    @pytest.mark.parametrize("leaf", ["profiles"])
     def test_a_keystone_directory_follows_the_custom_home(self, crew_root, leaf) -> None:
         assert '(deny file-read* (subpath "%s"))' % os.path.join(crew_root, leaf) in self._profile(
             "standard"
         )
+
+    @pytest.mark.parametrize("tier", ["standard", "cc", "strict"])
+    def test_the_profiles_directory_is_read_and_WRITE_denied(self, crew_root, tier) -> None:
+        """GPT review: `file-read*` alone hides the governance profiles'
+        CONTENT but leaves the directory itself renamable -- a sandboxed
+        `os.rename(".../profiles", ...)` makes it vanish, and whatever
+        hot-reloads governance profiles on this host could read that
+        absence as "no restrictions configured" instead of failing closed.
+        Same treatment the policy cache and voice runtime already get."""
+        target = os.path.join(crew_root, "profiles")
+        assert '(deny file-write* (subpath "%s"))' % target in self._profile(tier)
 
     def test_credential_files_keep_read_only_denial(self, crew_root) -> None:
         """`.npmrc` and `.git-credentials` are read-denied but NOT write-denied: npm and
@@ -1913,6 +1945,49 @@ class TestConcatenatedQuotedLiteralsInAnInterpreterPayload:
         assert not _blocked("python3 -c \"print('foo'); print('bar')\"")
 
 
+class TestPythonsImplicitAdjacentLiteralConcatenationIsReconstructed:
+    """GPT review, second pass: `_concatenated_literal_candidates` only
+    continued a run when the text between two quoted literals was `+` --
+    but Python (unlike bash) ALSO concatenates two adjacent string literals
+    with nothing but whitespace between them, no operator at all.
+    `expanduser('~/.k' 'iro/crew')` is ordinary Python, identical in effect
+    to `'~/.k' + 'iro/crew'`, but the `+`-only check left it unrecognized:
+    `between.strip()` is empty, not `"+"`, so the run stopped after the
+    first literal and `~/.kiro/crew` was never reconstructed.
+    """
+
+    def test_the_reported_shape_is_blocked(self, monkeypatch) -> None:
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked(
+            'python3 -c "import os; os.rename(os.path.expanduser('
+            "'~/.k' 'iro/crew'), '/tmp/stash')\""
+        )
+
+    def test_a_three_piece_whitespace_joined_run_is_blocked(self, monkeypatch) -> None:
+        """No prefix of the run spells the container on its own (`~/.ki`,
+        `~/.kiro/cr` neither one) -- only reaching the FULL three-piece
+        reconstruction completes `~/.kiro/crew`, so this cannot pass by
+        coincidence the way a run whose `+`-joined prefix already spelled
+        `.kiro` would."""
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked("python3 -c \"os.rename('~/.ki' 'ro/cr' 'ew', '/tmp/x')\"")
+
+    def test_a_mix_of_whitespace_and_plus_joins_is_blocked(self, monkeypatch) -> None:
+        """Same non-coincidence property: the `+`-joined prefix (`~/.ki` +
+        `ro/cr` = `~/.kiro/cr`) is not itself sensitive; only the final
+        whitespace-joined piece completes the container."""
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked("python3 -c \"os.rename('~/.ki' + 'ro/cr' 'ew', '/tmp/x')\"")
+
+    def test_unrelated_adjacent_literals_still_stay_allowed(self) -> None:
+        """The property that must NOT regress: two adjacent literals whose
+        CONCATENATION does not name anything sensitive stay allowed --
+        this widening only changes which text gets reconstructed and
+        checked, not the check itself."""
+        assert not _blocked("mv 'foo' 'bar'")
+        assert not _blocked("python3 -c \"print('hello' 'world')\"")
+
+
 class TestTheLinuxSelfBindRefusesASymlinkedContainer:
     """`os.path.isdir` follows a symlink, so the self-bind loop would happily bind
     THROUGH one -- `mount(2)` resolves the link the same way `open()` does, landing
@@ -1979,29 +2054,47 @@ class TestAncestorSelfBindsAreOrderedShallowestFirst:
     """
 
     def test_every_ancestor_precedes_its_descendants(self, monkeypatch, tmp_path) -> None:
+        """Compared with `/`-normalized separators, not the raw entries:
+        `sandbox._unrenamable_containers()` returns OS-native paths, so on Windows
+        every entry is backslash-separated and a forward-slash-only
+        `.startswith(ancestor + "/")` check never matches anything -- the `if` never
+        fires, `assert i < j` never runs, and the test passes VACUOUSLY, checking
+        nothing at all, rather than failing. Normalizing both sides the same way
+        `security.py`'s own path-folding does (`.replace("\\\\", "/")`) makes the
+        ancestor/descendant relationship recognized on every platform."""
         from kiro_crew import sandbox
 
         resolved_tmp = os.path.realpath(str(tmp_path))
         nested = os.path.join(resolved_tmp, "company", "dept", "crewdata")
         monkeypatch.setenv("KIROCREW_HOME", nested)
         containers = sandbox._unrenamable_containers()
-        for i, ancestor in enumerate(containers):
-            for j, descendant in enumerate(containers):
+        normalized = [c.replace("\\", "/") for c in containers]
+        checked_at_least_one_pair = False
+        for i, ancestor in enumerate(normalized):
+            for j, descendant in enumerate(normalized):
                 if ancestor != descendant and descendant.startswith(ancestor.rstrip("/") + "/"):
+                    checked_at_least_one_pair = True
                     assert i < j, (
-                        f"{ancestor!r} (index {i}) must precede its descendant "
-                        f"{descendant!r} (index {j}), or its self-bind would hide the "
-                        "descendant's mount"
+                        f"{containers[i]!r} (index {i}) must precede its descendant "
+                        f"{containers[j]!r} (index {j}), or its self-bind would hide "
+                        "the descendant's mount"
                     )
+        assert checked_at_least_one_pair, "no ancestor/descendant pair was found to check"
 
     def test_the_default_kiro_pair_is_also_ordered_correctly(self) -> None:
         """Not new behavior -- `.kiro` already preceded `.kiro/crew`. Pinned so a
-        future edit cannot flip it while "fixing" something else."""
+        future edit cannot flip it while "fixing" something else.
+
+        Compared with `/`-normalized separators: `sandbox._unrenamable_containers()`
+        returns OS-native paths, so a bare `.endswith("/.kiro")` never matches a
+        Windows entry ending `\\.kiro` and raised `StopIteration` there instead of
+        finding either container."""
         from kiro_crew import sandbox
 
         containers = sandbox._unrenamable_containers()
-        kiro = next(c for c in containers if c.endswith("/.kiro"))
-        kiro_crew = next(c for c in containers if c.endswith("/.kiro/crew"))
+        normalized = [(c, c.replace("\\", "/")) for c in containers]
+        kiro = next(c for c, n in normalized if n.endswith("/.kiro"))
+        kiro_crew = next(c for c, n in normalized if n.endswith("/.kiro/crew"))
         assert containers.index(kiro) < containers.index(kiro_crew)
 
 
@@ -2153,25 +2246,59 @@ class TestTheAncestorWalkStopsAtTheSystemTempRootNotUnderIt:
     environment-selected `$TMPDIR` from having THAT boundary itself relocated.
     """
 
-    def test_the_sandbox_protects_the_temp_root_itself(self, monkeypatch, tmp_path) -> None:
+    def test_the_sandbox_protects_the_temp_root_itself(self, monkeypatch) -> None:
         """Unlike the command gate, the sandbox's ancestor walk does NOT exempt the
         temp root: self-binding it costs nothing (it only blocks renaming that one
         directory entry), so there is no usability reason to leave it out, and
         leaving it out would un-protect a `KIROCREW_HOME` nested under a writable
-        custom `$TMPDIR`."""
+        custom `$TMPDIR`.
+
+        Nested under `tempfile.gettempdir()`, not `tmp_path`: this project's own
+        rootdir conftest redirects `tempfile.gettempdir()` to a SIBLING of pytest's
+        own `tmp_path` tree, not an ancestor of it -- on POSIX the two coincide
+        anyway, because both land under the same literal `/tmp` boundary, but
+        Windows has no such literal fallback, so `tmp_path`'s own ancestors are
+        never recognized as a temp root there and this test failed on every
+        Windows CI run with `tmp_path is not under a recognized temp root`.
+
+        `_unrenamable_containers()` itself walks ancestors with plain `os.path`
+        string operations, but resolving `KIROCREW_HOME` along the way goes
+        through `config_dir()`, which DOES create the directory as a normal side
+        effect of resolving a home -- so this registers cleanup of what that
+        creates, into the redirected (session-scoped, already-tracked) temp root
+        rather than leaving it unregistered residue."""
+        import tempfile
+
         from kiro_crew.config.paths import _is_system_tmp_root
 
-        nested = tmp_path / "company" / "dept" / "crewdata"
-        nested.parent.mkdir(parents=True)
+        base = pathlib.Path(tempfile.gettempdir())
+        created_root = base / "company"
+        nested = created_root / "dept" / "crewdata"
         monkeypatch.setenv("KIROCREW_HOME", str(nested))
         from kiro_crew import sandbox
 
-        containers = sandbox._unrenamable_containers()
-        real_tmp = pathlib.Path(os.path.realpath(str(tmp_path)))
-        temp_root = next((a for a in [real_tmp, *real_tmp.parents] if _is_system_tmp_root(a)), None)
-        assert temp_root is not None, "tmp_path is not under a recognized temp root"
+        try:
+            containers = sandbox._unrenamable_containers()
+        finally:
+            platform_compat.rmtree_force(created_root)
+        real_base = pathlib.Path(os.path.realpath(str(base)))
+        temp_root = next(
+            (a for a in [real_base, *real_base.parents] if _is_system_tmp_root(a)), None
+        )
+        assert temp_root is not None, "gettempdir() is not under a recognized temp root"
         assert str(temp_root) in containers
 
+    @pytest.mark.skipif(
+        not platform_compat.IS_POSIX,
+        reason=(
+            "Rooted at the literal POSIX `/tmp`, exercising `_is_system_tmp_root`'s "
+            "POSIX-`/tmp`-literal fallback specifically. Windows has no `/tmp` and "
+            "no such fallback -- confirmed on CI: `cd /tmp && cat notes.txt` was "
+            "wrongly refused there because the literal `/tmp` read as an ordinary, "
+            "unrecognized ancestor of the configured home rather than as the "
+            "shared, unprotected temp root this test's assertion assumes."
+        ),
+    )
     def test_ordinary_tmp_commands_are_allowed_even_with_a_tmp_nested_home(
         self, monkeypatch
     ) -> None:
@@ -2211,20 +2338,33 @@ class TestTheAncestorWalkStopsAtTheSystemTempRootNotUnderIt:
         assert _blocked("mv %s /tmp/x" % company_dir)
         assert _blocked("mv %s /tmp/x" % dept_dir)
 
-    def test_the_boundary_helper_directly(self, tmp_path) -> None:
+    def test_the_boundary_helper_directly(self) -> None:
         """Unit-level pin for `_is_system_tmp_root` itself: true exactly at the
-        boundary, false one level either side of it."""
+        boundary, false one level either side of it.
+
+        Walks up from `tempfile.gettempdir()`, not `tmp_path`: this project's own
+        rootdir conftest redirects `gettempdir()` to a SIBLING of pytest's own
+        `tmp_path` tree, not an ancestor of it -- the two only coincide on POSIX,
+        where both happen to land under the same literal `/tmp` boundary. Windows
+        has no such literal fallback, so `tmp_path`'s own ancestors are never
+        recognized as a temp root there, and this test failed on every Windows CI
+        run with `no ancestor of tmp_path was recognized as the temp root`."""
+        import tempfile
+
         from kiro_crew.config.paths import _is_system_tmp_root
 
-        real_tmp = pathlib.Path(os.path.realpath(str(tmp_path)))
-        assert not _is_system_tmp_root(real_tmp)
-        assert not _is_system_tmp_root(real_tmp.parent)
-        for ancestor in list(real_tmp.parents):
+        leaf = pathlib.Path(os.path.realpath(tempfile.gettempdir()))
+        for ancestor in [leaf, *leaf.parents]:
             if _is_system_tmp_root(ancestor):
+                # True exactly at the boundary, false one level either side: a
+                # CHILD of the recognized boundary must not also read as the
+                # boundary itself, and neither must its parent.
+                if ancestor is not leaf:
+                    assert not _is_system_tmp_root(leaf)
                 assert not _is_system_tmp_root(ancestor.parent)
                 break
         else:
-            pytest.fail("no ancestor of tmp_path was recognized as the temp root")
+            pytest.fail("no ancestor of gettempdir() was recognized as the temp root")
 
 
 class TestObfuscatedAncestorReferencesAreCaughtToo:
@@ -2328,3 +2468,1621 @@ class TestTheSandboxProtectsAUserSelectedTempRootAncestor:
 
         assert not hasattr(sandbox, "_is_system_tmp_root")
         assert hasattr(security, "_is_system_tmp_root")
+
+
+class TestTheCommandGateProtectsTheTempRootWhenSandboxingIsOff:
+    """GPT review: `_is_system_tmp_root`'s exemption in `security.py`'s own
+    ancestor walk explicitly defers the cost of protecting an operator-selected
+    `TMPDIR` to `sandbox.py`'s ancestor walk ("since doing so there is free" --
+    see `TestTheSandboxProtectsAUserSelectedTempRootAncestor`), but that walk
+    only ever runs as part of building the namespace-sandbox launcher script --
+    with `agent.sandbox="off"`, it never executes at all. A `KIROCREW_HOME`
+    placed directly under an operator-selected `TMPDIR` then had no protection
+    from EITHER layer: the command gate exempted it as shared temp space, and
+    the layer that exemption defers to never ran to cover it. Fixed by
+    conditioning the exemption itself on `sandbox.configured_sandbox_mode()`:
+    unlike "is `TMPDIR` set" (the signal a prior, reverted round of this same
+    narrowing relied on and had to revert, because macOS sets `TMPDIR` via
+    launchd unconditionally), `agent.sandbox` carries no per-platform ambient
+    default -- it ships `"auto"` and becomes `"off"` only through an explicit
+    operator opt-out, so honoring it here cannot reopen that regression.
+    """
+
+    @staticmethod
+    def _real_temp_root() -> pathlib.Path:
+        """The actual recognized temp-root boundary `_is_system_tmp_root`
+        answers to -- NOT simply `tempfile.gettempdir()`, which this project's
+        own rootdir conftest redirects to a per-session directory nested BELOW
+        that boundary, not the boundary itself (same reasoning as
+        `TestTheAncestorWalkStopsAtTheSystemTempRootNotUnderIt.
+        test_the_sandbox_protects_the_temp_root_itself`)."""
+        import tempfile
+
+        from kiro_crew.config.paths import _is_system_tmp_root
+
+        base = pathlib.Path(os.path.realpath(tempfile.gettempdir()))
+        root = next((a for a in [base, *base.parents] if _is_system_tmp_root(a)), None)
+        assert root is not None, "gettempdir() is not under a recognized temp root"
+        return root
+
+    def test_a_tmpdir_rooted_home_is_protected_when_sandboxing_is_off(self, monkeypatch) -> None:
+        """The exact shape GPT reported: `KIROCREW_HOME` sitting directly under
+        the configured temp root, with sandboxing explicitly disabled."""
+        from kiro_crew import sandbox
+
+        tmp_root = self._real_temp_root()
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_root / "crew"))
+        monkeypatch.setattr(sandbox, "configured_sandbox_mode", lambda: "off")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        security._custom_home_ancestors_cache.clear()
+        assert _blocked(f"mv {tmp_root} /tmp/stash")
+        assert _blocked(f"ln -s /tmp/evil {tmp_root}")
+
+    def test_the_same_home_stays_exempt_when_sandboxing_is_on(self, monkeypatch) -> None:
+        """The property that must NOT regress: with sandboxing active (the
+        default, and this project's own CI posture), `sandbox.py`'s own walk is
+        the layer that protects this boundary, so the command gate keeps its
+        existing, narrower exemption -- an ordinary `mv $TMPDIR ...` command
+        stays allowed rather than refusing to touch the whole temp tree."""
+        from kiro_crew import sandbox
+
+        tmp_root = self._real_temp_root()
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_root / "crew"))
+        monkeypatch.setattr(sandbox, "configured_sandbox_mode", lambda: "auto")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        security._custom_home_ancestors_cache.clear()
+        assert not _blocked(f"mv {tmp_root} /tmp/stash")
+
+    def test_the_ancestor_helper_directly_with_sandboxing_off(self, monkeypatch) -> None:
+        """Unit-level pin on `_custom_home_ancestors_uncached` itself, isolated
+        from the command gate's other matchers."""
+        from kiro_crew import sandbox
+
+        tmp_root = self._real_temp_root()
+        configured = str(tmp_root / "crew")
+        monkeypatch.setattr(sandbox, "configured_sandbox_mode", lambda: "off")
+        ancestors = security._custom_home_ancestors_uncached(configured)
+        assert str(tmp_root) in ancestors
+
+    def test_the_ancestor_helper_directly_with_sandboxing_on(self, monkeypatch) -> None:
+        """Companion negative control: the unchanged, existing behavior."""
+        from kiro_crew import sandbox
+
+        tmp_root = self._real_temp_root()
+        configured = str(tmp_root / "crew")
+        monkeypatch.setattr(sandbox, "configured_sandbox_mode", lambda: "auto")
+        ancestors = security._custom_home_ancestors_uncached(configured)
+        assert ancestors == []
+
+
+class TestAWildcardAgainstAnAncestorRequiresALiteralAnchor:
+    """A real regression from the ancestor-target fix itself, caught by CI: once the
+    glob/substitution scanners consulted a custom home's ancestors too, a BARE
+    wildcard (`ls -la /tmp/*`) started reading as naming whichever ancestor happened
+    to sit directly under `/tmp` -- an ordinary, harmless command this project's own
+    CI matrix runs constantly, refused outright. The fixed container dirs (`.kiro`
+    etc.) never had this problem: they are dot-prefixed, and bash's dotfile rule
+    already keeps a bare `*` from matching them without `dotglob`. An ancestor's
+    name carries no such protection -- it is an ordinary, installation-specific
+    component -- so ancestor matches additionally require the operand's own LEAF
+    component to retain a literal character (`_pattern_component_has_literal_anchor`,
+    `_glob_could_name`'s `require_leaf_literal`).
+    """
+
+    @pytest.mark.skipif(
+        not platform_compat.IS_POSIX,
+        reason=(
+            "Hardcodes the literal POSIX `/tmp` as `KIROCREW_HOME`'s prefix to "
+            "exercise `_is_system_tmp_root`'s POSIX-`/tmp`-literal fallback "
+            "specifically -- Windows has no such path or fallback, so the literal "
+            "`/tmp` is just an ordinary, unrecognized ancestor there and the "
+            "assertion this test pins does not hold."
+        ),
+    )
+    def test_bare_wildcard_under_the_temp_root_does_not_name_an_ancestor(self, monkeypatch) -> None:
+        """The exact CI shape: KIROCREW_HOME nested directly under `/tmp`, and an
+        ordinary `ls -la /tmp/*` that must stay allowed."""
+        monkeypatch.setenv("KIROCREW_HOME", "/tmp/some-crew-home/.kiro/crew")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert not _blocked("ls -la /tmp/*")
+        assert not _blocked("rm /tmp/*.log")
+
+    def test_a_partially_literal_wildcard_still_names_the_ancestor(self, monkeypatch) -> None:
+        """The property that must NOT regress while fixing the above: GPT's own
+        flagged obfuscation, which retains a literal anchor in the leaf component,
+        stays caught."""
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/company/dept/crewdata")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked("bash -O extglob -c 'mv /opt/comp@(any) /tmp/x'")
+
+    def test_the_leaf_anchor_helper_directly(self) -> None:
+        from kiro_crew.security import _pattern_component_has_literal_anchor
+
+        assert not _pattern_component_has_literal_anchor("*")
+        assert not _pattern_component_has_literal_anchor("?")
+        assert not _pattern_component_has_literal_anchor("[abc]")
+        assert not _pattern_component_has_literal_anchor(".*")
+        assert _pattern_component_has_literal_anchor("comp*")
+        assert _pattern_component_has_literal_anchor("dept")
+
+    def test_a_write_capable_verb_with_a_bare_wildcard_still_names_the_ancestor(
+        self, monkeypatch
+    ) -> None:
+        """GPT review: the leaf-anchor requirement's leniency was UNCONDITIONAL --
+        it never distinguished `ls -la /opt/*` (merely lists whatever the wildcard
+        expands to) from `mv /opt/* /tmp/x` (RELOCATES whatever it expands to,
+        `/opt/company` included). Now scoped by `bare_trust_root_read`: exempted
+        only when the containing command is a proven-safe, program-allowlisted
+        read (`_is_bare_trust_root_read(..., allow_glob=True)`); a write-capable
+        verb whose bare wildcard structurally matches an ancestor's shape fails
+        closed instead."""
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/company/dept/crewdata")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked("mv /opt/* /tmp/x")
+        assert _blocked("ln -s /evil /opt/*")
+
+    def test_an_unrelated_bare_wildcard_write_stays_allowed(self, monkeypatch) -> None:
+        """The property that must NOT regress: the fail-closed direction is scoped
+        to a wildcard whose STRUCTURE (prefix and leaf) actually matches a
+        configured ancestor -- an ordinary `mv` somewhere else entirely must not
+        be swept up just because it is write-capable and uses a bare wildcard."""
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/company/dept/crewdata")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert not _blocked("mv /completely/unrelated/* /tmp/x")
+        assert not _blocked("mv /home/user/downloads/* /archive/")
+
+    def test_an_ambiguous_widened_alternation_is_not_swept_into_the_fail_closed_case(
+        self, monkeypatch
+    ) -> None:
+        """The property that must NOT regress while fixing the write-verb gap
+        above: `@(comp|other)` widens to a bare `*` leaf for the SAME reason a
+        genuinely vague pattern does, but it is not actually unbounded -- it can
+        only ever be `comp` or `other`, neither of which is `company`. Failing
+        closed on this WIDENED reading specifically (as opposed to the operand's
+        own literal text) would block a command that structurally cannot ever
+        name the ancestor."""
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/company/dept/crewdata")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert not _blocked("bash -O extglob -c 'mv /opt/@(comp|other) /tmp/x'")
+
+    def test_fixed_container_dirs_are_unaffected_by_the_anchor_requirement(
+        self, monkeypatch
+    ) -> None:
+        """The split target groups (`_container_target_groups`) must leave the FIXED
+        set's existing, more permissive matching untouched -- only ancestor targets
+        get the new restriction."""
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked("bash -O extglob -c 'mv ~/@(.kiro) /tmp/x'")
+        assert _blocked("mv ~/.k$(printf i)ro/crew /tmp/x")
+
+
+class TestIndirectExpansionCannotNameTheContainerUnseen:
+    """GPT review: bash indirect expansion (`${!NAME}` -- the value of the variable
+    NAMED BY `NAME`'s own value) resolves the configured home without ever spelling
+    its name in the operand. `N=KIROCREW_HOME; mv "${!N}" /tmp/x` renames
+    `$KIROCREW_HOME` itself; `N=HOME; mv "${!N}/.kiro/crew" /tmp/x` reaches the
+    default home the same way. Neither is caught by the existing substitution
+    scanner: `${!N}` masks to a bare `*` (whole-operand) or `*/.kiro/crew`
+    (embedded), and `_glob_could_name` requires the masked reading to already look
+    like a path before checking it against anything -- so both were silently
+    dropped rather than refused.
+    """
+
+    def test_bare_indirect_expansion_of_a_configured_home_is_blocked(self, monkeypatch) -> None:
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/crewdata")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked('N=KIROCREW_HOME; mv "${!N}" /tmp/x')
+
+    def test_embedded_indirect_expansion_of_home_is_blocked(self, monkeypatch) -> None:
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked('N=HOME; mv "${!N}/.kiro/crew" /tmp/x')
+
+    def test_the_unrelated_prefix_listing_construct_stays_allowed(self, monkeypatch) -> None:
+        """`${!prefix*}`/`${!prefix@}` list variable NAMES matching a prefix -- a
+        different construct entirely, ending in `*`/`@` rather than closing right
+        after the name, and must not trip the same refusal."""
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert not _blocked("echo ${!BASH_*}")
+
+
+class TestBraceOverflowRecognizesAnAncestorsOwnName:
+    """GPT review: a brace expression too large to enumerate falls back to a
+    LITERAL-PREFIX heuristic deciding whether to refuse outright. That heuristic
+    checked the prefix against the FIXED container dirs and the sensitive-path
+    dirs, never against a configured home's ancestors -- and, independently, its
+    "same parent" sibling check mis-measured a prefix ending in a separator (a
+    FRESH path component, landing directly inside that directory) as if it were
+    extending a partial one (landing one level higher), so even adding ancestors
+    would not have caught `mv /opt/{arm0,…,company} /tmp/x` -- a 70-plus-arm brace
+    where one arm spells an ancestor's own exact name, with nothing after it.
+    """
+
+    def test_a_brace_spelling_an_ancestors_own_name_is_blocked(self, monkeypatch) -> None:
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/company/dept/crewdata")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        arms = ",".join(f"x{i}" for i in range(70)) + ",company"
+        assert _blocked("mv /opt/{" + arms + "} /tmp/x")
+
+    @pytest.mark.skipif(
+        not platform_compat.IS_POSIX,
+        reason=(
+            "Hardcodes the literal POSIX `/tmp` as `KIROCREW_HOME`'s prefix to "
+            "exercise `_is_system_tmp_root`'s POSIX-`/tmp`-literal fallback "
+            "specifically -- Windows has no such path or fallback, so the literal "
+            "`/tmp` is just an ordinary, unrecognized ancestor there and the "
+            "assertion this test pins does not hold."
+        ),
+    )
+    def test_the_documented_tmp_false_positive_stays_fixed_even_with_a_nested_home(
+        self, monkeypatch
+    ) -> None:
+        """The property that must NOT regress while fixing the above: a
+        `KIROCREW_HOME` nested directly under the temp root -- this project's own
+        test-isolation convention -- must not turn an ordinary `/tmp`-rooted brace
+        into a refusal, the exact false positive `_is_system_tmp_root` already
+        exists to prevent elsewhere in this file."""
+        monkeypatch.setenv("KIROCREW_HOME", "/tmp/some-crew-home/.kiro/crew")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert not _blocked("ls /tmp/{a..z}{a..z}")
+        assert not _blocked("cp /data/img{a..z}{a..z}.jpg /out/")
+
+
+class TestAnExactExtglobAlternativeIsNotVague:
+    """GPT review: `@(company)` -- a SINGLE, unambiguous extglob alternative, no
+    `|` -- names EXACTLY `company`. The widened `.*`/`*` readings that let a glob
+    embedded in a larger literal still match (`comp@(any)` -> `comp*`) discard this
+    when the group is the WHOLE leaf component: `mv /opt/@(company)` read as
+    carrying no literal anchor at all, even though the operand names the ancestor
+    exactly. A third reading substitutes an unambiguous group with its own text
+    instead of a wildcard; an alternation (`@(a|b)`) or a group holding its own
+    glob syntax is left widened, since it genuinely is vague.
+    """
+
+    def test_an_exact_single_alternative_names_the_ancestor(self, monkeypatch) -> None:
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/company/dept/crewdata")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked("bash -O extglob -c 'mv /opt/@(company) /tmp/x'")
+
+    def test_an_ambiguous_alternation_is_not_claimed_as_exact(self, monkeypatch) -> None:
+        """Must stay allowed -- `@(comp|other)` genuinely could be either, and
+        `_extglob_exact_alternative` must not manufacture false precision for it."""
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/company/dept/crewdata")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert not _blocked("bash -O extglob -c 'mv /opt/@(comp|other) /tmp/x'")
+
+    def test_the_dotfile_and_embedded_cases_still_work(self, monkeypatch) -> None:
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked("bash -O extglob -c 'mv ~/@(.kiro) /tmp/x'")
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/company/dept/crewdata")
+        assert _blocked("bash -O extglob -c 'mv /opt/comp@(any) /tmp/x'")
+
+
+class TestEachMultiAlternativeExtglobAlternativeIsCheckedOnItsOwn:
+    """GPT review: a multi-alternative group (`@(a|b)`) is not "matches anything" --
+    it is a disjunction over a SMALL, KNOWN, finite set, and each alternative names
+    something exactly, same as a single-alternative group does. Treating the whole
+    group as a vague widening (the fix that made
+    `TestAnExactExtglobAlternativeIsNotVague::test_an_ambiguous_alternation_is_not_
+    claimed_as_exact` correctly allowed) went too far: `@(foo|SomeRepo)` was
+    ALSO exempted even when `SomeRepo` is the exact ancestor -- the shape a
+    real CI runner's own checkout path takes -- since nothing ever checked the
+    alternatives individually, only the widened `*` reading, which is correctly
+    vague-exempted. `_extglob_alternative_readings` now substitutes each
+    alternative in turn as its own exact (non-vague) reading, alongside the
+    widened one.
+    """
+
+    def test_one_matching_alternative_among_several_still_blocks(self, monkeypatch) -> None:
+        monkeypatch.setenv("KIROCREW_HOME", "/home/runner/work/SomeRepo/dept/crewdata")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked("bash -O extglob -c 'mv /home/runner/work/@(foo|SomeRepo) /tmp/x'")
+
+    def test_the_matching_alternative_can_be_first_or_last(self, monkeypatch) -> None:
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/company/dept/crewdata")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked("bash -O extglob -c 'mv /opt/@(company|foo) /tmp/x'")
+        assert _blocked("bash -O extglob -c 'mv /opt/@(foo|company) /tmp/x'")
+
+    def test_no_alternative_matching_still_stays_allowed(self, monkeypatch) -> None:
+        """The property that must NOT regress: neither `comp` nor `other` is
+        `company`, so this must still be allowed."""
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/company/dept/crewdata")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert not _blocked("bash -O extglob -c 'mv /opt/@(comp|other) /tmp/x'")
+
+    def test_a_glob_shaped_alternative_is_not_treated_as_exact(self, monkeypatch) -> None:
+        """`@(comp*|other)` -- one alternative is itself glob-shaped, so it is not
+        one exact string either; only the genuinely literal alternatives are
+        checked this way, and the glob-shaped one is left to the existing widened
+        reading. `overflowed` is now `True`, not `False` (GPT review, third
+        pass): `comp*` was silently dropped rather than accounted for, so the
+        widened reading kept its vague-widening exemption as if `other` were
+        the only thing this group could ever mean -- even though `comp*` can
+        ALSO equal an ancestor named `company`."""
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/company/dept/crewdata")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert security._extglob_alternative_readings("/opt/@(comp*|other)") == (
+            ["/opt/other"],
+            True,
+        )
+
+
+class TestASingletonBracketIsNotVague:
+    """GPT review: the bracket-class equivalent of the extglob case above.
+    `_pattern_component_has_literal_anchor` stripped EVERY bracket expression
+    (`\\[[^\\]]*\\]`) unconditionally, treating `[c]` the same as `[abc]` or
+    `[a-z]` -- but a SINGLETON bracket names exactly one character, no more vague
+    than spelling that character bare. `[c][o][m][p][a][n][y]` is `company`
+    letter-for-letter, so `mv /opt/[c][o][m][p][a][n][y] /tmp/stash` against a
+    configured `KIROCREW_HOME=/opt/company/dept/crewdata` read as carrying no
+    literal anchor at all and relocated the governance ceiling's own ancestor.
+    A negated (`[!c]`, `[^c]`) or multi-character (`[abc]`, `[a-z]`) bracket keeps
+    its ordinary vague reading -- both genuinely admit more than one character.
+    """
+
+    def test_singleton_brackets_spelling_the_ancestor_are_blocked(self, monkeypatch) -> None:
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/company/dept/crewdata")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked("mv /opt/[c][o][m][p][a][n][y] /tmp/stash")
+
+    def test_a_genuinely_vague_multi_char_bracket_class_is_unaffected(self, monkeypatch) -> None:
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/company/dept/crewdata")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert not _blocked("ls -la /tmp/[abc]")
+
+    def test_a_genuinely_vague_bracket_range_is_unaffected(self, monkeypatch) -> None:
+        assert not _blocked("ls -la /opt/[a-z]*")
+
+    def test_a_negated_bracket_stays_vague(self) -> None:
+        assert security._pattern_component_has_literal_anchor("[!c]") is False
+        assert security._pattern_component_has_literal_anchor("[^c]") is False
+
+    def test_a_non_alnum_singleton_still_counts_as_a_literal_anchor(self, monkeypatch) -> None:
+        """GPT review: the final check was `any(ch.isalnum() for ch in stripped)`,
+        so a de-bracketed singleton that isn't a letter or digit -- `_`, a common,
+        ordinary filename character -- was correctly kept as literal text by
+        `_debracket_singleton` but then refused to COUNT as an anchor by this
+        stricter alnum filter. `KIROCREW_HOME=/opt/_/crew` with `mv /opt/[_]
+        /tmp/x` read the leaf `[_]` as carrying no anchor at all. Fixed: by
+        construction everything reaching the final check already had every
+        wildcard and vague bracket class stripped, so any surviving character is
+        literal -- non-emptiness is the correct test, not alnum-ness."""
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/_/crew")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked("mv /opt/[_] /tmp/x")
+        assert security._pattern_component_has_literal_anchor("[_]") is True
+
+
+class TestEscapedWhitespaceDoesNotSplitARawGlobWord:
+    """GPT review: `_raw_glob_could_name_container` isolated glob-bearing words with
+    a plain `text.split()`, which breaks on EVERY whitespace run -- including one
+    bash itself treats as part of the same word. `my\\ dir` is ONE path component to
+    bash (the backslash escapes the space), but `str.split()` cuts it into `my\\`
+    and `dir`, and neither fragment alone matches an ancestor whose real name
+    contains that space. `KIROCREW_HOME` under `/opt/my dir` with the interpreter
+    payload `bash -c 'mv /opt/my\\ d[i]r /tmp/x'` -- an opaque `-c` argument only
+    the raw scan sees inside -- relocated the ancestor. Fixed by splitting with
+    `(?:\\\\.|\\S)+` (keeps an escaped character glued to its neighbors) and then
+    un-escaping only the whitespace that split protected, leaving other backslash
+    escapes (`\\[`, `\\*`) as-is.
+    """
+
+    def test_an_escaped_space_does_not_split_the_ancestors_name(self, monkeypatch) -> None:
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/my dir/crew")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked(r"bash -c 'mv /opt/my\ d[i]r /tmp/x'")
+
+    def test_an_ordinary_unescaped_space_still_separates_words(self, monkeypatch) -> None:
+        """The property that must NOT regress: two genuinely separate arguments,
+        with no escape between them, must still be split apart."""
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/company/dept/crewdata")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert not _blocked("bash -c 'mv /opt/comp[a] /elsewhere notes.txt'")
+        assert _blocked("bash -c 'mv /opt/comp[a][n][y] /elsewhere'")
+
+
+class TestAnAssignmentFedThroughAParameterExpansionOperatorIsCaught:
+    """GPT review: `H=$HOME/.kiro/crewXXXX; mv "${H%XXXX}"` trims an assigned value
+    down to exactly the container path. The general substitution masking has no
+    notion of assignments -- it reads `${H%XXXX}` as unknown output and masks it
+    to a bare `*`, which then carries no path-shaped text for the "looks like a
+    path" gate even to see. `_assignment_feeds_container_via_operator` does not
+    try to compute the operator's actual effect (bash's trim/substring/case-
+    conversion repertoire is not reimplemented here); instead, an assignment
+    whose value already CONTAINS a container or ancestor as a substring, later
+    referenced through ANY operator-form expansion, is refused outright -- the
+    operator's presence is what makes the assigned text alone insufficient to
+    clear the command, regardless of which specific operator runs.
+    """
+
+    def test_the_exact_reported_shape_is_blocked(self, monkeypatch) -> None:
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked('H=$HOME/.kiro/crewXXXX; mv "${H%XXXX}" /tmp/x')
+
+    def test_an_ancestor_reached_the_same_way_is_also_blocked(self, monkeypatch) -> None:
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/company/dept/crewdata")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked('H=/opt/companyXXXX; mv "${H%XXXX}" /tmp/x')
+
+    def test_an_ancestor_targets_own_separator_spelling_need_not_be_normalized(
+        self, monkeypatch
+    ) -> None:
+        """Windows CI regression (GPT review, round 2): finding 33 normalized
+        only the ASSIGNED VALUE before the substring check, on the assumption a
+        target was already in the platform's native separator form. An ANCESTOR
+        target is not: `_custom_home_ancestors` walks the as-configured
+        spelling of `KIROCREW_HOME` alongside the abspath/realpath-normalized
+        ones, and the as-configured spelling is never forced to native
+        separators -- `KIROCREW_HOME=/opt/company/dept/crewdata` on Windows left
+        an ancestor target spelled `/opt/company` (forward slash) sitting next
+        to a normalized value's `\\opt\\companyXXXX` (backslash), matching
+        neither. A redundant `./` segment exercises the identical
+        both-sides-must-normalize fix on any platform: `/opt/./company`
+        (target) is not literally a substring of `/opt/companyXXXX` (value)
+        without normalizing the TARGET too."""
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        monkeypatch.setattr(
+            security, "_container_target_groups", lambda: (set(), {"/opt/./company"})
+        )
+        assert _blocked('H=/opt/companyXXXX; mv "${H%XXXX}" /tmp/x')
+
+    def test_an_ordinary_trim_on_an_unrelated_value_stays_allowed(self, monkeypatch) -> None:
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert not _blocked('F=report.txt; echo "${F%.txt}"')
+        assert not _blocked('N=filename; echo "${N#pre}"')
+
+    def test_a_bare_reference_with_no_operator_is_unaffected(self) -> None:
+        """The property that must NOT regress: a bare `${NAME}` (no operator) is
+        an ordinary, already-handled substitution, not this new case."""
+        assert not security._assignment_feeds_container_via_operator(
+            "H=$HOME/.kiro/crew; echo ${H}"
+        )
+
+    def test_the_helper_requires_both_an_assignment_and_a_later_operator_reference(
+        self,
+    ) -> None:
+        assert not security._assignment_feeds_container_via_operator("echo ${H%XXXX}")
+        assert not security._assignment_feeds_container_via_operator(
+            "H=$HOME/.kiro/crewXXXX; echo done"
+        )
+
+    @pytest.mark.parametrize("builtin", ["export", "declare", "local", "readonly", "typeset"])
+    def test_a_declaration_builtin_does_not_hide_the_assignment(
+        self, monkeypatch, builtin: str
+    ) -> None:
+        """GPT review: `export H=$HOME/.kiro/crewXXXX; mv "${H%XXXX}"` is the
+        IDENTICAL assignment `H=$HOME/.kiro/crewXXXX` is, merely exported for
+        child processes to see too -- but `_SIMPLE_ASSIGNMENT_RE`'s statement-
+        boundary anchor expected `NAME=` to begin right after `;`/`&&`/`|`/the
+        text's own start, and `export ` sitting between the boundary and `H=`
+        meant the capture never started where it looked. Widened to allow an
+        optional declaration builtin (`export`, `declare`, `local`, `readonly`,
+        `typeset`) between the boundary and the assignment."""
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked(f'{builtin} H=$HOME/.kiro/crewXXXX; mv "${{H%XXXX}}" /tmp/x')
+
+    def test_home_expansion_does_not_depend_on_the_home_environment_variable(
+        self, monkeypatch
+    ) -> None:
+        """GPT review / Windows CI: `os.path.expandvars` only expands `$HOME`
+        when the literal `HOME` environment variable is set -- true on POSIX,
+        but Windows resolves the user's home through `USERPROFILE` instead and
+        does not reliably set `HOME`, so the assigned value stayed literal text
+        that could never match a resolved container path.
+        `_assignment_feeds_container_via_operator` now resolves `$HOME`/
+        `${HOME...}` against `Path.home()` directly (`_HOME_TEXT_REF_RE`),
+        which already knows to fall back to `USERPROFILE` -- proven here by
+        deleting `HOME` from the environment and confirming detection still
+        fires without it."""
+        monkeypatch.delenv("HOME", raising=False)
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked('H=$HOME/.kiro/crewXXXX; mv "${H%XXXX}" /tmp/x')
+
+
+class TestAQuotedAssignmentValueWithEmbeddedWhitespaceIsCaptured:
+    """GPT review: `H=" $HOME/.kiro/crewXXXX"; mv ${H%XXXX} /tmp/stash` -- the
+    assigned value is double-quoted and begins with a literal space.
+    `_SIMPLE_ASSIGNMENT_RE`'s old value capture, `(\\S+)`, stops at the FIRST
+    whitespace character, so it captured only the opening quote `"` and lost
+    the rest of the value -- hiding `$HOME/.kiro/crewXXXX` from the substring
+    check `_assignment_feeds_container_via_operator` runs downstream. Real
+    bash keeps the leading space as part of the double-quoted value; the
+    command then references `$H` UNQUOTED (`${H%XXXX}`, no surrounding
+    quotes), so bash's own word-splitting on the expanded value discards that
+    leading space as an IFS separator and leaves the container path as the
+    final argument to `mv` -- a fully working relocation the truncated
+    capture never saw.
+
+    Widened the value alternation to a double-quoted span, a single-quoted
+    span, or a run of bare non-whitespace-non-quote characters, repeated --
+    so a quoted value is captured whole, whitespace and all, rather than
+    truncated at its first space. The quotes are captured too (not stripped):
+    the downstream containment check matches a substring anywhere in the
+    (normalized) value, so a surrounding quote character never prevents a
+    real match.
+    """
+
+    def test_the_reported_leading_space_bypass_is_blocked(self, monkeypatch) -> None:
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked('H=" $HOME/.kiro/crewXXXX"; mv ${H%XXXX} /tmp/stash')
+
+    def test_a_single_quoted_variant_is_also_blocked(self, monkeypatch) -> None:
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked("H=' $HOME/.kiro/crewXXXX'; mv ${H%XXXX} /tmp/stash")
+
+    def test_a_trailing_space_inside_the_quotes_is_also_blocked(self, monkeypatch) -> None:
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked('H="$HOME/.kiro/crewXXXX "; mv ${H%XXXX} /tmp/stash')
+
+    def test_a_declaration_builtin_does_not_hide_the_quoted_value_either(self, monkeypatch) -> None:
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked('declare -x H=" $HOME/.kiro/crewXXXX"; mv ${H%XXXX} /tmp/stash')
+
+    def test_an_unrelated_quoted_assignment_with_embedded_whitespace_stays_allowed(
+        self,
+    ) -> None:
+        """The property that must NOT regress: widening the capture to include
+        whitespace must not make an ordinary quoted assignment with no
+        container-shaped content start tripping the check."""
+        assert not security._assignment_feeds_container_via_operator(
+            'MSG="hello world"; echo "${MSG%world}"'
+        )
+
+    def test_the_captured_value_includes_the_full_quoted_span(self) -> None:
+        """Direct regex-level check: the value group must span the whole
+        quoted token, not stop at the internal space."""
+        match = security._SIMPLE_ASSIGNMENT_RE.search(
+            'H=" $HOME/.kiro/crewXXXX"; mv ${H%XXXX} /tmp/stash'
+        )
+        assert match is not None
+        assert match.group(2).startswith('" $HOME')
+
+
+class TestANestedParameterExpansionInsideAHomeReferenceIsCaught:
+    """GPT review: `${HOME:0:${#HOME}}` -- real bash syntax, a nested parameter
+    expansion supplying the substring LENGTH -- evaluates to plain `$HOME`, but
+    both `_OUTPUT_SUBSTITUTION_RE` and `_build_container_regex`'s `home_var`
+    matched `${...}` with `[^}]*`, which stops at the FIRST closing brace: the
+    INNER expansion's own `}`, leaving the OUTER one stray right before whatever
+    container spelling followed. The masked/matched result then either carried
+    an unconsumed `}` (breaking the "looks like a path" reading) or simply
+    failed to match the raw regex at all. Both gained one level of balanced-
+    brace tolerance, mirroring `_OUTPUT_SUBSTITUTION_RE`'s existing `$(...)`
+    handling for the identical shape of problem.
+    """
+
+    def test_the_exact_reported_shape_is_blocked(self, monkeypatch) -> None:
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked("mv ${HOME:0:${#HOME}}/.kiro/crew /tmp/x")
+
+    def test_ordinary_single_level_operator_forms_are_unaffected(self, monkeypatch) -> None:
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked("mv ${HOME:0}/.kiro/crew /tmp/x")
+        assert _blocked("mv ${HOME:-/root}/.kiro/crew /tmp/x")
+
+
+class TestTheTempRootExemptionDoesNotDependOnWhichVariableSetIt:
+    """A round of this fence tried excluding `tempfile.gettempdir()`'s result from
+    the ancestor-walk exemption whenever `TMPDIR`/`TEMP`/`TMP` was SET, on the
+    theory that a set variable meant a deliberate operator choice worth protecting
+    like any other ancestor (GPT review). Reverted: that signal is not reliable
+    cross-platform. macOS sets `TMPDIR` via launchd for EVERY process regardless of
+    operator intent, so the exclusion fired unconditionally there, made
+    `gettempdir()`'s own per-user temp root stop being treated as a boundary, and
+    reopened the exact regression this whole mechanism exists to prevent -- on
+    every macOS run, including this project's own `Gateway Tests (macOS)` CI job,
+    which pins `KIROCREW_HOME` under it the same way Linux CI does. There is no
+    cheap, reliable "was this a deliberate choice" signal that holds across every
+    platform's own default, so the ancestor walk goes back to exempting whatever
+    `tempfile.gettempdir()` (or the POSIX `/tmp` literal) resolves to, unconditionally
+    -- matching `sandbox.py`'s OWN copy of this walk, which never adopted the
+    per-variable distinction in the first place because protecting an ancestor
+    unconditionally costs it nothing.
+    """
+
+    def test_the_ambient_tmpdir_is_still_exempt(self) -> None:
+        """The regression's exact shape: `TMPDIR` set (as macOS always has it, and
+        as this project's OWN rootdir conftest also does for every test, via
+        `_redirect_tempfile_base`) must not stop the temp root from being treated
+        as a boundary somewhere along `tempfile.gettempdir()`'s own ancestor chain.
+        Walks UP from it rather than asserting the leaf itself is the boundary:
+        this conftest's redirect nests `gettempdir()`'s result inside a further,
+        outer temp root (`/tmp/kc-pytest-<user>-<pid>/...`), so the recognized
+        boundary here is that OUTER root, with `gettempdir()`'s own value
+        correctly still protected as an ordinary intermediate ancestor of it --
+        exactly the invariant `test_the_boundary_helper_directly` already pins
+        for `tmp_path`. Deliberately reads the AMBIENT value rather than setting
+        one itself: this project's test suite already runs with `TMPDIR` set for
+        the identical reason production macOS does, so no extra setup is needed
+        -- or safe, given how many rounds of this exact fence tripped on
+        `tempfile`'s own caching interacting badly with a manual reset."""
+        import tempfile
+
+        from kiro_crew.config.paths import _is_system_tmp_root
+
+        assert os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP")
+        leaf = pathlib.Path(tempfile.gettempdir()).resolve()
+        for ancestor in [leaf, *leaf.parents]:
+            if _is_system_tmp_root(ancestor):
+                assert not _is_system_tmp_root(ancestor.parent)
+                break
+        else:
+            pytest.fail("no ancestor of gettempdir() was recognized as the temp root")
+
+    @pytest.mark.skipif(
+        not platform_compat.IS_POSIX,
+        reason=(
+            "Hardcodes the literal POSIX `/tmp` as `KIROCREW_HOME`'s prefix to "
+            "exercise `_is_system_tmp_root`'s POSIX-`/tmp`-literal fallback "
+            "specifically -- Windows has no such path or fallback, so the literal "
+            "`/tmp` is just an ordinary, unrecognized ancestor there and the "
+            "assertion this test pins does not hold."
+        ),
+    )
+    def test_an_ordinary_command_naming_the_temp_root_stays_allowed_with_tmpdir_set(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("KIROCREW_HOME", "/tmp/some-crew-home/.kiro/crew")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert not _blocked("cd /tmp && cat notes.txt")
+        assert not _blocked("ls -la /tmp/*")
+
+    def test_an_intermediate_ancestor_under_the_temp_root_stays_protected(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """The property the exemption must NOT weaken: a uniquely-identifying
+        directory strictly BETWEEN the leaf and the temp root is unaffected by
+        where the boundary itself sits."""
+        nested = tmp_path / "company" / "dept" / "crewdata"
+        nested.parent.mkdir(parents=True)
+        monkeypatch.setenv("KIROCREW_HOME", str(nested))
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        company_dir = os.path.join(os.path.realpath(str(tmp_path)), "company")
+        assert _blocked("mv %s /tmp/x" % company_dir)
+
+
+class TestCustomHomeAncestorDiscoveryIsCached:
+    """GPT review: `_custom_home_ancestors` does a `realpath()` syscall -- slow, or
+    even stalling, on a network-backed data home -- and is now called from the
+    substitution scanner, the glob scanner, and `is_unreplaceable_container`, all
+    of them UNCACHED call sites, unlike `_build_container_regex`'s own callers,
+    which only ever ran through `_get_container_re`'s TTL wrapper. Extracting this
+    walk into a function shared by those three turned one blocking syscall per
+    distinct `KIROCREW_HOME` value into one per command evaluated through any of
+    them. A TTL cache, mirroring `_home_dir_targets`'s own, bounds that back down.
+    """
+
+    def test_repeated_calls_within_the_ttl_hit_the_cache(self, monkeypatch) -> None:
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/company/dept/crewdata")
+        security._custom_home_ancestors_cache.clear()
+        calls = []
+        real_realpath = os.path.realpath
+
+        def _counting_realpath(path, *args, **kwargs):
+            calls.append(path)
+            return real_realpath(path, *args, **kwargs)
+
+        monkeypatch.setattr(security.os.path, "realpath", _counting_realpath)
+        first = security._custom_home_ancestors()
+        after_first_build = len(calls)
+        assert after_first_build > 0, "the uncached build should call realpath() at least once"
+        second = security._custom_home_ancestors()
+        assert first == second
+        assert (
+            len(calls) == after_first_build
+        ), f"second call should be a pure cache hit, adding no realpath() calls; got {calls}"
+
+    def test_a_different_kirocrew_home_is_not_served_from_the_others_cache_entry(
+        self, monkeypatch
+    ) -> None:
+        security._custom_home_ancestors_cache.clear()
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/company/dept/crewdata")
+        first = security._custom_home_ancestors()
+        monkeypatch.setenv("KIROCREW_HOME", "/srv/other/deep/crewdata")
+        second = security._custom_home_ancestors()
+        assert first != second
+        assert "/opt/company" in first
+        assert "/srv/other" in second
+
+
+class TestSubstitutionOutputIsNotSubjectToTheDotglobRule:
+    """Opus 4.8 review: `_substitution_could_name_container` masks unknown
+    substitution output to a bare `*` and checks it as an ordinary shell glob --
+    but command substitution splices its output in LITERALLY, with no dotfile
+    exemption of its own: `$(printf .kiro)` really does yield `.kiro`. Reading the
+    mask as dotglob-sensitive let `~/$(printf .kiro)` mask to `~/*`, which
+    `_glob_component_matches` then refused to match against the dot-prefixed
+    `.kiro` target -- every fixed container is dot-prefixed under `$HOME`, so this
+    silently exempted the whole scanner from ever catching a substitution-supplied
+    leading dot.
+    """
+
+    def test_a_substitution_supplied_leading_dot_is_blocked(self, monkeypatch) -> None:
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked("mv ~/$(printf .kiro) /tmp/stash")
+
+    @pytest.mark.skipif(
+        not platform_compat.IS_POSIX,
+        reason=(
+            "Hardcodes the literal POSIX `/tmp` as `KIROCREW_HOME`'s prefix to "
+            "exercise `_is_system_tmp_root`'s POSIX-`/tmp`-literal fallback "
+            "specifically -- Windows has no such path or fallback, so the literal "
+            "`/tmp` is just an ordinary, unrecognized ancestor there and the "
+            "assertion this test pins does not hold."
+        ),
+    )
+    def test_the_leaf_literal_anchor_requirement_still_protects_a_bare_wildcard(
+        self, monkeypatch
+    ) -> None:
+        """The property that must NOT regress: `dotglob=True` alone would let a
+        bare `*` (from an unqualified substitution) match ANY ancestor target,
+        dot-prefixed or not, if `require_leaf_literal` weren't independently
+        still in force for the ancestor-targets call."""
+        monkeypatch.setenv("KIROCREW_HOME", "/tmp/some-crew-home/.kiro/crew")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert not _blocked("mv $(echo /tmp/x)/* /elsewhere")
+        assert not _blocked("cd /tmp && cat notes.txt")
+
+
+class TestASymlinkedIntermediateAncestorIsProtectedTooSandbox:
+    """GPT review: `sandbox._unrenamable_containers`'s ancestor walk was based on
+    the RESOLVED leaf only. A symlinked LEAF was already covered (the unresolved
+    override is appended as its own entry), but a symlinked INTERMEDIATE ancestor
+    -- `KIROCREW_HOME=/opt/symlinked-dept/crewdata` where `symlinked-dept` is
+    itself a symlink -- had no equivalent: `/opt/symlinked-dept`'s own directory
+    entry never appeared in the resolved chain at all, so nothing protected it
+    from `rm /opt/symlinked-dept && ln -s /evil /opt/symlinked-dept`, which
+    repoints every future resolution the same way a symlinked leaf swap does.
+    """
+
+    def test_a_symlinked_intermediate_ancestor_is_in_the_protected_list(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        from kiro_crew import sandbox
+
+        real_dept = tmp_path / "real-dept"
+        real_dept.mkdir()
+        symlinked = tmp_path / "symlinked-dept"
+        symlinked.symlink_to(real_dept)
+        monkeypatch.setenv("KIROCREW_HOME", str(symlinked / "crewdata"))
+        containers = sandbox._unrenamable_containers()
+        assert str(symlinked) in containers
+
+    def test_ordering_still_holds_across_both_spellings(self, monkeypatch, tmp_path) -> None:
+        """Every ancestor must still precede every descendant, for BOTH the
+        resolved chain and the unresolved-spelling chain -- merging two
+        potentially-divergent ancestor chains must not break the mount-ordering
+        invariant `_build_launcher_script`'s self-bind loop depends on."""
+        from kiro_crew import sandbox
+
+        real_dept = tmp_path / "real-dept"
+        real_dept.mkdir()
+        symlinked = tmp_path / "symlinked-dept"
+        symlinked.symlink_to(real_dept)
+        monkeypatch.setenv("KIROCREW_HOME", str(symlinked / "crewdata"))
+        containers = sandbox._unrenamable_containers()
+        for i, a in enumerate(containers):
+            for j, b in enumerate(containers):
+                if a != b and b.startswith(a.rstrip("/") + "/"):
+                    assert i < j, f"{a!r} (index {i}) must precede {b!r} (index {j})"
+
+
+class TestARelativeOverrideIsAnchoredToTheGatewaysOwnCwd:
+    """GPT review: a `KIROCREW_HOME` override with no leading `~` or `/`
+    (`KIROCREW_HOME=../dept/crewdata`) survived `Path(override_raw).expanduser()`
+    still relative -- `expanduser()` only ever touches a leading `~`. That
+    relative string was then embedded into the launcher script and evaluated by
+    the SPAWNED CHILD's own `os.path.islink`/`isdir`/mount(2) calls against ITS
+    OWN cwd, not the gateway's: a task spawned with a different `cwd=` resolved
+    the "protect this override" entry to an unrelated path, and the self-bind
+    protection silently checked nothing there. `os.path.abspath` (lexical only,
+    no symlink following, unlike `.resolve()`) anchors it to the GATEWAY's own
+    cwd instead, captured before the spawn -- so the entry means the same thing
+    regardless of what cwd the eventual child runs with.
+    """
+
+    def test_every_entry_is_absolute_even_with_a_relative_override(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        from kiro_crew import sandbox
+
+        base = tmp_path / "base"
+        base.mkdir()
+        (base / "crewdata").mkdir()
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("KIROCREW_HOME", "base/crewdata")
+        containers = sandbox._unrenamable_containers()
+        relative = [c for c in containers if not os.path.isabs(c)]
+        assert relative == [], f"relative entries leaked through: {relative!r}"
+
+    def test_a_relative_symlinked_override_still_protects_the_links_own_path(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """Isolates the fix from `resolved`'s own (already-correct, `.resolve()`d)
+        ancestor walk: `resolved` FOLLOWS the symlink, so its own walk never
+        contains the symlink's OWN path -- only the unresolved-override entry
+        this fix repairs can put it there. A relative spelling through the
+        symlink (`base/crewdata`) must still surface the symlink's absolute
+        path, anchored to the gateway's cwd, not silently drop it."""
+        from kiro_crew import sandbox
+
+        real_dept = tmp_path / "real-dept"
+        real_dept.mkdir()
+        symlinked = tmp_path / "base"
+        symlinked.symlink_to(real_dept)
+        (real_dept / "crewdata").mkdir()
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("KIROCREW_HOME", "base/crewdata")
+        containers = sandbox._unrenamable_containers()
+        assert str(symlinked) in containers
+
+
+class TestFixedPointBudgetsFailClosedNotOpen:
+    """GPT review: both fixed-point loops (`_substitution_could_name_container`'s
+    masking loop, `_glob_could_name`'s extglob-widening loop) stopped after
+    `_MAX_..._PASSES` iterations and used whatever partial result they had --
+    which, for a nesting depth chosen specifically to outlast the budget, still
+    contains unresolved `$(...)`/`@(...)` syntax. That syntax reads as an
+    unrelated literal to every check downstream, so "stops early" meant "matches
+    nothing at all", not "a narrower match" as the (now-corrected) comments
+    claimed -- the exact fail-OPEN direction every other bounded scan in this
+    module is designed to avoid.
+    """
+
+    def test_substitution_nesting_past_the_budget_fails_closed(self, monkeypatch) -> None:
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        nested = "printf i"
+        for _ in range(20):
+            nested = "echo $(" + nested + ")"
+        assert _blocked("mv ~/.k" + nested + "ro/crew /tmp/x")
+
+    def test_extglob_nesting_past_the_budget_fails_closed(self, monkeypatch) -> None:
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        nested = "i"
+        for _ in range(10):
+            nested = "@(" + nested + ")"
+        assert _blocked("bash -O extglob -c 'mv ~/.k" + nested + "ro/crew /tmp/x'")
+
+    def test_ordinary_nesting_within_budget_is_unaffected(self, monkeypatch) -> None:
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert not _blocked("echo $(echo $(echo $(date)))")
+        assert not _blocked("bash -O extglob -c 'ls @(*.txt|*.md)'")
+
+
+class TestMultiDigitBraceRangesAreRecognized:
+    """GPT review: `_BRACE_RANGE_RE` captured each range endpoint as a bare `\\w`
+    -- exactly one character -- so `{10..10}` was never recognized as a brace
+    range AT ALL, not merely expanded wrong: the token passed through
+    `_expand_braces` completely unchanged, and `company{10..10}` never matched
+    an ancestor literally named `company10`. Widened to accept signed,
+    multi-digit numeric endpoints (bash's own zero-padding rule included) as
+    well as the original single-letter alpha case.
+    """
+
+    def test_a_multi_digit_range_reaches_the_ancestors_name(self, monkeypatch) -> None:
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/company10/dept/crewdata")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked("mv /opt/company{10..10}/dept /tmp/x")
+
+    def test_zero_padding_reaches_the_ancestors_name(self, monkeypatch) -> None:
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/company001/dept/crewdata")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked("mv /opt/company{001..001}/dept /tmp/x")
+
+    def test_ordinary_alpha_and_numeric_ranges_are_unaffected(self) -> None:
+        assert security._expand_braces("cr{e..e}w") == ["crew"]
+        assert security._expand_braces("img{1..3}.jpg") == ["img1.jpg", "img2.jpg", "img3.jpg"]
+        assert security._expand_braces("n{5..1}") == ["n5", "n4", "n3", "n2", "n1"]
+
+
+class TestZeroPaddingWidthMatchesTheWiderEndpoint:
+    """Opus review: "does this range zero-pad at all" and "how wide" are separate
+    questions, and the width computation answered both from only the endpoints
+    that themselves began with `0` -- correct for deciding WHETHER to pad
+    (`{01..100}` must pad, since `01` qualifies), wrong for deciding the WIDTH,
+    which bash always takes from the WIDER of the two endpoints regardless of
+    which one carries the leading zero. `{01..100}` -> bash pads to width 3
+    (`001`...`100`); the previous code measured width only from `01` (2),
+    producing `01`...`100` with `099` never generated -- so
+    `KIROCREW_HOME=/opt/node099/crew` reached by `mv /opt/node{01..100}
+    /tmp/x` relocated the ancestor without this scan ever emitting the
+    candidate that would have matched it.
+
+    `{01..100}` itself is not a clean regression test: 100 terms exceeds
+    `_MAX_BRACE_EXPANSIONS` (64), so both the buggy and the fixed code already
+    refuse it via the unrelated overflow-fails-closed path -- the width bug
+    never gets exercised. A stepped range (`{01..999..300}`) reaches the same
+    narrow-then-wide shape in only 4 terms, under the budget, so the width
+    bug is the only thing that can make the difference between blocked and
+    not. Verified against the `braceexpand` package (a faithful
+    reimplementation of bash's own algorithm) rather than a real bash: this
+    project's own dev/CI hosts ship bash 3.2, which predates brace
+    zero-padding entirely and could not have caught this by hand-testing
+    either.
+    """
+
+    def test_the_reported_ancestor_relocation_is_blocked(self, monkeypatch) -> None:
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/node001/crew")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked("mv /opt/node{01..999..300} /tmp/x")
+
+    def test_the_width_is_taken_from_the_wider_non_zero_endpoint(self) -> None:
+        assert security._expand_braces("node{01..999..300}") == [
+            "node001",
+            "node301",
+            "node601",
+            "node901",
+        ]
+
+    def test_the_narrower_zero_padded_endpoint_stays_the_width_when_it_is_wider(
+        self,
+    ) -> None:
+        """The property that must NOT regress: when the zero-padded endpoint
+        already IS the wider one, the width is unchanged."""
+        assert security._expand_braces("n{001..5}") == [
+            "n001",
+            "n002",
+            "n003",
+            "n004",
+            "n005",
+        ]
+
+    def test_neither_endpoint_zero_padded_stays_unpadded(self) -> None:
+        assert security._expand_braces("n{1..500..100}") == [
+            "n1",
+            "n101",
+            "n201",
+            "n301",
+            "n401",
+        ]
+
+
+class TestALargeNumericBraceRangeCannotStallTheGate:
+    """Opus review: widening ``_BRACE_RANGE_RE`` to multi-digit endpoints let a SHORT
+    command carry a numeric range whose SPAN is astronomically large --
+    ``{1..99999999999999999999999999999}`` is 31 digits, under the
+    ``_MAX_BRACE_STEP_DIGITS`` length guard, but its span is ~10**31 terms. The
+    cardinality check (``len(grown) > _MAX_BRACE_EXPANSIONS``) ran only AFTER the
+    numeric branch's list comprehension had already materialized the full span into a
+    Python list -- so the comprehension itself was the unbounded work, a memory-
+    exhausting synchronous stall directly on the event loop inside the PreToolUse gate.
+    The term count is now computed from plain `int` arithmetic on the endpoints BEFORE
+    either comprehension runs, and compared against the SAME budget. `len()` on the
+    `range` object itself was tried first and rejected: it raises `OverflowError` for a
+    span this large (CPython's `len` protocol must fit a C `Py_ssize_t`), which would
+    have traded the stall for an uncaught crash instead of the gate's normal fail-closed
+    refusal.
+    """
+
+    def test_a_huge_positive_span_overflows_instead_of_stalling(self) -> None:
+        start = time.monotonic()
+        result = _blocked("echo {1..99999999999999999999999999999}")
+        elapsed = time.monotonic() - start
+        assert result
+        assert elapsed < 2.0, f"took {elapsed}s -- the span was materialized, not bounded"
+
+    def test_a_huge_negative_to_small_span_overflows_instead_of_stalling(self) -> None:
+        start = time.monotonic()
+        result = _blocked("echo {-99999999999999999999999999999..1}")
+        elapsed = time.monotonic() - start
+        assert result
+        assert elapsed < 2.0, f"took {elapsed}s -- the span was materialized, not bounded"
+
+    def test_a_huge_span_with_a_step_overflows_instead_of_stalling(self) -> None:
+        start = time.monotonic()
+        result = _blocked("echo {1..99999999999999999999999999999..7}")
+        elapsed = time.monotonic() - start
+        assert result
+        assert elapsed < 2.0, f"took {elapsed}s -- the span was materialized, not bounded"
+
+    def test_ordinary_ranges_are_unaffected(self) -> None:
+        assert security._expand_braces("x{1..5}") == ["x1", "x2", "x3", "x4", "x5"]
+        assert security._expand_braces("company{10..10}") == ["company10"]
+
+
+class TestAMixedNumericAlphaBraceEndpointDoesNotCrash:
+    """GPT review: widening each endpoint to `[+-]?\\d+|[A-Za-z]` let the two
+    alternatives combine into a MIXED pair -- ``{10..a}`` matches `start="10"` via
+    the digit alternative and `end="a"` via the single-letter alternative. The branch
+    selecting numeric-vs-alpha handling only tested digit-ness (`start_digits.isdigit()
+    and end_digits.isdigit()`), not length, so a mixed pair fell through to the alpha
+    branch's `ord(start)`, which requires an exactly-one-character string and raised
+    `TypeError` for the two-character `"10"` -- crashing `is_sensitive_bash_command`
+    and aborting the tool-authorization decision entirely, rather than returning ANY
+    verdict. Bash itself does not treat a mixed numeric/alpha pair as a range either
+    (`{10..a}` is left unexpanded), so refusing it here -- fail closed, via the same
+    `_overflow` path other unrecognized brace syntax already takes -- matches both
+    bash's own behavior and this gate's convention of refusing what it cannot expand.
+    """
+
+    def test_numeric_then_alpha_does_not_crash(self) -> None:
+        assert _blocked("echo {10..a}")
+
+    def test_alpha_then_numeric_does_not_crash(self) -> None:
+        assert _blocked("echo {a..10}")
+
+    def test_ordinary_single_char_alpha_ranges_are_unaffected(self) -> None:
+        assert security._expand_braces("cr{e..e}w") == ["crew"]
+        assert security._expand_braces("n{a..c}") == ["na", "nb", "nc"]
+
+
+class TestAPositiveSignedBraceStepIsRecognized:
+    """GPT review: `_BRACE_RANGE_RE`'s optional step group only accepted `-?\\d+` --
+    an optional MINUS, never a PLUS -- while bash accepts an explicit leading `+` on
+    the step the same way it does on either endpoint. `{e..e..+1}` therefore failed
+    to match the regex AT ALL: the step group is required once `..` starts a third
+    segment, and `+1` does not fit `-?\\d+`, so the whole match fails at that
+    position. Because the belt-and-braces overflow check re-uses this SAME regex,
+    it found nothing to refuse either, and a degenerate single-value range like
+    `cr{e..e..+1}w` -- which bash still expands to `crew` regardless of the step's
+    sign, since start and end are equal -- passed through completely unexpanded and
+    unchecked. Widened the step group to `[+-]?\\d+`, matching the two endpoints.
+    """
+
+    def test_a_positive_step_degenerate_range_is_recognized(self) -> None:
+        assert _blocked("mv ~/.kiro/cr{e..e..+1}w /tmp/x")
+
+    def test_a_negative_step_still_works(self) -> None:
+        assert _blocked("mv ~/.kiro/cr{e..e..-1}w /tmp/x")
+
+    def test_an_ordinary_positive_step_range_is_unaffected(self) -> None:
+        assert security._expand_braces("x{1..5..+2}") == ["x1", "x3", "x5"]
+
+    def test_an_ordinary_unsigned_step_range_is_unaffected(self) -> None:
+        assert security._expand_braces("x{1..5..2}") == ["x1", "x3", "x5"]
+
+
+class TestShoptDashSAcceptsMultipleOptionNames:
+    """GPT review: `shopt -s dotglob` (and the equivalent `globstar`/`extglob`
+    patterns) required the target option name to appear IMMEDIATELY after `-s`,
+    but bash's `shopt -s` accepts a SPACE-SEPARATED LIST of option names in one
+    invocation -- `shopt -s nullglob dotglob` enables both. `shopt -s nullglob
+    dotglob; mv ~/* /tmp/x` left `dotglob` undetected (it is the SECOND argument,
+    not the first), so the glob-modes check ran without `dotglob=True` and the
+    leading-dot exemption on `*` let `~/*` miss the `.kiro` ancestor it should
+    have matched. All three mode regexes (`_DOTGLOB_ENABLED_RE`,
+    `_GLOBSTAR_ENABLED_RE`, `_EXTGLOB_ENABLED_RE`) now allow any number of OTHER
+    option names between `-s` and the target, so the target is found regardless
+    of where in the list it sits.
+    """
+
+    def test_dotglob_as_the_second_shopt_argument_is_detected(self) -> None:
+        assert _blocked("shopt -s nullglob dotglob; mv ~/* /tmp/x")
+
+    def test_dotglob_as_the_first_shopt_argument_is_detected(self) -> None:
+        assert _blocked("shopt -s dotglob nullglob; mv ~/* /tmp/x")
+
+    def test_globstar_and_extglob_are_detected_alongside_other_options_too(self) -> None:
+        assert security._GLOBSTAR_ENABLED_RE.search("shopt -s nullglob globstar")
+        assert security._EXTGLOB_ENABLED_RE.search("shopt -s nullglob extglob")
+
+    def test_an_unrelated_option_alone_does_not_falsely_enable_dotglob(self) -> None:
+        assert not security._DOTGLOB_ENABLED_RE.search("shopt -s nullglob")
+
+    def test_the_single_option_form_still_works(self) -> None:
+        assert _blocked("shopt -s dotglob; mv ~/* /tmp/x")
+
+
+class TestTheNormalizerPassAlsoSeesAncestorTargets:
+    """GPT review: the raw substitution/glob scanners and `is_unreplaceable_container`
+    were wired to `_container_target_groups()` a round ago, but the NORMALIZER
+    pass's own two glob checks -- one for a plain normalized candidate, one for a
+    `cd`-relative joined candidate -- still built their target set from
+    `_UNREPLACEABLE_CONTAINER_DIRS` alone, a fourth (and fifth) place with the
+    identical gap. `_glob_could_name_container` now backs both.
+    """
+
+    def test_the_shared_helper_matches_an_ancestor(self, monkeypatch) -> None:
+        """Tests `_glob_could_name_container` -- what both call sites now share --
+        directly, rather than through a full command. An end-to-end command
+        naming an ancestor also trips the RAW regex independently (the literal
+        text of an assignment or a `cd` target naming the ancestor's own path is
+        exactly what that pass matches on), which would pass whether or not
+        THIS specific fix is present and prove nothing about it."""
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/company/dept/crewdata")
+        assert security._glob_could_name_container("/opt/comp*")
+
+    def test_the_shared_helper_leaves_an_unrelated_glob_alone(self, monkeypatch) -> None:
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/company/dept/crewdata")
+        assert not security._glob_could_name_container("/elsewhere/other*")
+
+    def test_the_fixed_dirs_case_still_works_through_the_cd_relative_call_site(
+        self, monkeypatch
+    ) -> None:
+        """`_glob_could_name_container` must not have narrowed the EXISTING,
+        already-tested fixed-container matching at the `cd`-relative call site."""
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked("cd ~ && mv .kir?/crew /tmp/x")
+
+    def test_ordinary_normalizer_globs_with_no_ancestor_are_unaffected(self, monkeypatch) -> None:
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert not _blocked("V=/opt; ls $V/*.txt")
+
+
+class TestConcatenatedLiteralsAreCheckedEvenWithNoSubstitution:
+    """Opus review: `_concatenated_literal_candidates` reconstructs Python-style
+    (and similar) string concatenation (`'~/.k' + 'iro/crew'`), but was only ever
+    reached after an early return on "no substitution syntax present" -- dead code
+    whenever a payload concatenates literals with no `$(...)` anywhere in it at
+    all. `os.rename(os.path.expanduser('~/.k' + 'iro/crew'), ...)` has no
+    substitution for `_OUTPUT_SUBSTITUTION_RE` to find, so the function returned
+    `False` before the ONE check that reconstructs exactly this idiom ever ran.
+
+    Fixing this surfaced a second bug: the reconstructed candidate is a fully
+    resolved literal with no glob characters at all, so `_glob_could_name`'s own
+    "this has to look like a glob" gate silently excluded it too. And fixing
+    THAT naively (forcing `dotglob=True` for every caller of the shared
+    `_could_name` helper) broke `ls ~/*` -- an ordinary glob in a command with no
+    substitution at all started reading as `~/.kiro`, which bash itself would
+    never do without `dotglob` actually enabled. `dotglob=True` is now scoped to
+    the substitution-derived callers only.
+    """
+
+    def test_pure_concatenation_with_no_substitution_is_blocked(self, monkeypatch) -> None:
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked(
+            "python3 -c \"os.rename(os.path.expanduser('~/.k' + 'iro/crew'), '/tmp/x')\""
+        )
+
+    def test_an_ordinary_substitution_free_glob_is_unaffected(self, monkeypatch) -> None:
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert not _blocked("ls ~/*")
+        assert not _blocked('echo "a" + "b"')
+
+    def test_substitution_and_dotfile_substitution_still_work(self, monkeypatch) -> None:
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked("mv ~/.k$(printf i)ro/crew /tmp/x")
+        assert _blocked("mv ~/$(printf .kiro) /tmp/stash")
+
+
+class TestDeniedCommandsJsonIsAKeystoneFile:
+    """GPT review: `denied_commands.json` (the opt-out ceiling for `disable_all` /
+    `disabled_ids` / `user_added`, read by `hooks.read_denied_commands_config`) is
+    the SAME class of control as `security_policy.json` / `admission_policy.json`
+    / `computer_use.json` -- the command gate refuses a tool call naming it, a
+    subprocess never goes through that gate -- but was missing from
+    `sandbox._KEYSTONE_FILES`, the list that hides these files from an agent's OWN
+    sandboxed subprocess on every tier.
+    """
+
+    def test_denied_commands_json_is_in_the_keystone_list(self) -> None:
+        from kiro_crew import sandbox
+
+        assert ".kiro/crew/denied_commands.json" in sandbox._KEYSTONE_FILES
+        assert ".kirocrew/denied_commands.json" in sandbox._KEYSTONE_FILES
+
+
+class TestADeclarationBuiltinsOwnFlagsDoNotHideTheAssignment:
+    """GPT review: `declare -x H=$HOME/.kiro/crewXXXX; mv "${H%XXXX}"` still names
+    the container, but `_SIMPLE_ASSIGNMENT_RE`'s declaration-word group still
+    expects `H=` to follow immediately -- `-x ` sitting between the builtin and the
+    assignment defeats the match the same way the missing declaration word itself
+    did (finding 31). Widened to tolerate any number of `-flag` groups between the
+    builtin and the assignment.
+    """
+
+    @pytest.mark.parametrize(
+        "prefix", ["declare -x", "declare -xr", "export -p", "local -i", "readonly -a"]
+    )
+    def test_a_flagged_declaration_builtin_does_not_hide_the_assignment(
+        self, monkeypatch, prefix: str
+    ) -> None:
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked(f'{prefix} H=$HOME/.kiro/crewXXXX; mv "${{H%XXXX}}" /tmp/x')
+
+    def test_an_ordinary_flagged_declaration_on_an_unrelated_value_stays_allowed(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert not _blocked('declare -x F=report.txt; echo "${F%.txt}"')
+
+
+class TestADoubledSeparatorDoesNotHideTheContainerRename:
+    """GPT review: the Pass 1b separator-collapse retry (`#6350`) reruns the
+    sensitive-path matcher, the trust-root extraction check, and the relative-
+    traversal matcher over every separator-collapsed spelling of the command --
+    but not `_names_unreplaceable_container_raw`, the container-RENAME check,
+    despite the comment directly above the loop claiming completeness
+    (`ALL THREE pass-1 checks are repeated`). A doubled interior separator
+    (`$HOME\\.kiro\\\\crew`, which Win32 collapses to the exact container) named
+    the container in a spelling this scan's raw-text patterns never wrote, so it
+    matched no branch at all -- an unobfuscated `mv ~/.kiro/crew` was refused, but
+    the same rename survived one doubled backslash.
+    """
+
+    def test_a_doubled_backslash_between_kiro_and_crew_still_blocks_the_rename(self) -> None:
+        assert _blocked("mv $HOME\\.kiro\\\\crew /tmp/x")
+
+    def test_a_doubled_backslash_right_after_home_still_blocks_the_rename(self) -> None:
+        assert _blocked("mv $HOME\\\\.kiro\\crew /tmp/x")
+
+    def test_the_run_intact_spelling_was_already_blocked(self) -> None:
+        """The property this fix must not regress: the raw pass already caught the
+        single-backslash spelling directly, with no collapse needed."""
+        assert _blocked("mv $HOME\\.kiro\\crew /tmp/x")
+
+    def test_an_unrelated_command_with_a_doubled_separator_stays_allowed(self) -> None:
+        assert not _blocked("ls -la C:\\\\Users\\\\u\\\\Documents")
+
+
+class TestMultipleExtglobGroupsAreExpandedTogether:
+    """GPT review, second pass: `_extglob_alternative_readings` was bounded to the
+    FIRST extglob group found, on the theory the widened reading covers the rest
+    defensively -- but a SECOND group's raw, unexpanded syntax left in a reading
+    never structurally matches any target (`_components_could_match` does not
+    itself understand extglob), while the fully-widened reading DOES structurally
+    match yet was exempted as a "small, known set" -- which stopped being true
+    the moment a second independent choice was folded in. `/opt/@(foo|company)/
+    @(bar|dept)` against `KIROCREW_HOME=/opt/company/dept/crewdata` named the
+    ancestor via the ONE combination (`company`+`dept`) that matters, while the
+    other three combinations do not, and only enumerating every combination
+    together tells them apart.
+    """
+
+    def test_the_one_matching_combination_still_blocks(self, monkeypatch) -> None:
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/company/dept/crewdata")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked("bash -O extglob -c 'mv /opt/@(foo|company)/@(bar|dept) /tmp/x'")
+
+    def test_no_combination_matching_stays_allowed(self, monkeypatch) -> None:
+        """The property that must NOT regress: none of the four combinations
+        (foo+bar, foo+dept, company+bar, xx+yy) equals the ancestor except
+        company+dept, so a command naming only the OTHER three must stay
+        allowed."""
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/company/dept/crewdata")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert not _blocked("bash -O extglob -c 'mv /opt/@(foo|xx)/@(bar|yy) /tmp/x'")
+
+    def test_the_readings_are_the_full_cartesian_product(self) -> None:
+        readings, overflowed = security._extglob_alternative_readings(
+            "/opt/@(foo|company)/@(bar|dept)"
+        )
+        assert overflowed is False
+        assert sorted(readings) == sorted(
+            ["/opt/foo/bar", "/opt/foo/dept", "/opt/company/bar", "/opt/company/dept"]
+        )
+
+
+class TestExtglobAlternativeOverflowFailsClosedNotOpen:
+    """A cartesian product too large to enumerate exhaustively
+    (`_MAX_EXTGLOB_ALTERNATIVE_COMBINATIONS`) must not silently under-cover the
+    combinations it cannot check individually -- the widened `.*`/`*` reading is
+    what is left, and it loses its "small, known set" vague exemption in that
+    case, so a structural match still fails closed instead of silently passing.
+    """
+
+    _MANY_ALTERNATIVES = "|".join(f"alt{i}" for i in range(9))  # 9 * 9 = 81 > 64
+
+    def test_the_overflow_flag_is_set_and_no_readings_are_returned(self) -> None:
+        token = f"/opt/@({self._MANY_ALTERNATIVES})/@({self._MANY_ALTERNATIVES})"
+        readings, overflowed = security._extglob_alternative_readings(token)
+        assert overflowed is True
+        assert readings == []
+
+    def test_an_unenumerable_product_still_blocks_via_the_widened_reading(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/company/dept/crewdata")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        token = f"/opt/@({self._MANY_ALTERNATIVES})/@({self._MANY_ALTERNATIVES})"
+        assert _blocked(f"bash -O extglob -c 'mv {token} /tmp/x'")
+
+    def test_an_unrelated_shape_stays_allowed_even_when_overflowed(self, monkeypatch) -> None:
+        """The property that must NOT regress: the overflow fallback only
+        withholds the vague exemption for a STRUCTURAL match -- it does not turn
+        every overflowed token into a match against every ancestor."""
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/company/dept/crewdata")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        token = f"/somewhere/@({self._MANY_ALTERNATIVES})/@({self._MANY_ALTERNATIVES})"
+        assert not _blocked(f"bash -O extglob -c 'mv {token} /tmp/x'")
+
+
+class TestAPartiallyGlobShapedGroupIsNotTreatedAsFullyEnumerated:
+    """GPT review, third pass: `_extglob_alternative_readings` DROPS a glob-
+    shaped alternative from its own group's list (it is not one exact string
+    either), but a round-27 gap left the GROUP itself reported as fully,
+    exhaustively enumerated (`overflowed=False`) whenever ANY exact
+    alternatives survived the drop. `@(foo|comp*)` against
+    `KIROCREW_HOME=/opt/company/dept/crewdata` kept enumerating `foo` alone
+    and reported a complete result -- even though `comp*` can ALSO equal the
+    ancestor `company`, and nothing ever checked it. The widened `.*`/`*`
+    reading then kept its vague-widening exemption on the strength of that
+    false "fully enumerated" signal, letting `mv /opt/@(foo|comp*) /tmp/x`
+    relocate the ancestor.
+    """
+
+    def test_a_glob_shaped_alternative_sharing_a_group_with_an_exact_one_still_blocks(
+        self, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/company/dept/crewdata")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert _blocked("bash -O extglob -c 'mv /opt/@(foo|comp*) /tmp/x'")
+
+    def test_the_exact_alternative_is_still_returned_alongside_the_overflow_flag(
+        self,
+    ) -> None:
+        readings, overflowed = security._extglob_alternative_readings("/opt/@(foo|comp*)")
+        assert readings == ["/opt/foo"]
+        assert overflowed is True
+
+    def test_an_unrelated_shape_stays_allowed_despite_the_mixed_group(self, monkeypatch) -> None:
+        """The property that must NOT regress: a mixed group against a
+        NON-matching prefix must not turn into a block against every
+        ancestor."""
+        monkeypatch.setenv("KIROCREW_HOME", "/opt/company/dept/crewdata")
+        monkeypatch.setattr(security, "_CONTAINER_RE", None)
+        assert not _blocked("bash -O extglob -c 'mv /somewhere/@(foo|comp*) /tmp/x'")
+
+
+class TestAnAbsentKeystoneFileGetsASafePlaceholder:
+    """GPT review: the Linux namespace sandbox hides a keystone FILE by bind-
+    mounting an empty tmpfs file OVER it, and `mount(2)` requires the target to
+    already exist -- so a keystone file this box never configured
+    (`computer_use.json` on most fresh installs, since it is operator opt-in
+    only) got no hiding mount at all. Nothing then stopped a sandboxed
+    subprocess from CREATING `computer_use.json` with `{"enabled": true, ...}`
+    directly -- the exact "opaque script defeats the tool gate" bypass
+    `_KEYSTONE_FILES` exists to close, just for a file that happens not to exist
+    yet. `_sensitive_file_placeholders` maps each keystone file with a content
+    confirmed to read BYTE-IDENTICALLY to "absent" through its own loader to the
+    text materialized (then immediately hidden by the same mount) before that
+    check, so the mount can exist at all.
+    """
+
+    def test_every_registered_placeholder_is_a_real_keystone_entry(self) -> None:
+        from kiro_crew import sandbox
+
+        for entry in sandbox._KEYSTONE_FILE_ABSENT_PLACEHOLDERS:
+            assert entry in sandbox._KEYSTONE_FILES
+
+    def test_computer_use_json_has_the_reported_pocs_placeholder(self) -> None:
+        from kiro_crew import sandbox
+
+        assert sandbox._KEYSTONE_FILE_ABSENT_PLACEHOLDERS[".kiro/crew/computer_use.json"] == b"{}"
+        assert sandbox._KEYSTONE_FILE_ABSENT_PLACEHOLDERS[".kirocrew/computer_use.json"] == b"{}"
+
+    def test_governance_policy_files_are_deliberately_excluded_or_special_cased(
+        self,
+    ) -> None:
+        """`security_policy.json` has NO content that reads the same as absent:
+        any PRESENT file either parses -- and then fails `parse_policy`'s
+        `version == 1` check -- or fails to parse, and BOTH raise
+        `PlatformCompositionError` (abort boot), unlike absence's clean `None`
+        return (boots fine, ungoverned defaults). `admission_policy.json`'s only
+        safe placeholder is UNPARSEABLE content, not a plain `{}` -- `{}` is
+        valid JSON and `AdmissionPolicy.from_dict({})` fails OPEN
+        (`mode=MODE_OPEN`, no signature required), the opposite of absence's
+        fail-CLOSED `_fail_closed_policy()`."""
+        from kiro_crew import sandbox
+
+        assert ".kiro/crew/security_policy.json" not in sandbox._KEYSTONE_FILE_ABSENT_PLACEHOLDERS
+        assert ".kirocrew/security_policy.json" not in sandbox._KEYSTONE_FILE_ABSENT_PLACEHOLDERS
+        assert sandbox._KEYSTONE_FILE_ABSENT_PLACEHOLDERS[".kiro/crew/admission_policy.json"] == b""
+        assert sandbox._KEYSTONE_FILE_ABSENT_PLACEHOLDERS[".kirocrew/admission_policy.json"] == b""
+
+    def test_the_placeholder_map_is_anchored_to_the_real_home(self) -> None:
+        from kiro_crew import sandbox
+
+        files = sandbox._CC_FILES + sandbox._KEYSTONE_FILES
+        placeholders = sandbox._sensitive_file_placeholders(files)
+        expected = os.path.join(HOME, ".kiro", "crew", "computer_use.json")
+        assert placeholders.get(expected) == "{}"
+
+    def test_an_unregistered_keystone_file_is_absent_from_the_map(self) -> None:
+        from kiro_crew import sandbox
+
+        files = sandbox._CC_FILES + sandbox._KEYSTONE_FILES
+        placeholders = sandbox._sensitive_file_placeholders(files)
+        unregistered = os.path.join(HOME, ".kiro", "crew", "security_policy.json")
+        assert unregistered not in placeholders
+
+    def test_a_custom_home_gets_the_same_protection(self, monkeypatch, tmp_path) -> None:
+        from kiro_crew import sandbox
+
+        custom = tmp_path / "customcrew"
+        custom.mkdir()
+        monkeypatch.setenv("KIROCREW_HOME", str(custom))
+        files = sandbox._CC_FILES + sandbox._KEYSTONE_FILES
+        placeholders = sandbox._sensitive_file_placeholders(files)
+        assert placeholders.get(os.path.join(str(custom), "computer_use.json")) == "{}"
+
+    # The materialize-then-hide RUNTIME behavior (exclusive create, an existing
+    # file left untouched, an unregistered file left absent) is covered against
+    # the REAL, verbatim-extracted launcher source in
+    # ``test_sandbox_mount_checked.py`` rather than a hand-copy here, so that
+    # coverage cannot silently drift from what the shipped launcher executes.
+
+
+class TestPwdAndOldpwdAliasesResolveAgainstTheTrackedCdBase:
+    """GPT review: `$PWD`, `${PWD}`, `~+`, `$(pwd)` and `` `pwd` `` all name the
+    directory a preceding `cd` moved to; `$OLDPWD`, `${OLDPWD}` and `~-` name
+    the one before that. None of them is an ordinary variable this scanner's
+    assignment tracking can resolve -- `$PWD` in particular is never assigned
+    by the command TEXT at all, it is set by the shell itself on every `cd` --
+    so `cd ~; mv "$PWD/.kiro/crew" /tmp/x` matched no branch even though the
+    segment walk already recorded exactly where `cd ~` went (`base_dirs`).
+    Every one of the five spellings resolves against that same tracked state
+    now, so the container-rename check the plain `cd ~; mv ~/.kiro/crew ...`
+    form already triggers fires for all of them too.
+    """
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            'cd ~; mv "$PWD/.kiro/crew" /tmp/x',
+            'cd ~; mv "${PWD}/.kiro/crew" /tmp/x',
+            'cd ~; mv "~+/.kiro/crew" /tmp/x',
+            'cd ~; mv "$(pwd)/.kiro/crew" /tmp/x',
+            'cd ~; mv "`pwd`/.kiro/crew" /tmp/x',
+        ],
+    )
+    def test_a_pwd_alias_after_cd_still_names_the_container(self, template: str) -> None:
+        assert _blocked(template)
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            'cd ~; cd /tmp; mv "$OLDPWD/.kiro/crew" /tmp/x',
+            'cd ~; cd /tmp; mv "${OLDPWD}/.kiro/crew" /tmp/x',
+            'cd ~; cd /tmp; mv "~-/.kiro/crew" /tmp/x',
+        ],
+    )
+    def test_an_oldpwd_alias_names_the_pre_cd_container(self, template: str) -> None:
+        assert _blocked(template)
+
+    def test_an_unrelated_pwd_reference_stays_allowed(self) -> None:
+        """The property that must NOT regress: `$PWD` naming an ordinary,
+        non-sensitive location is untouched, and a bare mention of `$PWD` in
+        text unrelated to a path is not treated as a path at all."""
+        assert not _blocked('cd /tmp; ls "$PWD/notes.txt"')
+        assert not _blocked('echo "$PWD is unrelated text"')
+        assert not _blocked('cd /tmp; mv "$PWD/other" /tmp/y')
+        assert not _blocked('cd /tmp; mv "$(pwd)/other" /tmp/y')
+
+    def test_pwd_without_a_preceding_cd_has_no_tracked_base_to_resolve_against(
+        self,
+    ) -> None:
+        """No `cd` ran, so there is no tracked base for `$PWD` to mean -- the
+        alias helper returns no readings and the ordinary (unresolved-literal)
+        path stays in effect, same as before this fix existed."""
+        assert not _blocked('mv "$PWD/.kiro/crew" /tmp/x')
+
+    def test_pwd_substitution_checks_every_tracked_base_not_only_the_first(
+        self,
+    ) -> None:
+        """GPT review, second pass: an operator-form `cd` target
+        (`cd ${D:+$HOME}`) leaves MULTIPLE readings in `base_dirs` -- the
+        naive "value" reading (`D`'s own value, here `x`) ahead of the
+        home-hypothesis-resolved one (the real target, `$HOME`) two slots
+        later. Using only `base_dirs[0]` for `$(pwd)`/`` `pwd` `` silently
+        checked the WRONG tracked base and stayed allowed even though the
+        walk had already recorded the right one."""
+        assert _blocked('D=x; cd ${D:+$HOME}; mv "$(pwd)/.kiro/crew" /tmp/x')
+        assert _blocked('D=x; cd ${D:+$HOME}; mv "`pwd`/.kiro/crew" /tmp/x')
+
+    def test_pwd_substitution_still_stays_allowed_when_no_base_matches(
+        self,
+    ) -> None:
+        """The property that must NOT regress: checking every tracked base
+        must not turn `$(pwd)` into a match against every ancestor -- only a
+        base that actually names the container triggers a block."""
+        assert not _blocked('D=x; cd ${D:+$HOME}; mv "$(pwd)/unrelated" /tmp/y')
+
+
+class TestAnOperatorFormAssignmentReconstructsTheContainer:
+    """GPT review: `p=${HOME:0}; mv "$p/.kiro/crew" /tmp/x` names neither
+    `$HOME` nor `.kiro` in a form any prior check resolved. `${HOME:0}` is
+    bash's substring expansion (offset 0 -- the whole value, unchanged), an
+    OPERATOR-form reference `normalize_shell_command`'s own `$HOME`/`~`
+    expansion cannot touch (it only expands bare `$HOME`/`${HOME}`) and the
+    segment walk's assignment tracking cannot resolve either (the assigned
+    VALUE is the operator expression itself, not a literal path). Every
+    `is_unreplaceable_container(cand)` call site checked only the literal
+    candidate text, which still read `$p/.kiro/crew` or
+    `${HOME:0}/.kiro/crew` -- neither of which equals the container.
+
+    Fixed the same way an unresolved variable already gets a second look for
+    CREDENTIAL paths (`_sensitive_under_unresolved_var`): a new
+    `_unresolved_container_hypothesis` also tests whether the unresolved part
+    could name a home directory, applied at all three
+    `is_unreplaceable_container` call sites in `_check_sensitive_via_
+    normalizer`. Deliberately its OWN helper, not a call straight to
+    `_unresolved_home_hypothesis`: a bare `$PWD`/`$OLDPWD` with no tracked
+    `cd` base is a DIFFERENT, already-decided case (see
+    `TestPwdAndOldpwdAliasesResolveAgainstTheTrackedCdBase.
+    test_pwd_without_a_preceding_cd_has_no_tracked_base_to_resolve_against`)
+    that must keep reading as an ordinary unresolved literal rather than a
+    home guess.
+    """
+
+    def test_the_reported_container_relocation_is_blocked(self) -> None:
+        assert _blocked('p=${HOME:0}; mv "$p/.kiro/crew" /tmp/x')
+
+    def test_the_symlink_replacement_half_is_also_blocked(self) -> None:
+        assert _blocked('p=${HOME:0}; mv "$p/.kiro/crew" /tmp/x && ln -s /tmp/evil "$p/.kiro/crew"')
+
+    def test_the_operator_form_reaches_the_container_check_unmasked(self) -> None:
+        """No intervening assignment at all -- the operator form sits directly
+        in the operand, exercising Pass A's flat token scan on its own."""
+        assert _blocked('mv "${HOME:0}/.kiro/crew" /tmp/x')
+
+    def test_the_same_shape_still_blocks_with_a_preceding_cd_in_the_command(
+        self,
+    ) -> None:
+        """A `cd` earlier in the same command must not change the verdict --
+        the segment walk's own `is_unreplaceable_container` call sites carry
+        the identical hypothesis check, so this stays blocked whether or not
+        the command also happens to change directory first."""
+        assert _blocked('cd /tmp; p=${HOME:0}; mv "$p/.kiro/crew" /tmp/x')
+
+    def test_a_bare_pwd_with_no_tracked_base_stays_allowed(self) -> None:
+        """The property that must NOT regress: this fix must not resurrect
+        the case `TestPwdAndOldpwdAliasesResolveAgainstTheTrackedCdBase`
+        already pinned as allowed -- a bare `$PWD` with no preceding `cd` has
+        no tracked base for the segment walk to mean, and `_pwd_alias_
+        readings` already leaves it as an ordinary unresolved literal on
+        purpose. Routing it through the generic home-hypothesis test too
+        would silently override that carve-out."""
+        assert not _blocked('mv "$PWD/.kiro/crew" /tmp/x')
+
+    def test_a_pwd_with_a_tracked_base_still_gets_caught_by_its_own_mechanism(
+        self,
+    ) -> None:
+        """Companion positive control: once a `cd` DOES establish a base,
+        `$PWD` is still caught -- just by `_pwd_alias_readings`, the
+        mechanism that already owns this case, not by the new hypothesis
+        check this class is otherwise testing."""
+        assert _blocked('cd ~; mv "$PWD/.kiro/crew" /tmp/x')
+
+    def test_an_unrelated_operator_form_assignment_stays_allowed(self) -> None:
+        """The property that must NOT regress: an ordinary operator-form
+        reference to an unrelated variable, joined with an unrelated path,
+        must not be treated as home-hypothesis-worthy just because it is
+        unresolved -- the hypothesis must still require the REMAINDER to
+        actually name the container."""
+        assert not _blocked('p=${BUILD_DIR:0}; mv "$p/artifacts" /tmp/x')
+
+
+class TestEvalWithAnEscapedDollarIndirectionFailsClosed:
+    """GPT review: `H=HOME; eval "\\$$H/.kiro/crew"` spells neither `$HOME` nor
+    `.kiro` anywhere in the command AS WRITTEN. Inside the double-quoted
+    string, the escaped `\\$` survives the OUTER shell's own expansion as a
+    literal `$`, while `$H` is expanded normally to `HOME` -- the OUTER shell
+    hands `eval` the literal text `$HOME/.kiro/crew`, and `eval` runs THAT as
+    a brand-new command. Every check in this scan reads the command AS
+    WRITTEN, so none of them ever see the reconstructed text. Rather than try
+    to compute what the indirection resolves to, `eval` combined ANYWHERE
+    with this escape shape is refused outright -- the co-occurrence itself
+    has no ordinary, benign use worth preserving.
+    """
+
+    def test_the_reported_container_relocation_is_blocked(self) -> None:
+        assert _blocked(
+            'H=HOME; eval "mv \\$$H/.kiro/crew /tmp/stash ' '&& ln -s /tmp/evil \\$$H/.kiro/crew"'
+        )
+
+    def test_the_same_trick_spelled_with_a_brace_is_also_blocked(self) -> None:
+        """GPT review, second pass: `\\${$H}` is the identical idiom wrapped
+        in braces -- `\\$` (escaped, survives as a literal `$`) + `{`
+        (literal) + `$H` (expanded to `HOME`) + `}` (literal) assembles into
+        the literal text `${HOME}`, which `eval` re-parses exactly like bare
+        `$HOME`. The unbraced-only regex never matched the `{` sitting
+        between the escaped dollar and the variable name."""
+        assert _blocked(
+            'H=HOME; eval "mv \\${$H}/.kiro/crew /tmp/stash '
+            '&& ln -s /tmp/evil \\${$H}/.kiro/crew"'
+        )
+
+    def test_the_same_trick_against_credentials_is_also_blocked(self) -> None:
+        assert _blocked('H=HOME; eval "cat \\$$H/.aws/credentials"')
+        assert _blocked('H=HOME; eval "cat \\$$H/.ssh/id_rsa"')
+
+    def test_an_ordinary_eval_with_no_indirection_stays_allowed(self) -> None:
+        assert not _blocked('eval "echo hello"')
+        assert not _blocked('eval "ls -la"')
+
+    def test_the_indirection_shape_without_eval_anywhere_stays_allowed(self) -> None:
+        assert not _blocked('echo "\\$$H is just text"')
+
+    def test_eval_with_an_ordinary_direct_reference_stays_allowed(self) -> None:
+        assert not _blocked('H=HOME; eval "echo $H"')
