@@ -1671,7 +1671,7 @@ class SkillsLoader:
                     "description": description,
                     "path": str(skill_file),
                     "dir": str(skill_file.parent),
-                    "always": meta.get("always", "").lower() == "true",
+                    "always": meta.get("always", "").strip().lower() == "true",
                     "repo_scope": repo_scope,
                     # Project paths cannot safely offer a live pointer to the
                     # agent, so report the effective forced-body behavior.
@@ -1923,7 +1923,7 @@ class SkillsLoader:
                     "description": meta.get("description", name),
                     "path": str(skill_file),
                     "dir": str(skill_file.parent),
-                    "always": meta.get("always", "").lower() == "true",
+                    "always": meta.get("always", "").strip().lower() == "true",
                     # Carried so a caller assembling context can drop a
                     # repo-scoped skill from the INDEX, not just from the
                     # injected body: a summary line the agent is told to read
@@ -2825,7 +2825,7 @@ class SkillsLoader:
             # recorded rather than reading it unconfined for a ranking signal.
             meta = self._cached_frontmatter(Path(s["path"]), within=s.get("confine_root"))
             hits, anchor = self._auto_activity(key, s["path"], meta)
-            pinned = str(meta.get("pinned", "")).lower() == "true"
+            pinned = str(meta.get("pinned", "")).strip().lower() == "true"
             slug = key.split("/")[-1]
             exempt_row = (
                 pinned
@@ -3989,7 +3989,7 @@ class SkillsLoader:
         result: list[str] = []
         for name, skill_file, _within in self._iter_visible(project_dir):
             meta = self._cached_frontmatter(skill_file, within=_within)
-            if meta.get("always", "").lower() == "true":
+            if meta.get("always", "").strip().lower() == "true":
                 scope = meta.get("repo_scope", "")
                 if scope and not self._repo_scope_satisfied(scope, project_dir):
                     continue
@@ -4028,7 +4028,7 @@ class SkillsLoader:
         negated_skills: list[str] = []
         for name, skill_file, _within in self._iter_visible(project_dir):
             meta = self._cached_frontmatter(skill_file, within=_within)
-            if meta.get("always", "").lower() == "true":
+            if meta.get("always", "").strip().lower() == "true":
                 continue
             triggers = meta.get("triggers", "")
             if not triggers:
