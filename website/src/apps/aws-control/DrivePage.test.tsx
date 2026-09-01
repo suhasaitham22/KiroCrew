@@ -405,6 +405,8 @@ describe('DrivePage', () => {
     stubDrivePresent()
     await renderDrive('drive')
 
+    // The name field is a disclosure now: open it first.
+    fireEvent.click(await screen.findByTestId('drive-folder-toggle'))
     fireEvent.change(await screen.findByTestId('drive-folder-name'), { target: { value: '../escape' } })
     fireEvent.click(screen.getByTestId('drive-folder-create'))
 
@@ -413,6 +415,29 @@ describe('DrivePage', () => {
     expect(err).not.toHaveTextContent(i18nT('apps.awsControl.console.drive_bad_name'))
     // Never reached the endpoint.
     expect(awsControlApi.driveFolderCreate).not.toHaveBeenCalled()
+  })
+
+  it('folder disclosure swaps Upload out while open, and blurring the empty field collapses it', async () => {
+    // Expanded, the row must stay one two-button action group (Create/Cancel):
+    // Upload hides rather than becoming a third sibling. An abandoned empty
+    // field must not leave the toolbar stuck expanded — blur puts it back.
+    stubDrivePresent()
+    await renderDrive('drive')
+
+    expect(screen.getByTestId('drive-upload-btn')).toBeTruthy()
+    fireEvent.click(screen.getByTestId('drive-folder-toggle'))
+    expect(screen.queryByTestId('drive-upload-btn')).toBeNull()
+
+    const name = screen.getByTestId('drive-folder-name')
+    // Blur with TEXT keeps the disclosure open (the reader is mid-thought)...
+    fireEvent.change(name, { target: { value: 'photos' } })
+    fireEvent.blur(name)
+    expect(screen.getByTestId('drive-folder-name')).toBeTruthy()
+    // ...and blur with an EMPTY field collapses back to the toggle + Upload.
+    fireEvent.change(name, { target: { value: '' } })
+    fireEvent.blur(name)
+    expect(screen.queryByTestId('drive-folder-name')).toBeNull()
+    expect(screen.getByTestId('drive-upload-btn')).toBeTruthy()
   })
 
   it('deleting a folder does not also open it', async () => {
