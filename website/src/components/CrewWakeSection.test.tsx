@@ -65,7 +65,7 @@ describe('CrewWakeSection', () => {
   it('shows the empty state when nothing is bound to this crew', async () => {
     H.crons.mockResolvedValue({ jobs: [JOB] })
     wrap(<CrewWakeSection crew="kirocrew-research" isDefaultCrew={false} />)
-    expect(await screen.findByText(/No schedules run this crew automatically/i)).toBeTruthy()
+    expect(await screen.findByText(/No schedules run this agent automatically/i)).toBeTruthy()
     expect(screen.queryAllByTestId('wake-row')).toHaveLength(0)
   })
 
@@ -76,7 +76,7 @@ describe('CrewWakeSection', () => {
 
     cleanup()
     wrap(<CrewWakeSection crew="kirocrew-autofix" isDefaultCrew={false} />)
-    await screen.findByText(/No schedules run this crew automatically/i)
+    await screen.findByText(/No schedules run this agent automatically/i)
     expect(screen.queryAllByTestId('wake-row')).toHaveLength(0)
   })
 
@@ -126,7 +126,7 @@ describe('CrewWakeSection', () => {
       { ...JOB, id: 's2', name: 'poller', agent: '', script: '~/.kiro/crew/crons/p.py:run' },
     ] })
     wrap(<CrewWakeSection crew="default" isDefaultCrew />)
-    expect(await screen.findByText(/No schedules run this crew automatically/i)).toBeTruthy()
+    expect(await screen.findByText(/No schedules run this agent automatically/i)).toBeTruthy()
     expect(screen.queryAllByTestId('wake-row')).toHaveLength(0)
   })
 
@@ -148,7 +148,7 @@ describe('CrewWakeSection', () => {
 
     cleanup()
     wrap(<CrewWakeSection crew="default" isDefaultCrew />)
-    expect(await screen.findByText(/No schedules run this crew automatically/i)).toBeTruthy()
+    expect(await screen.findByText(/No schedules run this agent automatically/i)).toBeTruthy()
   })
 
   // The gateway takes the sequence path only at `len(agents) > 1`, so a
@@ -161,7 +161,7 @@ describe('CrewWakeSection', () => {
 
     cleanup()
     wrap(<CrewWakeSection crew="ops-triage" isDefaultCrew={false} />)
-    expect(await screen.findByText(/No schedules run this crew automatically/i)).toBeTruthy()
+    expect(await screen.findByText(/No schedules run this agent automatically/i)).toBeTruthy()
   })
 
   it('never lists a script job, even when it carries a stale agent', async () => {
@@ -169,7 +169,7 @@ describe('CrewWakeSection', () => {
       { ...JOB, id: 'x1', name: 'stale-script', script: '~/.kiro/crew/crons/p.py:run' },
     ] })
     wrap(<CrewWakeSection crew="kirocrew-autofix" isDefaultCrew={false} />)
-    expect(await screen.findByText(/No schedules run this crew automatically/i)).toBeTruthy()
+    expect(await screen.findByText(/No schedules run this agent automatically/i)).toBeTruthy()
   })
 
   // Absence of an answer and an answer of "none" must not render the same.
@@ -177,7 +177,7 @@ describe('CrewWakeSection', () => {
     H.crons.mockRejectedValue(new Error('gateway down'))
     wrap(<CrewWakeSection crew="kirocrew-autofix" isDefaultCrew={false} />)
     expect(await screen.findByRole('alert')).toHaveTextContent(/what wakes it is unknown/i)
-    expect(screen.queryByText(/No schedules run this crew automatically/i)).toBeNull()
+    expect(screen.queryByText(/No schedules run this agent automatically/i)).toBeNull()
   })
 
   it('reports a job that is running right now', async () => {
