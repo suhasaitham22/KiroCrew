@@ -37,6 +37,7 @@ from kiro_crew.config.loader import (
     published_autocompact_pct,
     resolve_agent_bindings,
 )
+from kiro_crew.dashboard import remote_mirror
 from kiro_crew.dashboard.channel_slots import channel_slot_name, note_slot_closed
 from kiro_crew.dashboard.chat_auto_tag import maybe_auto_tag
 from kiro_crew.dashboard.chat_delivery import (
@@ -89,6 +90,12 @@ from kiro_crew.dashboard.chat_utils import (
     effective_session_key,
     slot_history_key,
     subagents_attached,
+)
+from kiro_crew.dashboard.remote_relay import (
+    RemoteTurnError,
+    create_peer_slot,
+    forward_peer_stop,
+    relay_remote_turn,
 )
 from kiro_crew.dashboard.state import (
     DashboardState,
@@ -633,6 +640,14 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
     # WS mode: return JSON immediately, chunks delivered via WebSocket
     ws_mode = request.query.get("ws") == "1"
 
+    # Relay mode: an SSE reader on ANOTHER gateway is running this turn on behalf
+    # of a session in its own local list, and needs the frames a WebSocket client
+    # would get — tool calls, segment boundaries, turn end — which the SSE
+    # transport does not otherwise carry. For the life of this request those
+    # frames are also queued onto the slot's pending rows. Meaningless in WS mode
+    # (a WebSocket client already receives them) and ignored there, so the flag
+    # can never double-deliver to a local client.
+    relay_mode = not ws_mode and request.query.get("relay") == "1"
     slot._has_reader = not ws_mode  # Only block SSE broadcast if HTTP SSE reader
     slot._file_changes = []  # Reset file-change accumulator for the new turn
     # ── Sweep orphaned permissions from prior turns ──
@@ -828,15 +843,47 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
     except Exception:
         logger.debug("on_user_message observer raised; ignoring", exc_info=True)
 
+    # A slot bound to a peer crew runs its turn THERE. The branch sits here, at
+    # the single dispatch point, so every validation above (member reserve, app
+    # ownership, agent conflict, busy/steer/queue, crew and orchestrator modes)
+    # applies identically to a remote-bound session — a remote slot is an
+    # ordinary slot that executes elsewhere, not a second kind of session.
+    #
+    # `executor == "remote"` with an incomplete binding does NOT fall through to
+    # a local run: that would execute on this machine work the user asked a
+    # named crew to do, which is the one failure the binding exists to prevent.
+    if slot.executor == "remote" and not slot.is_remote:
+        return web.json_response(
+            {
+                "error": "this session is bound to a remote crew but the binding is incomplete",
+                "code": "remote_binding_incomplete",
+            },
+            status=409,
+        )
+    # Attach the mirror BEFORE dispatch, not after the response is prepared: the
+    # turn task can emit its first frames as soon as the event loop yields, and a
+    # mirror armed later would miss them.
+    _relay_owned = remote_mirror.attach(slot.key) if relay_mode else False
+
     # FIX 2: an unattended app-owned turn runs under the background concurrency
     # cap; run_background_turn passes an attended slot straight through, so the
     # interactive path is unchanged (no semaphore is even created).
+    #
+    # The remote arm is a conditional expression INSIDE the dispatch rather than a
+    # coroutine hoisted into a local: `test_chat_turn_timeout_consistency` scans
+    # the text of each `spawn_guarded_turn(...)` body for `_run_chat(`, so hoisting
+    # the call out would take this site — the primary user-typed turn — out of the
+    # static guard that every dispatch carries a CHAT_TURN_TIMEOUT ceiling.
+    # Both arms are wrapped identically: a hung peer must hit the same wall a hung
+    # local turn does.
     task = spawn_guarded_turn(
         state,
         slot,
         state.run_background_turn(
             slot,
-            _run_chat(
+            relay_remote_turn(state, slot, message)
+            if slot.is_remote
+            else _run_chat(
                 state,
                 slot,
                 message,
@@ -889,6 +936,7 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
         finally:
             slot.drain()
             slot._has_reader = False
+            remote_mirror.detach(slot.key, _relay_owned)
     return resp
 
 
@@ -2015,6 +2063,18 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "folder not found", "code": "folder_not_found"}, status=400
         )
+    # Remote execution binding. Done BEFORE the local slot exists: creating the
+    # peer's slot is the step that can fail (peer disconnected, version skew,
+    # stale credential), and doing it after would leave a local session in the
+    # sidebar that looks ready and refuses every send. Failing here means the
+    # user sees an error and no orphan row.
+    instance_id = str(body.get("instance_id") or "")
+    remote_slot_key = ""
+    if instance_id:
+        try:
+            remote_slot_key = await create_peer_slot(state, instance_id)
+        except RemoteTurnError as exc:
+            return web.json_response({"error": str(exc), "code": "remote_bind_failed"}, status=502)
     folder_project = ""
     existing_slot = state._slots.get(_normalize_slot_key(str(name))) if name else None
     if folder_id and (existing_slot is None or not existing_slot.project):
@@ -2144,6 +2204,15 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
             )
         except ValueError as exc:
             return web.json_response({"error": str(exc)}, status=409)
+        if remote_slot_key:
+            # Stamped after creation rather than passed through
+            # get_or_create_slot: the binding is not part of a slot's identity
+            # (the key, agent and workspace are), and keeping it out of that
+            # signature means every other creation path — channels, apps, forks,
+            # restore — stays untouched by remote execution.
+            slot.executor = "remote"
+            slot.instance_id = instance_id
+            slot.remote_slot = remote_slot_key
         if slot.is_restricted:
             logger.info("Slot %s created with memory_mode=%s", slot.key, slot.memory_mode)
         # App ownership check (App Kit §5.2), same deny-by-default rule as
@@ -2294,11 +2363,16 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
     # A pinned title must persist too (not just a folder move): without the
     # write, a restart rehydrates the previous title with a refreshable "auto"
     # origin and the background refresh may rewrite the pin.
-    if folder_id or title:
+    if folder_id or title or remote_slot_key:
         await save_slot_off_loop(state, slot, force=True)
     # Speculative session creation: overlap the ACP handshake with the user's
     # think-time before their first message. No-op unless session.eager_spawn.
-    schedule_eager_spawn(state, slot)
+    #
+    # Skipped for a peer-bound slot: the turn will run on the peer, so a local
+    # kiro-cli spawned here would idle until it timed out, having consumed a
+    # process and a model handshake for a session that never uses it.
+    if not slot.is_remote:
+        schedule_eager_spawn(state, slot)
     return web.json_response(state.serialize_slot(slot))
 
 
@@ -2670,6 +2744,24 @@ async def stop_slot_turn(
     """
     name = slot.key
     cancel_key = cancel_key or _cancel_target(slot)
+
+    # A peer-bound slot's turn is not running in this process. The local
+    # escalation machinery below would find nothing to cancel and report a clean
+    # stop while the peer kept generating into the relay, so the stop has to
+    # travel. Deliberately placed before the local path rather than beside it:
+    # there is no local turn to also stop, and running both would insert a second
+    # stop_event card for one press.
+    if slot.is_remote:
+        accepted = await forward_peer_stop(state, slot, force or slot._stop_state == "soft_pending")
+        if not accepted:
+            return {
+                "ok": False,
+                "error": "could not reach the crew running this session to stop it",
+                "code": "remote_stop_unreachable",
+            }
+        # The peer ends its own turn, which reaches us as the relay's [DONE] and
+        # the mirrored chat_done. Nothing local to tear down.
+        return {"ok": True}
 
     # Escalation path: a second stop press while a cooperative cancel is
     # already pending hard-kills. We escalate on ANY second press — not only

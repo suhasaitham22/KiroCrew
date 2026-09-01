@@ -25,6 +25,11 @@ _TO_DICT_KEYS = (
     "surface",
     "workspace",
     "project",
+    # Remote-execution binding: present on EVERY slot, so the frontend can tell
+    # "runs locally" from "the field is missing on an older gateway".
+    "executor",
+    "instance_id",
+    "remote_slot",
     "artifact",
     "messages",
     "running",

@@ -963,6 +963,24 @@ def _rehydrate_slot_from_history(
             slot.workspace = meta["workspace"]
         if meta.get("project"):
             slot.project = meta["project"]
+        # Restore the remote binding only when it is COMPLETE. history JSONL is a
+        # file on disk, so a truncated write or a hand-edit can leave the marker
+        # without its target; accepting that would give us a slot that refuses
+        # every send with no way for the user to tell why. An incomplete binding
+        # is dropped instead, and the session comes back as an ordinary local one.
+        _executor_meta = meta.get("executor")
+        _instance_meta = meta.get("instance_id")
+        _remote_slot_meta = meta.get("remote_slot")
+        if (
+            _executor_meta == "remote"
+            and isinstance(_instance_meta, str)
+            and _instance_meta
+            and isinstance(_remote_slot_meta, str)
+            and _remote_slot_meta
+        ):
+            slot.executor = "remote"
+            slot.instance_id = _instance_meta
+            slot.remote_slot = _remote_slot_meta
         if meta.get("mode") and _member_identity is None:
             slot.mode = meta["mode"]
         if meta.get("folder_id"):
@@ -2696,6 +2714,19 @@ def _save_slot_to_history(
                     fields["channel_origin"] = True
                 if slot.forked_from is not None:
                     fields["forked_from"] = slot.forked_from
+                if slot.executor == "remote" and slot.instance_id and slot.remote_slot:
+                    # All three or none, exactly like the full save: a newborn
+                    # bound to a peer has an EMPTY window until the first relayed
+                    # row lands, so this merge is the only writer its binding
+                    # ever sees. Dropping it here means a restart in that window
+                    # brings the session back as an ordinary local one and the
+                    # next turn runs on this machine instead of the crew the user
+                    # picked. The completeness guard keeps the fail-closed
+                    # invariant: a half-binding is never written, so rehydration
+                    # never has to repair one.
+                    fields["executor"] = "remote"
+                    fields["instance_id"] = slot.instance_id
+                    fields["remote_slot"] = slot.remote_slot
                 if getattr(slot, "_tab_id", None):
                     fields["tab_id"] = slot._tab_id
                 if getattr(slot, "_auto_tagged", False):
@@ -2960,6 +2991,15 @@ def _save_slot_to_history(
                 meta_line["workspace"] = slot.workspace
             if slot.project:
                 meta_line["project"] = slot.project
+            # Remote-execution binding. All three are written together or not at
+            # all: a half-restored binding (executor="remote" with no peer slot)
+            # is the fail-closed refusal case, so persisting the marker without
+            # its target would resurrect a session that can never run. Written
+            # only when the whole binding is present, and read back the same way.
+            if slot.executor == "remote" and slot.instance_id and slot.remote_slot:
+                meta_line["executor"] = "remote"
+                meta_line["instance_id"] = slot.instance_id
+                meta_line["remote_slot"] = slot.remote_slot
             if slot.folder_id:
                 meta_line["folder_id"] = slot.folder_id
             if slot._channel_folder_filed or existing_meta.get("channel_folder_filed"):

@@ -768,6 +768,34 @@ export interface ConfiguredChannelTarget {
   unavailable_reason: string
 }
 
+/**
+ * What a connected crew offers a session bound to it for execution.
+ *
+ * Every field mirrors a gateway-wide read the chat shelf normally makes
+ * same-origin against THIS machine (`/api/agents`, `/api/models`,
+ * `/api/effort-levels`, `/api/workspaces`). A peer-bound session must offer the
+ * PEER's options instead: a model or crew that exists only here would be accepted
+ * by the picker and then fail on the first send, which is worse than not offering
+ * it at all.
+ */
+export interface RemoteCrewCapabilities {
+  instance_id: string
+  /** The peer's gateway version, or "" when it could not be read. */
+  version: string
+  local_version: string
+  /** The equality gate the backend enforces on every dispatch. False also covers
+   *  "could not be read": an unknown version cannot be proven equal. */
+  version_match: boolean
+  agents: { name: string; description: string; scope: string; model: string }[]
+  models: { model_name: string; display_name: string; description: string; context_window: number }[]
+  effort_levels: string[]
+  workspaces: { name: string; path: string }[]
+  default_workspace: string
+  /** Per-field failure codes for the reads that did not land, so one unreachable
+   *  roster disables its own control rather than blanking the whole shelf. */
+  unavailable: Record<string, string>
+}
+
 export interface ChatSlot {
   /** The agent that will actually answer, when it is NOT the requested `agent`;
    *  "" / absent means nothing to report. The backend stores `agent` verbatim
@@ -775,6 +803,16 @@ export interface ChatSlot {
    *  and it reports "" rather than guessing whenever resolution is unsettled — so
    *  a consumer must treat absent as "no news", never as a mismatch. */
   effective_agent?: string
+  /** Remote-execution binding. `executor` is "local" for an ordinary session and
+   *  "remote" for one whose turns run on a connected crew; `instance_id` names
+   *  that crew and `remote_slot` is the PEER's slot key, meaningful only in a
+   *  request routed back through the same instance. The backend ships all three
+   *  on EVERY slot so "runs locally" is a positive value rather than an absent
+   *  key — otherwise an older gateway's payload would read as local for a
+   *  session that is not. */
+  executor?: 'local' | 'remote'
+  instance_id?: string
+  remote_slot?: string
   key: string; title?: string; messages: number; running: boolean; stopping?: boolean; pending_approval?: boolean; created?: string; last_ts?: string; last_turn_ts?: string; last_message?: string; agent?: string; model?: string; reasoning_effort?: string; mode?: string; surface?: string; workspace?: string; trust?: boolean; trust_reads?: boolean; folder_id?: string; pinned?: boolean; tags?: string[]; links?: SessionLink[]; slack_linked?: boolean; slack_channel?: string; slack_thread_ts?: string; color_index?: number | null; color_hex?: string | null; memory_mode?: 'persistent' | 'incognito' | 'temporary'; clean_mode?: boolean; project?: string; forked_from?: string | null; source_links?: { provider: SourceProviderId; number: number; url: string; label?: string; repo?: string; ci?: 'running' | 'passed' | 'failed' | null; state?: 'open' | 'draft' | 'merged' | 'closed'; mergeable?: string; mergeStateStatus?: string; kind?: 'change' | 'issue' }[]; source_links_total?: number
   /** Provenance bucket from the backend `SlotOrigin` ("user" | "app" | "cron"
    * | "system"; absent/"" for untagged background slots). The session-pulse

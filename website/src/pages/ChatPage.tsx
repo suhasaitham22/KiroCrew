@@ -155,6 +155,9 @@ import { useFilteredDropdown } from '../hooks/useFilteredDropdown'
 import { useAvailableModels } from '../hooks/useAvailableModels'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
 import { useAgents } from '../hooks/useAgents'
+import { useRemoteCapabilities } from '../hooks/useRemoteCapabilities'
+import type { KiroCrewAgent } from '../components/AgentSelector'
+import type { ModelInfo } from '../providers/types'
 import AgentDropdownList, { DefaultAgentRow, ManageAgentsFooter } from '../components/AgentDropdownList'
 import { agentSwitchFailureMessage } from '../utils/agentSwitchFeedback'
 import ProjectPicker from '../components/ProjectPicker'
@@ -1256,6 +1259,27 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // from `currentSlot`, which is computed further down the render body.
   const activeSlotProject = slots.find(s => s.key === activeSlot)?.project || undefined
   const { agents: installedAgents, defaultAgent } = useAgents(refreshTrigger, activeSlot ?? undefined, activeSlotProject)
+  // Is this session bound to a peer crew for execution, and what does that crew
+  // offer? Read once here and threaded into the shelf's pickers below, so every
+  // control answers from one source rather than each deciding for itself.
+  const remoteCrew = useRemoteCapabilities(slots.find(s => s.key === activeSlot))
+  const effectiveAgents = useMemo<KiroCrewAgent[]>(() => {
+    if (!remoteCrew.isRemote) return installedAgents
+    // The peer's roster carries the four fields its picker renders. The rest of
+    // KiroCrewAgent describes bindings that only mean something on the machine
+    // that owns them (`kiro_agent`, `workspace`, `memory_store`), so they are
+    // filled with the empty value rather than this machine's — a local workspace
+    // path shown under a remote crew's name would be a straightforward lie.
+    return (remoteCrew.capabilities?.agents ?? []).map(a => ({
+      name: a.name,
+      kiro_agent: '',
+      workspace: '',
+      memory_store: '',
+      model: a.model || '',
+      description: a.description,
+      source: a.scope || 'remote',
+    }))
+  }, [remoteCrew.isRemote, remoteCrew.capabilities, installedAgents])
   const [defaultAgentFailed, setDefaultAgentFailed] = useState(false)
   // Promotes an agent to the global default. Set-only: clearing the default lives on
   // the Agent Templates page, where the control is labelled and the outcome is visible.
@@ -1270,9 +1294,27 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       .then(() => dispatch(triggerRefresh()))
       .catch(() => setDefaultAgentFailed(true))
   }, [dispatch])
-  const { open: agentDropdown, setOpen: setAgentDropdown, filter: agentFilter, setFilter: setAgentFilter, dropdownRef: agentDropdownRef, inputRef: agentInputRef, filtered: filteredAgentsByName } = useFilteredDropdown(installedAgents)
+  const { open: agentDropdown, setOpen: setAgentDropdown, filter: agentFilter, setFilter: setAgentFilter, dropdownRef: agentDropdownRef, inputRef: agentInputRef, filtered: filteredAgentsByName } = useFilteredDropdown(effectiveAgents)
   const filteredAgents = filteredAgentsByName
-  const availableModels = useAvailableModels()
+  const localModels = useAvailableModels()
+  // A peer-bound session's shelf must offer the PEER's rosters. Both hooks above
+  // read THIS machine same-origin, so a remote session left on them would list
+  // crews and models that do not exist over there — accepted by the picker, then
+  // refused on the first send. Substituted rather than merged: the union would let
+  // the user pick a local-only model and could not say which side it came from.
+  //
+  // While the capability read is in flight the lists are EMPTY, not local: a brief
+  // empty picker is honest, whereas briefly showing this machine's models for a
+  // remote session invites exactly the wrong pick.
+  const effectiveModels = useMemo<ModelInfo[]>(() => {
+    if (!remoteCrew.isRemote) return localModels
+    return (remoteCrew.capabilities?.models ?? []).map(m => ({
+      name: m.model_name,
+      description: m.description || m.display_name,
+      contextWindow: m.context_window || undefined,
+    }))
+  }, [remoteCrew.isRemote, remoteCrew.capabilities, localModels])
+  const availableModels = effectiveModels
   const { open: modelDropdown, setOpen: setModelDropdown, filter: modelFilter, setFilter: setModelFilter, dropdownRef: modelDropdownRef, inputRef: modelInputRef, filtered: filteredModels } = useFilteredDropdown(availableModels)
   // Roving-focus keyboard nav for the agent + model dropdowns (shared with StyledSelect/AgentSelector).
   const { onListKeyDown: onAgentListKeyDown } = useListboxKeyboard({
@@ -5398,6 +5440,15 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     availableModels,
     _modelsDegraded,
   )
+  // Context-window fallback for a peer-bound session BEFORE its first turn. Once a
+  // turn has run the real number arrives with the relayed `context_usage` frame and
+  // wins; until then `provider.getContextWindow` would answer from THIS machine's
+  // model knowledge, which can differ from the peer's for the same model name.
+  const remoteContextWindow = useMemo(() => {
+    if (!remoteCrew.isRemote) return 0
+    const picked = shownModel === 'auto' ? '' : shownModel
+    return remoteCrew.capabilities?.models.find(m => m.model_name === picked)?.context_window || 0
+  }, [remoteCrew.isRemote, remoteCrew.capabilities, shownModel])
   // True when the pin row would be a no-op: the agent already stores exactly
   // the model the composer is showing. 'auto' is the inherit spelling, never a
   // stored pin, so it never counts as pinned. Reads the slot's REAL model, not
@@ -8240,7 +8291,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               onVoiceStop={voiceInputSupported ? stopVoice : undefined}
               voiceCaptureActive={voice.recording}
               agentName={activeAgentName}
-              agentSource={installedAgents.find(a => a.name === activeAgentName)?.source}
+              agentSource={effectiveAgents.find(a => a.name === activeAgentName)?.source}
               modelName={shownModel}
               onAgentClick={provider.capabilities.agentTemplates ? (rect) => { setAgentBtnRect(rect); setAgentDropdown(!agentDropdown) } : undefined}
               onModelClick={(rect) => { setModelBtnRect(rect); setModelDropdown(!modelDropdown) }}
@@ -8250,7 +8301,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               }}
               contextPct={contextPct}
               contextUsedTokens={contextTokens?.used}
-              contextWindowTokens={contextTokens?.window || provider.getContextWindow(shownModel)}
+              contextWindowTokens={contextTokens?.window || remoteContextWindow || provider.getContextWindow(shownModel)}
               showContextPct={chatConfig.showContextPct}
               showContextTokens={chatConfig.showContextTokens}
               isRunning={composerBusy}
@@ -8406,6 +8457,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 slot={activeSlot}
                 currentEffort={currentSlot?.reasoning_effort || ''}
                 defaultEffort={defaultEffort}
+                effortLevelsOverride={remoteCrew.isRemote ? (remoteCrew.capabilities?.effort_levels ?? []) : undefined}
                 onSetDefault={() => {
                   setModelDropdown(false)
                   navigate(`/settings/chat?highlight=${SETTINGS_DEFAULT_MODEL_ID}`)

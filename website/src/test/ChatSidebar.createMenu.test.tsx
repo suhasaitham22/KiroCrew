@@ -60,7 +60,7 @@ vi.mock('../pages/chat/ChatSettings', () => ({
   saveChatConfig: vi.fn(),
 }))
 
-const mocks = vi.hoisted(() => ({ createChatSlot: vi.fn(), instancesCreateRemoteSlot: vi.fn(), listInstances: vi.fn() }))
+const mocks = vi.hoisted(() => ({ createChatSlot: vi.fn(), listInstances: vi.fn() }))
 vi.mock('../api/client', () => ({
   SEARCH_MIN_CHARS: 2,
   api: new Proxy(mocks as Record<string, unknown>, {
@@ -124,7 +124,6 @@ beforeEach(() => {
   localStorage.clear()
   cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false, defaultAutopilot: false }
   mocks.createChatSlot.mockResolvedValue({ key: 'chat-new-1' })
-  mocks.instancesCreateRemoteSlot.mockResolvedValue({ key: 'chat-7' })
   mocks.listInstances.mockResolvedValue({
     active: true, warm_set_cap: 5, sso: {},
     instances: [{ id: 'i-nobita', name: 'nobita' }, { id: 'i-gian', name: 'gian' }],
@@ -274,9 +273,19 @@ describe('create-button caret menu', () => {
     expect(screen.queryByTestId('new-chat-on-crew-i-gian')).toBeNull()
 
     fireEvent.click(row)
-    // Routed to the peer's own create endpoint through the proxy — NOT through
-    // createChatSlot, which would build a local slot and defeat the point.
-    await waitFor(() => expect(mocks.instancesCreateRemoteSlot).toHaveBeenCalledWith('i-nobita'))
-    expect(mocks.createChatSlot).not.toHaveBeenCalled()
+    // The session is created LOCALLY and bound to the peer for execution, so it
+    // lands in this machine's list with a crew chip. This replaced an earlier
+    // shape that POSTed straight to the peer's own create endpoint through the
+    // proxy: the session then existed only over there, and the only way to reach
+    // it was to switch to that crew's iframe pane. `instance_id` is what carries
+    // the binding, and it must be sent at BIRTH — the backend opens the peer's
+    // slot before creating the local one, so a disconnected or version-skewed
+    // peer fails the create instead of leaving a session that cannot send.
+    await waitFor(() =>
+      expect(mocks.createChatSlot).toHaveBeenCalledWith(
+        undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+        undefined, 'i-nobita',
+      ),
+    )
   })
 })
