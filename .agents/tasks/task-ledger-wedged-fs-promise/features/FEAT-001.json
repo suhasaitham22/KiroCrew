@@ -1,0 +1,78 @@
+{
+  "id": "FEAT-001",
+  "type": "chore",
+  "description": "Establish a verifiable baseline in the offline (INTEGRATIONS_ONLY) sandbox for the session_ledger module. The full pytest suite cannot run here because aiohttp and pytest-asyncio are not installed and cannot be pip-installed. This feature confirms the achievable verification path: standalone import of session_ledger, byte-compilation of both files that will change, and running the ONE existing stdlib-only lock regression test (test_record_fails_closed_on_held_lock) in isolation. This baseline is what later features re-run to confirm no regression. Independent of other features but MUST run first so the mechanism-fix feature knows the exact green baseline.",
+  "status": "completed",
+  "steps": [
+    "Confirm the interpreter: ~/.pyenv/versions/3.11.15/bin/python --version (expect 3.11.15).",
+    "Standalone import smoke check: `cd /projects/sandbox/KiroCrew/src && PYTHONPATH=. ~/.pyenv/versions/3.11.15/bin/python -c 'import kiro_crew.session_ledger; import kiro_crew.dashboard.handlers.session_ledger' 2>&1` — note that the handlers module imports aiohttp and WILL fail offline; that failure is expected and documents why the handler file can only be byte-compiled, not imported, here. session_ledger itself MUST import cleanly.",
+    "Byte-compile both target files: `~/.pyenv/versions/3.11.15/bin/python -m py_compile src/kiro_crew/session_ledger.py src/kiro_crew/dashboard/handlers/session_ledger.py` — expect success (compilation does not run imports).",
+    "Extract and run the existing stdlib-only lock test in isolation. Create a throwaway runner that imports kiro_crew.session_ledger with PYTHONPATH=src and reproduces test_record_fails_closed_on_held_lock's logic (record -> hold flock in-process on the .lock fd -> assert OSError 'held by another process' within the shortened _LOCK_TIMEOUT_SECS -> release -> next write succeeds), setting KIROCREW_HOME to a tmp dir. Confirm it passes on the UNCHANGED code so the baseline is green. Do this with a direct python script rather than pytest-collecting the aiohttp-importing test file.",
+    "Record the exact commands that worked and their output in this feature's findings so FEAT-002 reuses them verbatim."
+  ],
+  "acceptance_criteria": [
+    "`import kiro_crew.session_ledger` succeeds standalone from src/ with the 3.11.15 interpreter.",
+    "`python -m py_compile` succeeds for both src/kiro_crew/session_ledger.py and src/kiro_crew/dashboard/handlers/session_ledger.py.",
+    "The isolated cross-process-holder lock test passes against the current (unmodified) session_ledger.py, establishing a green baseline.",
+    "findings documents the working verification commands verbatim and confirms the full aiohttp-based suite is not runnable offline (with the exact error)."
+  ],
+  "verification": [
+    "cd /projects/sandbox/KiroCrew/src && PYTHONPATH=. ~/.pyenv/versions/3.11.15/bin/python -c 'import kiro_crew.session_ledger; print(\"ok\")'",
+    "~/.pyenv/versions/3.11.15/bin/python -m py_compile /projects/sandbox/KiroCrew/src/kiro_crew/session_ledger.py /projects/sandbox/KiroCrew/src/kiro_crew/dashboard/handlers/session_ledger.py && echo compiled",
+    "Run the isolated lock regression script and confirm it prints a pass."
+  ],
+  "blocked_reason": null,
+  "findings": {
+    "network_mode": "INTEGRATIONS_ONLY — no PyPI. aiohttp, pytest-asyncio, hypothesis are NOT installed and cannot be pip-installed. Do NOT attempt pip install.",
+    "interpreter": "~/.pyenv/versions/3.11.15/bin/python is Python 3.11.15 (bare `python` is not on PATH; no pyenv global). Use this interpreter verbatim for every command below.",
+    "working_verification_commands": {
+      "1_interpreter_version": {
+        "cmd": "~/.pyenv/versions/3.11.15/bin/python --version",
+        "output": "Python 3.11.15",
+        "exit": 0
+      },
+      "2_standalone_import_session_ledger": {
+        "cmd": "cd /projects/sandbox/KiroCrew/src && PYTHONPATH=. ~/.pyenv/versions/3.11.15/bin/python -c 'import kiro_crew.session_ledger; print(\"ok\")'",
+        "output": "ok",
+        "exit": 0,
+        "note": "session_ledger imports only stdlib + intra-package leaf modules (atomic_write, config.paths, platform_compat) and imports cleanly offline."
+      },
+      "3_byte_compile_both_target_files": {
+        "cmd": "cd /projects/sandbox/KiroCrew && ~/.pyenv/versions/3.11.15/bin/python -m py_compile src/kiro_crew/session_ledger.py src/kiro_crew/dashboard/handlers/session_ledger.py && echo compiled",
+        "output": "compiled",
+        "exit": 0,
+        "note": "py_compile does not run imports, so the aiohttp-importing handler compiles fine offline."
+      },
+      "4_isolated_lock_regression_baseline": {
+        "how": "Reproduce test/test_session_ledger.py::test_record_fails_closed_on_held_lock (POSIX flock holder) in a standalone stdlib-only script, since the pytest file cannot be collected offline (see below). The script sets KIROCREW_HOME to a tmp dir, records once to create the .lock inode, sets sl._LOCK_TIMEOUT_SECS=0.2, holds an exclusive fcntl.flock(LOCK_EX) on the .lock fd, asserts sl.record(...) raises OSError matching 'held by another process' within the shortened budget, releases the lock, then asserts the next record lands (goal=='z').",
+        "runner_body": "import fcntl, os, re, sys, tempfile; from kiro_crew.platform_compat import IS_POSIX; assert IS_POSIX; from kiro_crew import session_ledger as sl; ... (see FEAT-001 step 4). Placed at repo-relative path ._ledger_lock_baseline.py (the fs_write tool and the bash sandbox share the repo filesystem but NOT /tmp; write the throwaway INSIDE the repo, run it, then rm it — do not commit it).",
+        "cmd": "cd /projects/sandbox/KiroCrew && PYTHONPATH=src ~/.pyenv/versions/3.11.15/bin/python ._ledger_lock_baseline.py",
+        "output": "PASS: test_record_fails_closed_on_held_lock (standalone baseline)",
+        "exit": 0,
+        "result": "GREEN baseline against the current UNMODIFIED session_ledger.py."
+      }
+    },
+    "full_suite_not_runnable_offline": {
+      "pytest_collection": {
+        "cmd": "cd /projects/sandbox/KiroCrew && PYTHONPATH=src ~/.pyenv/versions/3.11.15/bin/python -m pytest test/test_session_ledger.py -q",
+        "error": "ImportError while loading conftest '/projects/sandbox/KiroCrew/test/conftest.py'. test/conftest.py:15: from hypothesis import HealthCheck, settings -> ModuleNotFoundError: No module named 'hypothesis'",
+        "exit": 2,
+        "note": "conftest fails first on missing hypothesis; even past that, importing the test module itself fails on aiohttp (next)."
+      },
+      "module_import": {
+        "cmd": "cd /projects/sandbox/KiroCrew/test && PYTHONPATH=/projects/sandbox/KiroCrew/src ~/.pyenv/versions/3.11.15/bin/python -c 'import test_session_ledger'",
+        "error": "File \".../test/test_session_ledger.py\", line 21, in <module> from aiohttp import web -> ModuleNotFoundError: No module named 'aiohttp'",
+        "exit": 0,
+        "note": "Confirms the file imports aiohttp at module top; the aiohttp/asyncio route + nudge tests can only run in CI, not this sandbox."
+      },
+      "handler_import": {
+        "cmd": "cd /projects/sandbox/KiroCrew/src && PYTHONPATH=. ~/.pyenv/versions/3.11.15/bin/python -c 'import kiro_crew.dashboard.handlers.session_ledger'",
+        "error": "kiro_crew/dashboard/handlers/__init__.py -> handlers_system.py:24 -> from aiohttp import web -> ModuleNotFoundError: No module named 'aiohttp'",
+        "exit": 1,
+        "note": "EXPECTED. The handler module can only be byte-compiled offline (step 3), not imported. Document, do not treat as a blocker."
+      }
+    },
+    "test_target_confirmed": "test/test_session_ledger.py::test_record_fails_closed_on_held_lock exists at ~line 405, guarded @pytest.mark.skipif(not IS_POSIX). It asserts pytest.raises(OSError, match='held by another process') after monkeypatch of sl._LOCK_TIMEOUT_SECS to 0.2, and that the post-release write lands (goal=='z'). The current OSError message in session_ledger._locked is 'ledger lock is held by another process; try again'.",
+    "notes_for_FEAT-002": "Reuse commands 2, 3, and 4 verbatim as the no-regression gate after the mechanism fix. The throwaway lock runner is NOT committed; recreate it (repo-relative path, then rm) or add the real regression test to test/test_session_ledger.py and run it via the same standalone-script technique (never via full pytest collection, which dies on hypothesis/aiohttp offline). No source files were changed in FEAT-001."
+  }
+}
