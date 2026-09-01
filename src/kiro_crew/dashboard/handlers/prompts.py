@@ -14,7 +14,6 @@ from typing import Any
 
 from aiohttp import web
 
-from kiro_crew import agent as _agent
 from kiro_crew import pinned_fs
 from kiro_crew.agent_discovery import agent_skill_globs
 from kiro_crew.config.loader import KiroCrewConfig
@@ -53,11 +52,15 @@ from ._shared import (
 )
 
 
-def _list_aim_prompts():
-    """Import from parent to avoid circular — cache lives in __init__.py for test compat."""
+def _list_aim_prompts(project_dir=None):
+    """Import from parent to avoid circular — cache lives in __init__.py for test compat.
+
+    ``project_dir`` is the caller's already-resolved per-slot local project (or
+    ``None``) and is forwarded unchanged so the parent implementation appends the
+    per-slot local prompts (see its docstring)."""
     import kiro_crew.dashboard.handlers as _pkg
 
-    return _pkg._list_aim_prompts()
+    return _pkg._list_aim_prompts(project_dir)
 
 
 logger = logging.getLogger(__name__)
@@ -218,8 +221,22 @@ async def api_prompts(request: web.Request) -> web.Response:
     # work that can stall the event loop on a large tree. It has a 5s TTL cache,
     # but the cold/expired build must run off the loop. (The cache lives in the
     # parent package; the executor call still benefits from it on warm builds.)
+    # Resolve the per-slot local project on the loop (requesting_slot_project
+    # just reads state._slots, non-blocking) and capture it into the executor
+    # job so local prompts come from the caller's chat slot, not a gateway-global
+    # dir. "local" is a PER-CHAT resource here — an @mention expanded in chat
+    # resolves it from slot.project (see chat_runner._expand_prompt_mention) — so
+    # this surface must ask the same narrow question the chat surface asks:
+    # requesting_slot_project (THIS slot, no cross-slot fallback), NOT
+    # active_project_dir, whose step-2 "single project shared by every slot"
+    # fallback could surface a directory this chat is not bound to. Mirrors how
+    # the skills catalog picks requesting_slot_project so the catalog matches
+    # what the chat will actually load.
+    state: DashboardState = request.app["state"]
+    session_key = _read_session_key(request)
+    project_dir = requesting_slot_project(state, session_key)
     prompts = await asyncio.get_running_loop().run_in_executor(
-        discovery_executor(), _list_aim_prompts
+        discovery_executor(), functools.partial(_list_aim_prompts, project_dir)
     )
     home = str(Path.home())
     for p in prompts:
@@ -237,13 +254,17 @@ async def api_prompts(request: web.Request) -> web.Response:
     return web.json_response(prompts)
 
 
-def _find_prompt(raw_name: str) -> dict[str, Any] | None:
-    """Resolve a prompt by bare name, fullName, or ``package/name``."""
+def _find_prompt(raw_name: str, project_dir=None) -> dict[str, Any] | None:
+    """Resolve a prompt by bare name, fullName, or ``package/name``.
+
+    ``project_dir`` is the caller's already-resolved per-slot local project (or
+    ``None``); it is forwarded to ``_list_aim_prompts`` so a local prompt is only
+    matched against the caller's chat-slot project."""
     pkg_filter = ""
     name = raw_name
     if "/" in raw_name:
         pkg_filter, name = raw_name.split("/", 1)
-    for p in _list_aim_prompts():
+    for p in _list_aim_prompts(project_dir):
         if pkg_filter and p["package"] != pkg_filter:
             continue
         if p["name"] == name or p["fullName"] == name:
@@ -270,8 +291,18 @@ async def api_prompt_detail(request: web.Request) -> web.Response:
         return await _api_user_prompt_detail(request, raw, scope)
     # _find_prompt() → _list_aim_prompts() does an rglob('*.sop.md') walk over the
     # (possibly large / edition-provided) prompt roots on a cold/expired cache;
-    # offload it so a slow FS can't stall the event loop.
-    p = await asyncio.get_running_loop().run_in_executor(discovery_executor(), _find_prompt, raw)
+    # offload it so a slow FS can't stall the event loop. Resolve the per-slot
+    # local project on the loop first and capture it into the executor job so a
+    # bare (unscoped) local prompt resolves against the caller's chat slot. Use
+    # requesting_slot_project (THIS slot only) so an unscoped detail lookup
+    # matches what an @mention in the same chat resolves — the chat surface reads
+    # slot.project directly, with no cross-slot fallback.
+    state: DashboardState = request.app["state"]
+    session_key = _read_session_key(request)
+    project_dir = requesting_slot_project(state, session_key)
+    p = await asyncio.get_running_loop().run_in_executor(
+        discovery_executor(), functools.partial(_find_prompt, raw, project_dir)
+    )
     if not p:
         _sel().log_tool_invocation(
             session_key="",
@@ -457,28 +488,35 @@ def _invalidate_prompt_cache() -> None:
     _pkg._invalidate_prompt_cache()
 
 
-def _resolve_prompt_dir(scope: str) -> tuple[Path | None, str | None]:
+def _resolve_prompt_dir(scope: str, project_dir: Path | None) -> tuple[Path | None, str | None]:
     """Resolve and validate the prompt directory for *scope*, OFF the loop.
 
     Returns ``(dir, None)`` or ``(None, error_code)``.
 
-    Both halves touch the filesystem: resolving "local" reads the active
-    project, and the link check ``lstat``s the directory. On a network-mounted
-    home or project that is a multi-second stall, so every caller runs this
-    inside its own executor job rather than on the event loop — the gateway
-    serves other requests and the heartbeat keeps ticking meanwhile.
+    ``project_dir`` is the caller's per-slot local project (or ``None``),
+    resolved on the event loop via ``requesting_slot_project(state, session_key)``
+    and passed in — this executor job no longer reads the gateway-global
+    project itself, so create and list agree on where "local" is for the SAME
+    chat slot. A ``None`` project for a "local" scope yields
+    ``no_active_project`` exactly as the gateway-global resolver did before.
+
+    The remaining half still touches the filesystem: the link check ``lstat``s
+    the directory. On a network-mounted home or project that is a multi-second
+    stall, so every caller runs this inside its own executor job rather than on
+    the event loop — the gateway serves other requests and the heartbeat keeps
+    ticking meanwhile.
     """
-    d = _user_prompt_dir(scope)
+    d = _user_prompt_dir(scope, project_dir)
     if d is None:
         return None, "no_active_project"
     if _linked_prompt_root(d):
         return None, "linked_prompt_root"
-    if scope == "local" and not _local_prompt_dir_in_project(d):
+    if scope == "local" and not _local_prompt_dir_in_project(d, project_dir):
         return None, "linked_prompt_root"
     return d, None
 
 
-def _local_prompt_dir_in_project(d: Path) -> bool:
+def _local_prompt_dir_in_project(d: Path, project_dir: Path | None) -> bool:
     """True when the local prompt dir RESOLVES inside the resolved project root.
 
     The leaf-only rule in ``_linked_prompt_root`` tolerates ancestor links
@@ -488,8 +526,11 @@ def _local_prompt_dir_in_project(d: Path) -> bool:
     and deletes into the global prompt tree. Comparing resolved-to-resolved
     keeps legitimately-linked project roots working while refusing any chain
     that leaves the project.
+
+    ``project_dir`` is the caller's per-slot local project (or ``None``),
+    supplied by the caller rather than read from the gateway-global resolver.
     """
-    proj = _agent._project_dir()
+    proj = project_dir
     if not proj:
         return False
     try:
@@ -498,19 +539,24 @@ def _local_prompt_dir_in_project(d: Path) -> bool:
         return False
 
 
-def _user_prompt_dir(scope: str) -> Path | None:
+def _user_prompt_dir(scope: str, project_dir: Path | None) -> Path | None:
     """Resolve the user prompt directory for *scope*.
 
-    Deliberately the same resolver ``_list_aim_prompts`` uses (the
-    gateway-global project dir): create and list must agree on where "local"
-    is, or a created prompt would never appear in the listing. Moving both
-    sides to per-chat-slot project resolution is a coordinated change to both.
+    "local" now resolves against the *per-slot* project supplied by the
+    caller (``project_dir``), resolved on the event loop via
+    ``requesting_slot_project(state, session_key)`` — the SAME narrow question
+    (THIS chat slot, no cross-slot fallback) the chat ``@mention`` surface asks
+    via ``slot.project``. ``_list_aim_prompts`` is passed the SAME resolved
+    project, so create and list still agree on where "local"
+    is for a given chat slot — a created local prompt appears in that slot's
+    listing and no other's. A request with no slot context resolves "local" to
+    ``None`` (the same value the old gateway-global resolver returned when there
+    was no project), which flows into the existing ``no_active_project``
+    contract.
     """
     if scope == "global":
         return Path.home() / ".kiro" / "prompts"
-    # Called through the module rather than imported by name so that patching
-    # ``kiro_crew.agent._project_dir`` (as the tests do) is still observed here.
-    proj = _agent._project_dir()
+    proj = project_dir
     return proj / ".kiro" / "prompts" if proj else None
 
 
@@ -695,8 +741,19 @@ async def api_prompts_create(request: web.Request) -> web.Response:
             {"error": "prompt name is too long", "code": "name_too_long"}, status=400
         )
 
+    # Resolve the per-slot local project on the event loop (requesting_slot_project
+    # just reads state._slots, non-blocking) and capture it into the executor
+    # closure below, so a "local" create targets the caller's chat-slot project
+    # — the SAME project the lister resolves — rather than a gateway-global dir.
+    # requesting_slot_project (THIS slot, no cross-slot fallback) is the seam
+    # every prompt surface shares, so create/list/read/write and the chat
+    # @mention all agree on where "local" is (#7345 invariant).
+    state: DashboardState = request.app["state"]
+    session_key = _read_session_key(request)
+    project_dir = requesting_slot_project(state, session_key)
+
     def _write() -> str | None:
-        target_dir, err = _resolve_prompt_dir(scope)
+        target_dir, err = _resolve_prompt_dir(scope, project_dir)
         if target_dir is None:
             return err
         filename = f"{safe_name}.md"
@@ -858,11 +915,20 @@ async def _api_user_prompt_detail(request: web.Request, name: str, scope: str) -
             {"error": "invalid prompt name", "code": "invalid_name"}, status=400
         )
 
+    # Resolve the per-slot local project on the loop and close over it so a
+    # scoped "local" read addresses the caller's chat-slot project — the SAME
+    # project create/list use — instead of a gateway-global dir. Use
+    # requesting_slot_project (THIS slot only) so it agrees with the lister and
+    # the chat @mention surface, not active_project_dir's cross-slot fallback.
+    state: DashboardState = request.app["state"]
+    session_key = _read_session_key(request)
+    project_dir = requesting_slot_project(state, session_key)
+
     def _read() -> tuple[str | None, str, str | None, str, bool, str]:
         # Directory resolution, the link check, and description extraction all
         # touch the filesystem, so they share this one executor job rather than
         # running on the loop.
-        target_dir, derr = _resolve_prompt_dir(scope)
+        target_dir, derr = _resolve_prompt_dir(scope, project_dir)
         if target_dir is None:
             return None, "", derr, "", False, ""
         target = target_dir / f"{name}.md"
@@ -1025,6 +1091,15 @@ async def _api_prompt_write(request: web.Request) -> web.Response:
             {"error": "invalid prompt name", "code": "invalid_name"}, status=400
         )
 
+    # Resolve the per-slot local project on the loop and close over it in
+    # _apply_locked so a "local" update/delete addresses the caller's chat-slot
+    # project — the SAME project create/list use — not a gateway-global dir. Use
+    # requesting_slot_project (THIS slot only) so it agrees with the lister and
+    # the chat @mention surface, not active_project_dir's cross-slot fallback.
+    state: DashboardState = request.app["state"]
+    session_key = _read_session_key(request)
+    project_dir = requesting_slot_project(state, session_key)
+
     content: str | None = None
     base_hash: str | None = None
     if request.method == "PUT":
@@ -1089,7 +1164,7 @@ async def _api_prompt_write(request: web.Request) -> web.Response:
             return _apply_locked()
 
     def _apply_locked() -> str | None:
-        target_dir, derr = _resolve_prompt_dir(scope)
+        target_dir, derr = _resolve_prompt_dir(scope, project_dir)
         if target_dir is None:
             return derr
         target = target_dir / f"{name}.md"
