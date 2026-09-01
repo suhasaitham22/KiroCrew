@@ -388,3 +388,70 @@ class TestDefaultsJsonPushRegexes:
     def test_stash_push_not_blocked(self) -> None:
         assert not self._blocked("git stash pus" + "h --all")
         assert not self._blocked("git stash pus" + "h")
+
+
+class TestEveryGatedTagNamesARealCatalogRule:
+    """A gated tag naming no catalog rule is a SILENT ALLOW, not a loud error.
+
+    Now that the floor consults the per-rule enabled set, ``is_denied`` resolves
+    each gated tag through ``_GIT_PUBLISH_FLOOR_BY_ID.get(tag)``.  A miss yields
+    ``None`` and the branch ``continue``s — so a protected-branch push is simply
+    not denied, nothing reddens, and the command runs.  A rule rename or a typo
+    in one of the seven ``tags.add("...")`` literals is therefore a
+    push-protection bypass that no behavioural test in this file would catch,
+    because they all exercise commands whose tags currently DO resolve.
+
+    ``test_exfil_gate_opt_out.py`` has the twin guard for the exfiltration
+    branches; this is the git-publish half.
+    """
+
+    # Every literal a gated ``tags.add(...)`` in ``_push_segment_targets_protected``
+    # or ``_git_publish_floor_tags`` can emit.  Written out rather than scraped
+    # from source so that DELETING an emitter is visible here too.
+    GATED_TAGS = (
+        "git-publish-push-mirror-all",
+        "git-publish-push-bare",
+        "git-publish-push-single-arg",
+        "git-publish-push-wildcard-refspec",
+        "git-publish-push-ambiguous-ref",
+        "git-publish-push-protected-ref-path",
+        "git-publish-push-protected-branch-name",
+    )
+
+    def test_every_gated_tag_resolves_to_a_pattern(self) -> None:
+        missing = [t for t in self.GATED_TAGS if t not in security._GIT_PUBLISH_FLOOR_BY_ID]
+        assert not missing, (
+            f"gated git-publish tag(s) naming no catalog rule: {missing}. In is_denied "
+            "these resolve to None and the branch is SKIPPED, so the push is ALLOWED. "
+            "Fix the tag literal or add the catalog rule."
+        )
+
+    def test_every_gated_tag_is_a_real_rule_id(self) -> None:
+        ids = {r.id for r in security.BUILTIN_DENIED_RULES}
+        assert not [t for t in self.GATED_TAGS if t not in ids]
+
+    def test_the_ungated_sentinel_is_unspellable_as_a_rule_id(self) -> None:
+        """If an operator could name the sentinel, disabling that row would turn
+        off the anti-obfuscation branches — the one thing opt-out must not reach."""
+        assert security._GIT_PUBLISH_UNGATED not in self.GATED_TAGS
+        assert security._GIT_PUBLISH_UNGATED not in {r.id for r in security.BUILTIN_DENIED_RULES}
+
+    def test_the_emitter_only_ever_emits_known_tags(self) -> None:
+        """Drive the real function: everything it emits is either a listed gated
+        tag or the ungated sentinel — never a third, unhandled kind."""
+        known = set(self.GATED_TAGS) | {security._GIT_PUBLISH_UNGATED}
+        for cmd in (
+            "git push",
+            "git push origin",
+            "git push --mirror",
+            "git push --all origin",
+            "git push origin main",
+            "git push origin refs/heads/main",
+            "git push origin HEAD",
+            "git push origin @",
+            "git push origin feat/x",
+            "git push origin $(echo main)",
+            "git push origin 'main@{upstream}'",
+        ):
+            emitted = security._git_publish_floor_tags(cmd.lower())
+            assert emitted <= known, f"{cmd!r} emitted unknown tag(s): {emitted - known}"

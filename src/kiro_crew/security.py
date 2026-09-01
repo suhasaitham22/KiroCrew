@@ -326,6 +326,78 @@ BUILTIN_DENIED_RULES: list[DeniedCommandRule] = [
             "path to steal EC2 role credentials."
         ),
     ),
+    # ── Floor-PRIMARY exfil rules ──
+    # Enforcement for these seven is the always-on gate
+    # (``audit_bash_exfiltration`` / ``_check_imds_access``), not the regex tier:
+    # the gate sees flag spellings and IP encodings no single human-auditable
+    # regex can cover. Each ``pattern`` below is a readable SUBSET that exists so
+    # the rule has a catalog identity — an id to switch off, a row in Settings, and
+    # a ``rule_id`` in the SEL trail. Same shape as
+    # ``credential-exfil-kirocrew-token``.
+    DeniedCommandRule(
+        id="credential-exfil-imds-any",
+        pattern=".*169\\.254\\.169\\.254.*",
+        category="credential-exfil",
+        description=(
+            "Blocks reaching the instance metadata service by ANY verb and ANY IP encoding "
+            "(decimal, hex, octal, IPv6-mapped, and the fd00:ec2::254 endpoint) — the "
+            "curl/wget rules above only cover those two verbs and the literal dotted quad."
+        ),
+    ),
+    DeniedCommandRule(
+        id="data-exfil-curl-file-body",
+        pattern=".*curl.*--?data(-binary|-ascii|-urlencode)?[= ]@.*",
+        category="credential-exfil",
+        description=(
+            "Blocks a `curl` request whose body is read from a LOCAL FILE (`-d @file` and every "
+            "--data variant), the tell-tale shape of pushing local data out to a remote."
+        ),
+    ),
+    DeniedCommandRule(
+        id="data-exfil-curl-multipart-upload",
+        pattern=".*curl.*(-F|--form)\\s*\\S*=@.*",
+        category="credential-exfil",
+        description=(
+            "Blocks a `curl` multipart upload that attaches a local file (`-F field=@file`), "
+            "for any field name."
+        ),
+    ),
+    DeniedCommandRule(
+        id="data-exfil-curl-upload",
+        pattern=".*curl.*(--upload-file|(^|\\s)-T\\s*\\S).*",
+        category="credential-exfil",
+        description=(
+            "Blocks a `curl` file upload (`--upload-file` / `-T file`), which sends a local file "
+            "to a remote endpoint."
+        ),
+    ),
+    DeniedCommandRule(
+        id="data-exfil-wget-post-file",
+        pattern=".*wget.*--post-file.*",
+        category="credential-exfil",
+        description=(
+            "Blocks `wget --post-file`, which posts the contents of a local file to a remote "
+            "endpoint."
+        ),
+    ),
+    DeniedCommandRule(
+        id="data-exfil-nc-file-redirect",
+        pattern=".*(^|\\s)nc(at)?\\s+\\S.*<.*",
+        category="credential-exfil",
+        description=(
+            "Blocks piping a local file into `nc`/`ncat` via input redirection, a plain-socket "
+            "way to ship data off the host."
+        ),
+    ),
+    DeniedCommandRule(
+        id="reverse-shell-devtcp",
+        pattern=".*/dev/(tcp|udp)/.*",
+        category="reverse-shell",
+        description=(
+            "Blocks bash's /dev/tcp and /dev/udp pseudo-devices, which open a raw socket to a "
+            "remote host without any external tool — the classic dependency-free reverse shell."
+        ),
+    ),
     DeniedCommandRule(
         id="credential-exfil-curl-aws-secret",
         pattern=".*curl.*\\$AWS_SECRET.*",
@@ -954,6 +1026,16 @@ BUILTIN_DENIED_RULES: list[DeniedCommandRule] = [
         ),
     ),
     DeniedCommandRule(
+        id="git-publish-push-ambiguous-ref",
+        pattern=".*git\\s+(-\\S+\\s+[^-]\\S*\\s+|-\\S+\\s+)*push\\s+.*[\\s:]\\+?(head|@|fetch_head)(\\s.*|$)",
+        category="git-publish",
+        description=(
+            "Blocks 'git push' whose destination is a symbolic ref that resolves at run time "
+            "(HEAD, @, FETCH_HEAD) — if the checked-out branch is a protected one, this "
+            "publishes to it, and the target cannot be verified before the push runs."
+        ),
+    ),
+    DeniedCommandRule(
         id="git-publish-push-protected-branch-name",
         pattern=".*git\\s+(-\\S+\\s+[^-]\\S*\\s+|-\\S+\\s+)*push\\s+.*[\\s:]\\+?(main|mainline|master)(\\s.*|$)",  # wokeignore:rule=master
         category="git-publish",
@@ -1579,10 +1661,67 @@ _GIT_PUBLISH_RULES: tuple[DeniedCommandRule, ...] = tuple(
 )
 _GIT_PUBLISH_RULE_PATTERNS: frozenset[str] = frozenset(r.pattern for r in _GIT_PUBLISH_RULES)
 
+# Tag returned by ``_git_publish_floor_tags`` for the anti-obfuscation branches
+# (substitution glue, unparseable push, no clean push segment). Deliberately not
+# a rule id: these are what make the gated rules non-bypassable, so no opt-out
+# may reach them. The leading NUL-ish sentinel shape cannot collide with a slug.
+_GIT_PUBLISH_UNGATED = "\x00git-publish-unverifiable"
+
+# ``id -> pattern`` for the git-publish rules, so a floor denial can report the
+# rule's own pattern (as the regex tier does) instead of an opaque label. Before
+# this, a git-publish denial reported the human string "git push" and mapped back
+# to NO rule id in the SEL audit trail.
+_GIT_PUBLISH_FLOOR_BY_ID: dict[str, str] = {r.id: r.pattern for r in _GIT_PUBLISH_RULES}
+
+# Why a git-publish floor denial happened, in words. Same role as
+# ``_SELF_PROTECTION_FLOOR_NOTES``: the floor routinely fires on input the
+# catalog pattern does NOT literally match, because these patterns are kept out
+# of ``re`` entirely (ReDoS) and the verb-anchored floor is the only enforcement.
+# Presentation-only SECOND line — ``RecoveryCard.tsx`` parses the pattern from
+# the first line with a per-line end-anchored regex.
+_GIT_PUBLISH_FLOOR_NOTES: dict[str, str] = {
+    "git-publish-push-bare": (
+        "Matched structurally on the parsed push arguments, not by the pattern text above: "
+        "the push names no branch, so it publishes whatever branch is checked out."
+    ),
+    "git-publish-push-single-arg": (
+        "Matched structurally on the parsed push arguments, not by the pattern text above: "
+        "the push names a remote but no branch, so it publishes to the configured upstream."
+    ),
+    "git-publish-push-protected-branch-name": (
+        "Matched structurally on the parsed push arguments, not by the pattern text above: "
+        "a refspec resolves to a protected branch after shell quoting is collapsed."
+    ),
+    "git-publish-push-protected-ref-path": (
+        "Matched structurally on the parsed push arguments, not by the pattern text above: "
+        "a refs/heads, heads/ or remotes/ ref path resolves to a protected branch."
+    ),
+    "git-publish-push-wildcard-refspec": (
+        "Matched structurally on the parsed push arguments, not by the pattern text above: "
+        "a wildcard refspec expands to many refs, which can include a protected branch."
+    ),
+    "git-publish-push-mirror-all": (
+        "Matched structurally on the parsed push arguments, not by the pattern text above: "
+        "--mirror/--all push every local ref regardless of any explicit refspec."
+    ),
+    "git-publish-push-ambiguous-ref": (
+        "Matched structurally on the parsed push arguments, not by the pattern text above: "
+        "the destination is a symbolic ref that only resolves when the push runs."
+    ),
+}
+
+# The one git-publish rule whose coverage is an UNGATED branch: brace expansion
+# is caught by ``_AMBIGUOUS_EXPANSION_RE`` inside the unverifiable-glue check, so
+# disabling this row would change nothing and the Settings surface must keep
+# rendering it locked (see ``floor_enforced_builtin_command_ids``).
+_GIT_PUBLISH_UNGATED_RULE_IDS: frozenset[str] = frozenset(
+    {"git-publish-push-brace-expansion-refspec"}
+)
+
 # Catalog rules whose ENFORCEMENT is an always-on floor rather than the
 # configurable regex tier.  Derived from the category (never a hand-maintained
 # id list) so a future git-publish rule is covered automatically.
-_FLOOR_ENFORCED_RULE_IDS: frozenset[str] = frozenset(r.id for r in _GIT_PUBLISH_RULES)
+_FLOOR_ENFORCED_RULE_IDS: frozenset[str] = _GIT_PUBLISH_UNGATED_RULE_IDS
 
 
 def floor_enforced_builtin_command_ids() -> frozenset[str]:
@@ -1729,6 +1868,25 @@ def compute_effective_denied(
     return list(dict.fromkeys(out))
 
 
+def enabled_rule_ids(denied_regexes: "list[str] | None") -> "frozenset[str] | None":
+    """Resolve an effective REGEX list to the set of enabled built-in rule ids.
+
+    The always-on gates (``audit_bash_exfiltration``, ``_check_imds_access``,
+    ``is_sensitive_path_for_agent``) are keyed by rule id, while the hooks gate
+    holds the effective set as patterns. This is the one translation, done once
+    per tool call.
+
+    ``None`` in, ``None`` out — and ``None`` means "all enabled" to every consumer,
+    so the fail-closed default survives the round trip. A pattern with no catalog
+    id (a user-added regex) contributes nothing, which is correct: those rules have
+    no always-on branch to gate.
+    """
+    if denied_regexes is None:
+        return None
+    ids = {_RULE_ID_BY_PATTERN.get(p) for p in denied_regexes}
+    return frozenset(rid for rid in ids if rid is not None)
+
+
 def builtin_denied_rules() -> list[dict]:
     """Return the built-in rule catalog as plain dicts for API serialization.
 
@@ -1744,6 +1902,85 @@ def builtin_denied_rules() -> list[dict]:
         }
         for r in BUILTIN_DENIED_RULES
     ]
+
+
+def edition_denied_rules() -> list[DeniedCommandRule]:
+    """Denied-command rules contributed by the composed edition, validated.
+
+    Reads ``current_context().denied_rules.denied_rules()`` (the
+    ``DeniedRuleProvider`` seam) and returns only entries safe to union into the
+    DISABLEABLE regex tier.  Unlike the ``SecurityOverlay`` floor these rules ARE
+    user-disableable — the whole point of the seam — so they are resolved by
+    ``compute_effective_denied`` exactly like a built-in and honour
+    ``disabled_ids`` / ``disable_all``.
+
+    Rejected (skipped with a warning, never raised):
+
+    * a non-:class:`DeniedCommandRule` entry, or one with a blank ``id`` /
+      ``pattern`` — there would be nothing to key an opt-out on;
+    * an ``id`` colliding with a BUILT-IN rule id — ``disabled_ids`` is one flat
+      set, so a collision would make one rule's toggle silently move the other.
+      The built-in wins, mirroring the ADD-only de-dupe the skill-discovery seam
+      uses for provider names;
+    * a duplicate ``id`` within the edition's own list (first occurrence wins).
+
+    Fail-soft: an ungoverned/standalone host, a provider that does not implement the
+    protocol, or one that raises all yield ``[]`` — the built-in catalog stands on
+    its own and the un-weakenable overlay floor is untouched either way, so
+    degrading here loses only an additive rule.  ``PlatformCompositionError``
+    still propagates fail-closed, as everywhere else in this module.
+    """
+    from kiro_crew.platform.context import PlatformCompositionError, current_context
+
+    try:
+        ctx = current_context()
+        contributed = list(ctx.denied_rules.denied_rules())
+    except PlatformCompositionError:
+        raise
+    except Exception:
+        logger.debug("edition denied_rules lookup failed; using built-ins only", exc_info=True)
+        return []
+
+    out: list[DeniedCommandRule] = []
+    seen: set[str] = set()
+    for rule in contributed:
+        rid = getattr(rule, "id", None)
+        pattern = getattr(rule, "pattern", None)
+        if not isinstance(rid, str) or not rid.strip():
+            logger.warning("edition denied rule with no id skipped")
+            continue
+        if not isinstance(pattern, str) or not pattern.strip():
+            logger.warning("edition denied rule %s has no pattern; skipped", rid)
+            continue
+        if rid in _RULES_BY_ID:
+            logger.warning(
+                "edition denied rule %s collides with a built-in rule id; built-in wins", rid
+            )
+            continue
+        if rid in seen:
+            logger.warning("edition denied rule %s is a duplicate; first occurrence wins", rid)
+            continue
+        if not is_safe_user_regex(pattern):
+            # The matcher DISABLES a malformed or ReDoS-prone pattern and only logs
+            # (see ``_DeniedMatcher.__init__``). Publishing it anyway would put a
+            # row in Settings → Security that reads enabled and toggles cleanly
+            # while matching nothing — a control that looks present and is not,
+            # which is the exact failure this seam exists to remove. Skip it so the
+            # panel's enabled set and the matcher's cannot disagree.
+            logger.warning(
+                "edition denied rule %s has an unsafe or malformed pattern; skipped", rid
+            )
+            continue
+        seen.add(rid)
+        out.append(
+            DeniedCommandRule(
+                id=rid,
+                pattern=pattern,
+                category=str(getattr(rule, "category", "") or "edition"),
+                description=str(getattr(rule, "description", "") or ""),
+            )
+        )
+    return out
 
 
 def pinned_builtin_command_ids() -> set[str]:
@@ -5056,11 +5293,6 @@ def _git_push_args(segment: str) -> list[str] | None:
     return None
 
 
-def _is_protected_branch_name(name: str) -> bool:
-    """Return True if *name* is a protected branch or an ambiguous ref."""
-    return name in _PROTECTED_BRANCHES or name in _AMBIGUOUS_REFS
-
-
 def _normalize_ref(ref: str) -> str:
     """Reduce a push destination ref to the bare branch name git resolves it to.
 
@@ -5080,51 +5312,130 @@ def _normalize_ref(ref: str) -> str:
     return ref.removeprefix("heads/")
 
 
-def _push_segment_targets_protected(arg_tokens: list[str]) -> bool:
-    """Return True if a single push's argument tokens target protected/bare.
+def _push_segment_targets_protected(arg_tokens: list[str]) -> frozenset[str]:
+    """Return the git-publish rule tags a single push's argument tokens trip.
 
     *arg_tokens* are the tokens following the ``push`` subcommand within ONE
-    shell segment (separators already removed).  A bare push (no explicit
-    branch) is treated as protected because the current branch might be a
-    protected one.  Force flags (``--force``/``-f``/``--force-with-lease``)
-    do NOT by themselves make a feature-branch push protected — force-push to
-    a feature branch is a normal PR/rebase workflow — but a force-push to a
-    protected branch is still blocked, because the target check below fires
-    regardless of any flags (force flags are stripped before the check).
+    shell segment (separators already removed).  An EMPTY result means this
+    segment is an explicit feature-branch push and is allowed.
+
+    Each returned tag is either a ``git-publish`` catalog rule id (the caller
+    denies only while that rule is still enabled, so an operator opt-out is
+    honoured) or :data:`_GIT_PUBLISH_UNGATED` for the anti-obfuscation branches,
+    which are NOT opt-out-able: they are what makes the gated tags
+    non-bypassable, since a refspec the shell fuses together cannot be checked
+    against a branch name at all.
+
+    ALL refspecs are collected rather than short-circuiting on the first hit: a
+    refspec that trips a DISABLED rule must not allow the push when a sibling
+    refspec trips an enabled one.
+
+    A bare push (no explicit branch) is reported because the current branch
+    might be a protected one.  Force flags (``--force``/``-f``/
+    ``--force-with-lease``) do NOT by themselves make a feature-branch push
+    protected — force-push to a feature branch is a normal PR/rebase workflow —
+    but a force-push to a protected branch is still reported, because the target
+    check below fires regardless of any flags (force flags are stripped first).
     """
+    tags: set[str] = set()
     tokens = [_dequote_token(t) for t in arg_tokens]
-    # Deny-by-default: flags that push ALL local branches (protected ones
-    # included) bypass any per-branch target check. Detect them BEFORE
-    # stripping flags and deny outright, so the always-on gate never relies on
-    # the secondary regex layer for this case.
+    # Flags that push ALL local branches (protected ones included) bypass any
+    # per-branch target check.  Detected BEFORE stripping flags.
     if any(tok in _PUSH_ALL_BRANCHES_FLAGS for tok in tokens):
-        return True
+        tags.add("git-publish-push-mirror-all")
     # Skip flags (tokens starting with -); non_flags[0] is the remote and
     # non_flags[1:] are the refspecs/branches.
     non_flags = [t for t in tokens if t and not t.startswith("-")]
     if len(non_flags) < 2:
         # Bare ``push`` or ``push <remote>`` with no explicit branch — the
-        # current branch might be protected, so deny.
-        return True
+        # current branch might be protected.  The two spellings are separate
+        # catalog rules, so report them separately.
+        tags.add(
+            "git-publish-push-bare" if not non_flags else "git-publish-push-single-arg"
+        )
+        return frozenset(tags)
     for refspec in non_flags[1:]:
         # Refspecs with shell expansion ($, `) or git-revision syntax
-        # (@{upstream}, @{u}) cannot be statically verified — deny.
+        # (@{upstream}, @{u}) cannot be statically verified — never opt-out-able.
         if _AMBIGUOUS_REFSPEC_RE.search(refspec):
-            return True
+            tags.add(_GIT_PUBLISH_UNGATED)
+            continue
         clean = refspec.lstrip("+")  # strip force-push '+' ref prefix
         # Wildcard refspec (refs/heads/*:refs/heads/*, *:*, feat*) expands to
         # MANY refs — like --mirror/--all it can include a protected branch and
-        # cannot be statically verified. Deny.
+        # cannot be statically verified.
         if "*" in clean:
-            return True
+            tags.add("git-publish-push-wildcard-refspec")
+            continue
         # Handle "local:remote" refspec format — the remote side is the target.
         target_branch = clean.split(":")[-1] if ":" in clean else clean
         # Normalize every ref spelling git resolves server-side (heads/main,
         # remotes/<remote>/main, refs/... ) to the bare name so the path form
         # cannot dodge the protected-name check.
-        if _is_protected_branch_name(_normalize_ref(target_branch)):
-            return True
-    return False
+        normalized = _normalize_ref(target_branch)
+        if normalized in _AMBIGUOUS_REFS:
+            tags.add("git-publish-push-ambiguous-ref")
+        elif normalized in _PROTECTED_BRANCHES:
+            # Distinguish the bare-name spelling from the ref-PATH spelling:
+            # they are separate catalog rules, and reporting the wrong one would
+            # let an operator disable a row that is not what fired.
+            tags.add(
+                "git-publish-push-protected-ref-path"
+                if normalized != target_branch
+                else "git-publish-push-protected-branch-name"
+            )
+    return frozenset(tags)
+
+
+def _git_publish_floor_tags(text_lower: str) -> frozenset[str]:
+    """Return the git-publish rule tags a command trips, EMPTY if it is allowed.
+
+    Same analysis as :func:`_is_push_to_protected_branch` (which is now a thin
+    boolean view of this), but it reports WHICH rule each denial belongs to so
+    the enforcement site can honour an operator opt-out per rule. A tag is
+    either a ``git-publish`` catalog rule id or :data:`_GIT_PUBLISH_UNGATED`.
+
+    Three branches emit the ungated tag, deliberately: substitution / expansion
+    glue in a push command, a segment detected as a push that does not parse
+    cleanly, and a push detected on the whole string with no clean push segment
+    surviving the split. None of them is a user-facing rule — they are the
+    anti-obfuscation backstop, and gating them would let ``git push origin
+    ma$(echo)in`` be allowed by disabling ONE row, defeating the protected-branch
+    rule without disabling it.
+
+    Iterates the command's TRUE shell segments (split only on ``;`` / ``&&`` /
+    ``||`` / ``|`` / newline — NOT on ``$(`` / backtick, which are glued into a
+    single word by the shell), and collects across ALL of them: a benign feature
+    push cannot vouch for a sibling protected one.
+    """
+    tags: set[str] = set()
+    saw_push = False
+    for command in _CMD_SEPARATOR_RE.split(text_lower):
+        # ``_is_git_publish`` (not ``_git_push_args``) gates the checks so that
+        # glue-evasion forms — which do NOT tokenize to a clean ``git`` token —
+        # are still recognized as pushes and cannot slip past the ambiguity /
+        # fail-closed guards below.
+        if not _is_git_publish(command):
+            continue
+        saw_push = True
+        # Substitution / expansion glue anywhere in a push command makes it
+        # unverifiable (the shell fuses it into the verb or the target word).
+        # This is also what covers brace expansion, which is why
+        # ``git-publish-push-brace-expansion-refspec`` stays floor-enforced.
+        if _AMBIGUOUS_EXPANSION_RE.search(command):
+            tags.add(_GIT_PUBLISH_UNGATED)
+            continue
+        args = _git_push_args(command)
+        if args is None:
+            # Detected as a push but not cleanly parseable (obfuscated).
+            tags.add(_GIT_PUBLISH_UNGATED)
+            continue
+        tags |= _push_segment_targets_protected(args)
+    if not saw_push:
+        # A push was detected upstream (e.g. glue-evasion ``git_push``) but no
+        # clean ``push`` segment survived splitting — deny to be safe.
+        tags.add(_GIT_PUBLISH_UNGATED)
+    return frozenset(tags)
 
 
 def _is_push_to_protected_branch(text_lower: str) -> bool:
@@ -5155,31 +5466,13 @@ def _is_push_to_protected_branch(text_lower: str) -> bool:
     is checked (a benign feature push cannot vouch for a sibling protected one).
     Force pushes to feature branches stay allowed (normal PR workflow). If a
     push was detected upstream but no segment here parses as one, denies.
+
+    FLOOR SEMANTICS: this ignores opt-out state, so it answers "would the floor
+    deny this at all". Enforcement in :func:`is_denied` uses
+    :func:`_git_publish_floor_tags` instead, which reports WHICH rule fired so a
+    disabled rule stays disabled.
     """
-    saw_push = False
-    for command in _CMD_SEPARATOR_RE.split(text_lower):
-        # ``_is_git_publish`` (not ``_git_push_args``) gates the checks so that
-        # glue-evasion forms — which do NOT tokenize to a clean ``git`` token —
-        # are still recognized as pushes and cannot slip past the ambiguity /
-        # fail-closed guards below.
-        if not _is_git_publish(command):
-            continue
-        saw_push = True
-        # Substitution / expansion glue anywhere in a push command makes it
-        # unverifiable (the shell fuses it into the verb or the target word).
-        if _AMBIGUOUS_EXPANSION_RE.search(command):
-            return True
-        args = _git_push_args(command)
-        if args is None:
-            # Detected as a push but not cleanly parseable (obfuscated) — deny.
-            return True
-        if _push_segment_targets_protected(args):
-            return True
-    if not saw_push:
-        # A push was detected upstream (e.g. glue-evasion ``git_push``) but no
-        # clean ``push`` segment survived splitting — deny to be safe.
-        return True
-    return False
+    return bool(_git_publish_floor_tags(text_lower))
 
 
 def _schedule_push_allow_audit(command: str) -> None:
@@ -7363,7 +7656,9 @@ def _separator_collapsed_variants(command: str) -> tuple[str, ...]:
     return tuple(variants)
 
 
-def is_sensitive_bash_command(command: str) -> str | None:
+def is_sensitive_bash_command(
+    command: str, *, enabled_ids: "frozenset[str] | None" = None
+) -> str | None:
     """Check if a bash command reads sensitive paths, accesses IMDS, or leaks env creds.
 
     Uses a two-pass approach:
@@ -7426,7 +7721,7 @@ def is_sensitive_bash_command(command: str) -> str | None:
         return native_result
 
     # IMDS access via any IP encoding (decimal, hex, octal, IPv6-mapped)
-    imds_result = _check_imds_access(command)
+    imds_result = _check_imds_access(command, enabled_ids=enabled_ids)
     if imds_result:
         return imds_result
     # Environment credential exfiltration (declare -p, env|grep, printenv, etc.)
@@ -11725,6 +12020,11 @@ def is_denied(
         regex_patterns = compute_effective_denied(BUILTIN_DENIED_RULES, (), False, (), ())
     else:
         regex_patterns = list(denied_regexes)
+    # Capture which git-publish rules are still ENABLED *before* the strip below
+    # removes their patterns from the regex tier. Computing this afterwards would
+    # always yield the empty set and the floor would never fire — a silent, total
+    # loss of push protection.
+    git_publish_enabled = {p for p in regex_patterns if p in _GIT_PUBLISH_RULE_PATTERNS}
     # Never feed git-publish rule patterns to Python ``re`` — they are ReDoS-prone
     # under backtracking and are already enforced by the ``_is_git_publish`` floor
     # below (see ``_GIT_PUBLISH_RULE_PATTERNS``).
@@ -11782,9 +12082,28 @@ def is_denied(
     # the FINAL outcome (never an allow for a command ultimately denied).
     push_allow_pending = False
     if _is_git_publish(lower):
-        if _is_push_to_protected_branch(lower):
-            _emit_deny_event(tool_name, _GIT_PUBLISH_DENY_LABEL, lower)
-            return _reason(_GIT_PUBLISH_DENY_LABEL)
+        floor_tags = _git_publish_floor_tags(lower)
+        # The ungated tag denies regardless of opt-out: it marks a command whose
+        # target could not be verified at all, which is what keeps the gated
+        # rules below non-bypassable. Report it under the brace-expansion rule,
+        # whose coverage this branch is, so the refusal still names a catalog row.
+        if _GIT_PUBLISH_UNGATED in floor_tags:
+            ungated_pattern = _GIT_PUBLISH_FLOOR_BY_ID.get(
+                "git-publish-push-brace-expansion-refspec", _GIT_PUBLISH_DENY_LABEL
+            )
+            _emit_deny_event(tool_name, ungated_pattern, lower)
+            return _reason(
+                ungated_pattern,
+                "Matched structurally on the command's argv, not by the pattern text above: "
+                "shell substitution or expansion fuses text into the push target, so the "
+                "destination branch cannot be determined before the push runs.",
+            )
+        for tag in sorted(floor_tags):
+            gated_pattern = _GIT_PUBLISH_FLOOR_BY_ID.get(tag)
+            if gated_pattern is None or gated_pattern not in git_publish_enabled:
+                continue
+            _emit_deny_event(tool_name, gated_pattern, lower)
+            return _reason(gated_pattern, _GIT_PUBLISH_FLOOR_NOTES.get(tag, ""))
         push_allow_pending = True
 
     # ── Self-protection floor (argv-structural, not a glob) ──
@@ -12169,16 +12488,63 @@ _BASH_EXFIL_RES: list[tuple[re.Pattern[str], str]] = [
 ]
 
 
-def audit_bash_exfiltration(command: str) -> str | None:
+# Which catalog rule each always-on exfil branch enforces, so a denial maps back
+# to a rule id and an operator opt-out is honoured. Patterns/labels absent from
+# these maps stay unconditional.
+_BASH_EXFIL_RULE_BY_PATTERN: dict[str, str] = {
+    "-d @": "data-exfil-curl-file-body",
+    "-d@": "data-exfil-curl-file-body",
+    "-d=@": "data-exfil-curl-file-body",
+    "--data @": "data-exfil-curl-file-body",
+    "--data=@": "data-exfil-curl-file-body",
+    "--data-binary @": "data-exfil-curl-file-body",
+    "--data-binary=@": "data-exfil-curl-file-body",
+    "--data-ascii @": "data-exfil-curl-file-body",
+    "--data-ascii=@": "data-exfil-curl-file-body",
+    "--data-urlencode @": "data-exfil-curl-file-body",
+    "--data-urlencode=@": "data-exfil-curl-file-body",
+    "-F *=@": "data-exfil-curl-multipart-upload",
+    "--form *=@": "data-exfil-curl-multipart-upload",
+    "--upload-file": "data-exfil-curl-upload",
+    "wget --post-file": "data-exfil-wget-post-file",
+    "/dev/tcp/": "reverse-shell-devtcp",
+    "/dev/udp/": "reverse-shell-devtcp",
+}
+
+# A single regex can span more than one catalog row, so this maps to a TUPLE and
+# the gate denies while ANY of them is still enabled.
+_BASH_EXFIL_RULE_BY_LABEL: dict[str, tuple[str, ...]] = {
+    "nc/ncat file redirect": ("data-exfil-nc-file-redirect",),
+    "nc/ncat reverse shell": ("reverse-shell-nc", "reverse-shell-ncat"),
+    "curl -T upload": ("data-exfil-curl-upload",),
+}
+
+
+def audit_bash_exfiltration(
+    command: str, *, enabled_ids: "frozenset[str] | None" = None
+) -> str | None:
     """Return a denial reason if *command* matches a data-egress / reverse-shell
     shape that must be blocked at the tool-invocation gate, else None.
 
     Scoped to _BASH_EXFIL_PATTERNS / _BASH_EXFIL_RES (exfil/reverse-shell only) so
     it can be wired into the deny path in ``hooks.on_tool_call`` without blocking
     benign local commands. The broader :func:`audit_bash_command` stays advisory.
+
+    Every branch carries the id of the catalog rule it enforces, so *enabled_ids*
+    lets the caller honour an operator opt-out: a branch whose rule the operator
+    disabled is skipped. ``None`` (the default) means ALL enabled — fail-closed,
+    which is what keeps the callers that hold no effective set (cron command
+    vetting, computer-use input vetting) at full strength without a change.
     """
     lower = command.lower()
+
+    def _on(rule_id: str) -> bool:
+        return enabled_ids is None or rule_id in enabled_ids
+
     for pattern in _BASH_EXFIL_PATTERNS:
+        rule_id = _BASH_EXFIL_RULE_BY_PATTERN.get(pattern, "")
+        if rule_id and not _on(rule_id):
+            continue
         pat = pattern.lower()
         if "*" in pat:
             if fnmatch.fnmatch(lower, f"*{pat}*"):
@@ -12186,6 +12552,11 @@ def audit_bash_exfiltration(command: str) -> str | None:
         elif pat in lower:
             return f"Blocked: command matches data-exfiltration pattern '{pattern}'"
     for rx, label in _BASH_EXFIL_RES:
+        rule_ids = _BASH_EXFIL_RULE_BY_LABEL.get(label, ())
+        # A label can span more than one catalog row (one regex covers both the
+        # nc and ncat rules); deny while EITHER is enabled.
+        if rule_ids and not any(_on(rid) for rid in rule_ids):
+            continue
         if rx.search(command):
             return f"Blocked: command matches data-exfiltration pattern ({label})"
     return None
@@ -12841,11 +13212,21 @@ _IMDS_IP = "169.254.169.254"
 _IMDS_IPV6 = "fd00:ec2::254"
 
 
-def _check_imds_access(command: str) -> str | None:
+def _check_imds_access(
+    command: str, *, enabled_ids: "frozenset[str] | None" = None
+) -> str | None:
     """Detect attempts to access the IMDS endpoint via any encoding.
 
     Returns denial reason if IMDS access detected, None otherwise.
+
+    Enforces ``credential-exfil-imds-any``, so *enabled_ids* lets the caller
+    honour an operator opt-out of that rule. The two curl/wget IMDS rows are
+    deliberately NOT consulted: they are verb-anchored and match only the literal
+    dotted quad, so gating on them would silently narrow this check from "any verb,
+    any encoding" to "curl or wget, literal IP". ``None`` means all enabled.
     """
+    if enabled_ids is not None and "credential-exfil-imds-any" not in enabled_ids:
+        return None
     # Quick reject: no IP-like candidate in command
     candidates = _IP_CANDIDATE_RE.findall(command)
     if not candidates:
