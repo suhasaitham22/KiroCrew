@@ -458,6 +458,77 @@ compaction cooldown clears it too (`reset`, `remove`,
 `close_all`), because slot keys ARE reused and a leaked flag would starve the
 NEXT holder of that key of its re-anchor.
 
+Slot-key reuse is also why the dashboard close/teardown path re-checks identity
+after it pops the slot. Both `close_slot` (shared by `api_chat_slot_delete` and
+session-control's `close_target`) and `api_chat_slots_cleanup` pop `name` out of
+`state._slots` and then run several AWAITS — cancel the task,
+`save_slot_off_loop(..., closed=True)`, `sessions.remove(_history_key_for(name))`.
+Across that window a concurrent same-key recreate (a `POST /api/chat`, or the
+`session_close` MCP verb) can mint a REPLACEMENT slot under the same key, reusing
+the same history key and the same session. Because both sites still hold the
+popped object (`slot` / `removed`), `_slot_still_ours(state, name, <popped>)` is a
+synchronous, race-free discriminator. It asks whether a DIFFERENT object now owns
+the key — an absent key is the ordinary post-pop state of every close, so `None`
+counts as still ours; reading it as "our object owns the key" would make the guard
+fire on every close and skip the very teardown it guards. It is evaluated BEFORE
+the closed=True save and again BEFORE `sessions.remove` at both sites, and when a
+replacement now owns the key the destructive save and the `sessions.remove` are
+SKIPPED so the close neither writes the original's transcript over the
+replacement's shared history nor tears down the session the replacement now uses.
+The original was already popped and cancelled, so the close is effectively
+complete for it: `close_slot` RETURNS rather than raising `SlotCloseError`, which
+is what makes both its callers report success, and cleanup takes its `continue`
+without counting the key archived. The failure arms apply the same predicate to
+their restores (`state._slots[name] = slot` / `= removed`): they run only when the
+key is still free or still the popped object, never clobbering a live replacement.
+The `note_slot_closed` tombstone (below) still fires before these awaits for the
+reconcile reader; it is NOT the vehicle for this guard, which is a pure post-pop
+identity re-check confined to the two teardown paths.
+
+What the guard covers is the WIDE window, not the durable write. `save_slot_off_loop`
+reaches its commit through the process-wide default executor, so a recreate can
+still land between the last synchronous check and the in-lock write, leaving
+`closed=True` on a key a live replacement holds. That residual is what an unguarded
+close carries as well, and the row is the same one a plain sequential
+close-then-reopen of a reused key produces: `closed`/`closed_at` are in
+`SLOT_OWNED_META_KEYS`, so the replacement's next full save drops them, and
+`api_chat_slot_resume` compensates a stale flag with an in-lock compare-and-clear
+(`clear_closed(..., only_if_closed_before=...)`). Closing it AT the commit needs an
+ownership predicate evaluated inside `_locked(history_key)` on the write AND on the
+resume's read-then-clear — a durable-metadata contract change rather than a
+loop-side ordering one, so it is deliberately not what these two teardown paths do.
+
+Yielding the key carries two obligations, and both exist because the state a close
+compensates is not all scoped the same way.
+
+- **Key-scoped state moves with the key.** `state._restricted_keys` holds
+  `dashboard:{name}` — a SESSION KEY, not a slot identity — and
+  `_is_restricted_session` tests that set BEFORE it looks at the slot. So every exit
+  of either teardown owes one postcondition, which is what
+  `_resettle_restricted_key(state, name)` IS: the key is marked iff the slot
+  currently AT `name` is restricted, an absent key counting as unrestricted. All six
+  exits go through it rather than through a bare `discard` — the ordinary close
+  (where the key is gone, so the marker drops and the next holder is not starved),
+  and every exit that hands the key to a replacement (where it is re-derived from
+  the REPLACEMENT). Re-derived, never blindly discarded: a replacement that is
+  itself restricted keeps the marker, since dropping it is the fail-OPEN direction.
+  Skipping it on a hand-over gives a persistent replacement an incognito original's
+  403 on every memory, artifact and mcp-apps call for as long as that tab lives.
+- **Slot-scoped compensation is coupled to the restore.** The failure arms owe the
+  ORIGINAL two rollbacks, and both are conditional on the original getting its key
+  back — not on the original merely existing. The nudge loop already is, through
+  `_restore_slot_nudge_loop`'s own `state.get_slot(name) is slot` admission check.
+  `notify_slot_close_undone` is coupled the same way rather than gated on
+  `slot._app` alone: with a replacement on the key there is no tab to put back, so
+  the dismissal DID happen for the original, and resuming the app's worker re-arms
+  an autonomous crew whose `slot_key` its watchdog resolves with a bare
+  `state.get_slot(...)` and no ownership test — handing the auto-approve grant, and
+  then an unbounded nudge clock, to the user-owned replacement. Leaving the pause is
+  the same answer the pre-save guard gives from the identical state, and it is a
+  first-class visible one (a `paused_reason` row with a resume control). The bulk
+  archive has no sibling here: it deliberately never calls `notify_slot_closed`, so
+  it has no app dismissal to take back.
+
 Three properties the route holds, each of which fails silently if broken:
 
 - The key comes from `effective_session_key(slot)`, never a derived
