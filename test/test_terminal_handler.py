@@ -7,6 +7,7 @@ import contextlib
 import json
 import os
 import pathlib
+import shutil
 import threading
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1887,7 +1888,9 @@ class TestApiTerminalWs:
         assert spawn.call_args.kwargs["env"]["SHELL"] == "/bin/zsh"
 
     @pytest.mark.asyncio
-    async def test_bash_spawn_uses_the_post_profile_init_stream(self, monkeypatch):
+    async def test_bash_spawn_is_a_login_shell_with_a_prompt_command_marker(
+        self, monkeypatch,
+    ):
         registry: dict = {}
         req = _make_request(registry=registry, session_id="bash-ready")
         req.query = MagicMock()
@@ -1921,11 +1924,18 @@ class TestApiTerminalWs:
         assert resp is ws
         args = spawn.call_args.args
         assert args[0].replace("\\", "/").endswith("/bin/bash")
-        assert args[1] == "--init-file"
-        assert args[2].startswith("/dev/fd/")
-        assert args[3] == "-i"
-        inherited = spawn.call_args.kwargs["pass_fds"]
-        assert inherited == (int(args[2].rsplit("/", 1)[-1]),)
+        # A real login shell, so `shopt -q login_shell` is true and every
+        # profile stanza guarded on login-ness runs (#5885). The readiness
+        # marker rides an inherited PROMPT_COMMAND instead of an rc file,
+        # which Bash reads only for NON-login shells.
+        assert args[1] == "-l"
+        assert len(args) == 2
+        assert "--init-file" not in args
+        assert "pass_fds" not in spawn.call_args.kwargs
+        child_env = spawn.call_args.kwargs["env"]
+        assert child_env["PROMPT_COMMAND"] == child_env[terminal._READY_HOOK_VAR]
+        assert child_env[terminal._READY_TOKEN_VAR] in child_env["PROMPT_COMMAND"] \
+            or "%s" in child_env["PROMPT_COMMAND"]
 
     @pytest.mark.asyncio
     async def test_windows_conpty_spawn_failure_sends_error(self, monkeypatch):
@@ -2854,6 +2864,261 @@ class TestTerminalWsIntegration:
 
             await terminal._kill_session(registry["sigint-sess"])
 
+    @pytest.mark.skipif(
+        terminal.platform_compat.IS_WINDOWS or not shutil.which("bash"),
+        reason="POSIX login-shell semantics; needs a real bash on PATH",
+    )
+    @pytest.mark.asyncio
+    async def test_ws_bash_runs_a_login_guarded_profile(self, monkeypatch, tmp_path):
+        """Regression for #5885: a profile stanza behind a login-shell guard must
+        run in a Kiro Crew terminal.
+
+        The shell is spawned with ``-l``, so ``shopt -q login_shell`` is true and
+        the guard passes. Emulating the profile chain from an rc file (what
+        #4724's ``--init-file`` did) cannot substitute: the option is read-only,
+        stays off, and every such stanza silently no-ops — which is precisely
+        what the reporter saw. On that code this test fails at the final assert
+        with an EMPTY value, having still received the ready frame.
+
+        EXECUTION-only marker, same idiom as the SIGINT test above: the typed
+        bytes carry ``PROFILE''_OK`` so the PTY's echo of our own keystrokes can
+        never contain the token — only the shell's execution of the echo emits
+        the concatenated form, and only if the guarded export really ran.
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / ".bash_profile").write_text(
+            "if shopt -q login_shell; then\n"
+            "    export KC_5885_PROFILE=PROFILE_OK\n"
+            "fi\n"
+        )
+        # ~/.bashrc is deliberately NOT part of this contract: an interactive
+        # login bash has never read it, on any arm of this bug.
+        (home / ".bashrc").write_text("export KC_5885_PROFILE=BASHRC_WRONG\n")
+
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({
+            "dashboard": {"terminal": {"enabled": True, "shell": "bash"}}
+        }))
+        monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
+        monkeypatch.setattr(terminal, "_sel", lambda: MagicMock())
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("SHELL", shutil.which("bash") or "/bin/bash")
+
+        registry: dict = {}
+        app = _make_app(registry=registry)
+
+        from aiohttp.test_utils import TestClient, TestServer
+
+        async def _drain_until(ws, token: bytes, *, budget_secs: float) -> bytes:
+            loop = asyncio.get_event_loop()
+            deadline = loop.time() + budget_secs
+            buf = bytearray()
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return bytes(buf)
+                try:
+                    msg = await ws.receive(timeout=remaining)
+                except asyncio.TimeoutError:
+                    return bytes(buf)
+                if msg.type == web.WSMsgType.BINARY:
+                    buf.extend(msg.data)
+                    if token in bytes(buf):
+                        return bytes(buf)
+                elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
+                    return bytes(buf)
+
+        out = b""
+        # A real Bash is spawned below, so every exit from here on — assertion,
+        # timeout, cancellation — must still reap it. TestClient closes the
+        # socket, not the child.
+        try:
+            async with TestClient(TestServer(app)) as client:
+                async with client.ws_connect("/api/ws/terminal/login-sess") as ws:
+                    loop = asyncio.get_event_loop()
+                    ready_deadline = loop.time() + 15
+                    ready_seen = False
+                    while loop.time() < ready_deadline:
+                        msg = await ws.receive(timeout=ready_deadline - loop.time())
+                        if msg.type == web.WSMsgType.TEXT:
+                            if json.loads(msg.data).get("type") == "ready":
+                                ready_seen = True
+                                break
+                        elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
+                            break
+                    assert ready_seen, "shell never emitted the post-profile ready frame"
+
+                    await ws.send_bytes(b"echo KC=$KC_5885_PROFILE.\n")
+                    out = await _drain_until(ws, b"KC=PROFILE_OK.", budget_secs=15)
+                    await ws.close()
+        finally:
+            spawned = registry.get("login-sess")
+            if spawned is not None:
+                await terminal._kill_session(spawned)
+
+        assert b"KC=PROFILE_OK." in out, (
+            "a login-guarded profile stanza did not run: the terminal is not a "
+            "login shell (#5885). Observed PTY tail: "
+            f"{out[-400:]!r}"
+        )
+        assert b"BASHRC_WRONG" not in out
+
+    @pytest.mark.skipif(
+        terminal.platform_compat.IS_WINDOWS or not shutil.which("bash"),
+        reason="POSIX login-shell semantics; needs a real bash on PATH",
+    )
+    @pytest.mark.asyncio
+    async def test_ws_bash_keeps_a_profile_appended_prompt_command(
+        self, monkeypatch, tmp_path,
+    ):
+        """The readiness hook withdraws ITSELF, never the user's own prompt hook.
+
+        Bash 5.1+ lets `PROMPT_COMMAND+=(...)` turn the exported scalar into an
+        array whose element zero is still the hook, so a scalar-equality test
+        alone would match and unset the WHOLE array — taking the profile's own
+        element with it and silently disabling it after the first prompt.
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / ".bash_profile").write_text(
+            "export KC_5885_PROFILE=PROFILE_OK\n"
+            "PROMPT_COMMAND+=(true)\n"
+        )
+
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({
+            "dashboard": {"terminal": {"enabled": True, "shell": "bash"}}
+        }))
+        monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
+        monkeypatch.setattr(terminal, "_sel", lambda: MagicMock())
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("SHELL", shutil.which("bash") or "/bin/bash")
+
+        registry: dict = {}
+        app = _make_app(registry=registry)
+
+        from aiohttp.test_utils import TestClient, TestServer
+
+        out = bytearray()
+        try:
+            async with TestClient(TestServer(app)) as client:
+                async with client.ws_connect("/api/ws/terminal/pcarray-sess") as ws:
+                    loop = asyncio.get_event_loop()
+                    deadline = loop.time() + 20
+                    while loop.time() < deadline:
+                        msg = await ws.receive(timeout=deadline - loop.time())
+                        if msg.type == web.WSMsgType.BINARY:
+                            out.extend(msg.data)
+                            if b"PC1=" in bytes(out):
+                                break
+                        elif msg.type == web.WSMsgType.TEXT:
+                            if json.loads(msg.data).get("type") == "ready":
+                                # First prompt reached, so the hook has fired and
+                                # made its keep-or-withdraw decision by now.
+                                # EXECUTION-only marker: the typed bytes carry
+                                # PC''1= so the line-discipline echo of our own
+                                # keystrokes cannot satisfy the match below.
+                                await ws.send_bytes(
+                                    b"echo PC''1=${PROMPT_COMMAND[1]:-GONE}.\n"
+                                )
+                        elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
+                            break
+                    await ws.close()
+        finally:
+            spawned = registry.get("pcarray-sess")
+            if spawned is not None:
+                await terminal._kill_session(spawned)
+
+        tail = bytes(out)
+        assert b"PC1=true." in tail, (
+            "the profile's own PROMPT_COMMAND element did not survive the "
+            f"readiness hook's self-withdrawal. PTY tail: {tail[-400:]!r}"
+        )
+
+    @pytest.mark.skipif(
+        terminal.platform_compat.IS_WINDOWS or not shutil.which("bash"),
+        reason="POSIX login-shell semantics; needs a real bash on PATH",
+    )
+    @pytest.mark.asyncio
+    async def test_ws_bash_restores_an_inherited_prompt_command(
+        self, monkeypatch, tmp_path,
+    ):
+        """An exported PROMPT_COMMAND in the GATEWAY's environment is preserved.
+
+        Replacing it loses data rather than a nicety: `history -a` is what makes
+        concurrent shells append to HISTFILE instead of the last one to exit
+        overwriting it. Drives a real Bash and asks the live shell what
+        PROMPT_COMMAND holds once the hook has withdrawn.
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / ".bash_profile").write_text("export KC_5885_PROFILE=PROFILE_OK\n")
+
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({
+            "dashboard": {"terminal": {"enabled": True, "shell": "bash"}}
+        }))
+        monkeypatch.setattr(terminal, "config_path", lambda: cfg_file)
+        monkeypatch.setattr(terminal, "_sel", lambda: MagicMock())
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("SHELL", shutil.which("bash") or "/bin/bash")
+        # What the operator exported into the gateway's own environment. It
+        # PRINTS, so the transcript shows whether it ran at the FIRST prompt
+        # (appended after the hook) or only from the second one (restored but
+        # not appended) -- the difference this test exists to pin.
+        monkeypatch.setenv("PROMPT_COMMAND", "builtin printf PREV_RAN")
+
+        registry: dict = {}
+        app = _make_app(registry=registry)
+
+        from aiohttp.test_utils import TestClient, TestServer
+
+        out = bytearray()
+        try:
+            async with TestClient(TestServer(app)) as client:
+                async with client.ws_connect("/api/ws/terminal/pcprev-sess") as ws:
+                    loop = asyncio.get_event_loop()
+                    deadline = loop.time() + 20
+                    while loop.time() < deadline:
+                        msg = await ws.receive(timeout=deadline - loop.time())
+                        if msg.type == web.WSMsgType.BINARY:
+                            out.extend(msg.data)
+                            if b"PCNOW=" in bytes(out):
+                                break
+                        elif msg.type == web.WSMsgType.TEXT:
+                            if json.loads(msg.data).get("type") == "ready":
+                                # EXECUTION-only marker, as above.
+                                await ws.send_bytes(
+                                    b"echo PC''NOW=[${PROMPT_COMMAND-unset}]\n"
+                                )
+                        elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
+                            break
+                    await ws.close()
+        finally:
+            spawned = registry.get("pcprev-sess")
+            if spawned is not None:
+                await terminal._kill_session(spawned)
+
+        tail = bytes(out)
+        # (1) It ran at the FIRST prompt, i.e. it was appended after the hook
+        # rather than only restored: its output precedes the echo of the probe
+        # this test typed afterwards.
+        assert b"PREV_RAN" in tail and b"PC''NOW" in tail, (
+            f"probe never completed. PTY tail: {tail[-500:]!r}"
+        )
+        assert tail.index(b"PREV_RAN") < tail.index(b"PC''NOW"), (
+            "the gateway's exported PROMPT_COMMAND did not run at the first "
+            f"prompt, so it was not appended after the hook. PTY: {tail[:600]!r}"
+        )
+        # (2) The withdrawal restored it instead of unsetting the variable.
+        assert b"PCNOW=[builtin printf PREV_RAN]" in tail, (
+            "the gateway's exported PROMPT_COMMAND was not restored after the "
+            f"readiness hook withdrew. PTY tail: {tail[-500:]!r}"
+        )
+        # The Kiro Crew names are gone from the session either way.
+        assert b"KIROCREW_TERMINAL_READY" not in tail
+
     @pytest.mark.asyncio
     async def test_rest_create_list_delete(self, monkeypatch, tmp_path):
         """Full REST lifecycle: create, list, delete."""
@@ -3044,13 +3309,78 @@ class TestBashShellReadiness:
         assert terminal._is_bash_shell("C:\\tools\\bash.exe") is True
         assert terminal._is_bash_shell("/bin/zsh") is False
 
-    def test_init_script_marks_ready_after_the_login_profile_chain(self):
-        script = terminal._bash_init_script("abc123")
-        marker = b"builtin printf '\\033]697;KiroCrewReady;abc123\\007'"
-        assert script.index(b". /etc/profile") < script.index(b'. "$HOME/.bash_profile"')
-        assert script.index(b'. "$HOME/.bash_profile"') < script.index(marker)
-        assert script.index(b'. "$HOME/.bash_login"') < script.index(marker)
-        assert script.index(b'. "$HOME/.profile"') < script.index(marker)
+    def test_ready_hook_is_a_single_shot_self_removing_prompt_command(
+        self, monkeypatch,
+    ):
+        monkeypatch.delenv("PROMPT_COMMAND", raising=False)
+        env = terminal._bash_ready_env("abc123")
+
+        # The marker rides PROMPT_COMMAND because Bash reads an --init-file only
+        # for a NON-login shell, and a non-login shell is exactly what #5885
+        # reports: `shopt -q login_shell` false, so login-guarded profile
+        # stanzas never run.
+        assert env[terminal._READY_TOKEN_VAR] == "abc123"
+        hook = env["PROMPT_COMMAND"]
+        assert env[terminal._READY_HOOK_VAR] == hook, "the mirror must be byte-identical"
+        # Fires only while the token is set, so no later prompt and no child
+        # shell repeats the sequence.
+        assert f'-n "${{{terminal._READY_TOKEN_VAR}-}}"' in hook
+        assert f"builtin unset {terminal._READY_TOKEN_VAR}" in hook
+        assert "]697;KiroCrewReady;%s" in hook
+        # Withdraws itself only while PROMPT_COMMAND is still exactly the scalar
+        # that was exported: a profile that APPENDED its own command keeps that
+        # half, and one that appended as an ARRAY leaves the exported text as
+        # element zero, which the scalar test alone would match.
+        assert f'"${{PROMPT_COMMAND-}}" == "${{{terminal._READY_HOOK_VAR}-}}"' in hook
+        assert '-z "${PROMPT_COMMAND[1]+x}"' in hook
+        assert "builtin unset PROMPT_COMMAND; fi" in hook
+        # The mirror and the inherited-value carrier are unset either way, so a
+        # session whose profile took PROMPT_COMMAND over does not keep them.
+        assert f"builtin unset {terminal._READY_HOOK_VAR} " \
+               f"{terminal._READY_PREV_VAR}; fi" in hook
+        # No Bash 5.1-only syntax: /bin/bash on macOS is 3.2 and must parse this.
+        assert "@a}" not in hook and "@A}" not in hook
+        # The token is never pasted into the snippet; it is read from the
+        # environment, so the hook text carries no secret to echo.
+        assert "abc123" not in hook
+
+    def test_ready_hook_preserves_an_inherited_prompt_command(self, monkeypatch):
+        """An operator who EXPORTED PROMPT_COMMAND keeps it. Replacing it is data
+        loss, not a lost nicety: `PROMPT_COMMAND='history -a'` is what makes
+        concurrent shells APPEND to HISTFILE, and without it an exiting shell
+        overwrites that file with its own in-memory list."""
+        monkeypatch.setenv("PROMPT_COMMAND", "history -a")
+        env = terminal._bash_ready_env("abc123")
+
+        exported = env["PROMPT_COMMAND"]
+        # The inherited command is carried verbatim and runs AFTER the marker,
+        # which must be the first thing the prompt writes.
+        assert exported.endswith("; history -a")
+        assert exported.index("KiroCrewReady") < exported.index("history -a")
+        # The mirror is the WHOLE exported value, so the ownership test still
+        # recognizes an untouched variable now that it has a tail.
+        assert env[terminal._READY_HOOK_VAR] == exported
+        # Withdrawal RESTORES the inherited command instead of unsetting it.
+        assert env[terminal._READY_PREV_VAR] == "history -a"
+        assert f'PROMPT_COMMAND="${{{terminal._READY_PREV_VAR}}}"' in exported
+        assert f"builtin unset {terminal._READY_HOOK_VAR} " \
+               f"{terminal._READY_PREV_VAR}" in exported
+
+    def test_ready_hook_unsets_when_nothing_was_inherited(self, monkeypatch):
+        monkeypatch.delenv("PROMPT_COMMAND", raising=False)
+        env = terminal._bash_ready_env("abc123")
+
+        assert terminal._READY_PREV_VAR not in env
+        assert "builtin unset PROMPT_COMMAND" in env["PROMPT_COMMAND"]
+        # Nothing to append, so the exported value is the hook alone.
+        assert env["PROMPT_COMMAND"].endswith("fi")
+
+    def test_ready_hook_ignores_a_blank_inherited_prompt_command(self, monkeypatch):
+        monkeypatch.setenv("PROMPT_COMMAND", "   ")
+        env = terminal._bash_ready_env("abc123")
+
+        assert terminal._READY_PREV_VAR not in env
+        assert "builtin unset PROMPT_COMMAND" in env["PROMPT_COMMAND"]
 
     def test_marker_match_is_split_safe_and_one_shot(self):
         sess = _make_session()

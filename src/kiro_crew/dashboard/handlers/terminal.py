@@ -162,10 +162,10 @@ class _TerminalSession:
     # to a freshly spawned login shell. Run-in-terminal callers must not release
     # queued commands until this barrier has been crossed.
     shell_ready: bool = False
-    # Bash receives a one-use init file that emits this randomized OSC marker
-    # only after its login profiles return. ``ready_probe`` retains the small
-    # suffix needed when the marker straddles two PTY reads; output itself is
-    # still forwarded byte-for-byte.
+    # Bash inherits a PROMPT_COMMAND that emits this randomized OSC marker once,
+    # after its login profiles return. ``ready_probe`` retains the small suffix
+    # needed when the marker straddles two PTY reads; output itself is still
+    # forwarded byte-for-byte.
     ready_marker: bytes | None = None
     ready_probe: bytearray = field(default_factory=bytearray)
     # Serializes concurrent WS writes (reader loop + title poller + pong);
@@ -406,25 +406,104 @@ def _is_bash_shell(shell: str) -> bool:
     return name in {"bash", "bash.exe"}
 
 
-def _bash_init_script(token: str) -> bytes:
-    """Build the Bash init file that emulates ``-l`` then marks readiness.
+# Names the readiness hook reads. When the hook runs, both are consumed and unset
+# at the first prompt, so nothing the user runs afterwards sees them. A profile
+# that ASSIGNS PROMPT_COMMAND prevents the hook from running at all, and both
+# then stay exported for that session -- inert, since the only thing that reads
+# them is the hook that was replaced.
+_READY_TOKEN_VAR = "KIROCREW_TERMINAL_READY_TOKEN"
+_READY_HOOK_VAR = "KIROCREW_TERMINAL_READY_HOOK"
+# Carries an inherited PROMPT_COMMAND across the hook's lifetime so the
+# withdrawal can restore it instead of unsetting the variable. Absent when the
+# gateway's own environment exported no PROMPT_COMMAND, which is the norm.
+_READY_PREV_VAR = "KIROCREW_TERMINAL_READY_PREV"
 
-    Bash ignores ``--init-file`` for a login shell, so the injected interactive
-    init file sources the same profile chain itself. The marker comes strictly
-    after those files return, including shell builtins such as ``read`` that do
-    not change the PTY foreground process group.
+
+def _bash_ready_env(token: str) -> dict[str, str]:
+    """Environment that makes a real login Bash report readiness at its prompt.
+
+    Bash reads an ``--init-file`` only when it is *not* a login shell, so the
+    marker cannot ride an injected rc file without giving up ``-l`` — and giving
+    up ``-l`` is the bug in #5885: ``shopt -q login_shell`` is then false, so
+    every profile stanza guarded on login-ness silently no-ops and the user's
+    environment never loads. Sourcing the same files from an rc file cannot
+    substitute, because that option is read-only and stays off.
+
+    A login shell does honour a ``PROMPT_COMMAND`` inherited from its
+    environment, and runs it after the profile chain returns and before the first
+    prompt — the point the injected marker used to occupy.
+
+    The snippet is single-shot and self-removing: it emits only while the token
+    variable is still set, unsets that token so neither a later prompt nor a
+    child shell repeats the sequence, and withdraws itself from
+    ``PROMPT_COMMAND`` only when that variable is still exactly the scalar that
+    was exported. Both halves of that last test matter: a profile that APPENDED
+    (``PROMPT_COMMAND="$PROMPT_COMMAND; history -a"``) no longer matches, and one
+    that appended as an ARRAY (``PROMPT_COMMAND+=("history -a")``, Bash 5.1+)
+    leaves the exported text as element zero — which the scalar expansion alone
+    would match, so unsetting there would take the user's own element with it.
+    ``${PROMPT_COMMAND[1]+x}`` distinguishes the two without Bash 5.1 syntax the
+    ``/bin/bash`` on macOS (3.2) cannot parse.
+
+    A profile that ASSIGNS ``PROMPT_COMMAND`` outright drops the hook, and with
+    it the marker: that session's barrier never opens, and the client's own
+    bounded timeout reports the failure without writing. That is the same
+    fail-closed outcome the barrier already has for a profile that never returns,
+    and it is deliberate — releasing on inferred progress instead risks handing a
+    queued command to a profile that is still reading input, which corrupts it.
+
+    One case is NOT fail-closed and is worth naming: a profile that installs its
+    own hook only when the variable looks unset — ``[ -z "$PROMPT_COMMAND" ] &&
+    PROMPT_COMMAND=…``, which is how the RHEL-family ``/etc/bashrc`` installs its
+    terminal-title updater — sees the exported hook, skips its own install, and
+    then this snippet withdraws itself, so that session ends with no prompt
+    command at all. It cannot be fixed by choosing a better moment or a cleverer
+    guard: every carrier a login shell inherits is visible to the profile chain,
+    and the carriers that are invisible to it (``BASH_ENV``, non-interactive only;
+    ``ENV``, POSIX mode only; ``INPUTRC``, cannot run commands) do not run at the
+    post-profile point a readiness marker needs. Tracked with the alternatives in
+    #7657.
+    An operator who EXPORTED ``PROMPT_COMMAND`` into the gateway's own
+    environment keeps it: the exported value is the readiness hook followed by
+    the inherited command, and the withdrawal restores the inherited command
+    rather than unsetting the variable. Replacing it outright would be data loss,
+    not just a lost nicety — ``PROMPT_COMMAND='history -a'`` is the standard way
+    to make concurrent shells append to ``HISTFILE``, and without it a shell
+    exiting OVERWRITES that file with its own in-memory list, dropping the
+    commands every sibling shell had appended.
     """
-    return (
-        "if [ -r /etc/profile ]; then . /etc/profile; fi\n"
-        'if [ -r "$HOME/.bash_profile" ]; then\n'
-        '    . "$HOME/.bash_profile"\n'
-        'elif [ -r "$HOME/.bash_login" ]; then\n'
-        '    . "$HOME/.bash_login"\n'
-        'elif [ -r "$HOME/.profile" ]; then\n'
-        '    . "$HOME/.profile"\n'
-        "fi\n"
-        f"builtin printf '\\033]697;KiroCrewReady;{token}\\007'\n"
-    ).encode("utf-8")
+    hook = (
+        f'if [[ -n "${{{_READY_TOKEN_VAR}-}}" ]]; then '
+        f"builtin printf '\\033]697;KiroCrewReady;%s\\007' "
+        f'"${{{_READY_TOKEN_VAR}}}"; '
+        f"builtin unset {_READY_TOKEN_VAR}; "
+        f'if [[ "${{PROMPT_COMMAND-}}" == "${{{_READY_HOOK_VAR}-}}" '
+        f'&& -z "${{PROMPT_COMMAND[1]+x}}" ]]; then '
+        f'if [[ -n "${{{_READY_PREV_VAR}+x}}" ]]; then '
+        f'PROMPT_COMMAND="${{{_READY_PREV_VAR}}}"; '
+        f"else builtin unset PROMPT_COMMAND; fi; fi; "
+        f"builtin unset {_READY_HOOK_VAR} {_READY_PREV_VAR}; fi"
+    )
+    inherited = (os.environ.get("PROMPT_COMMAND") or "").strip()
+    # The exported value is executed as shell code, so the inherited command is
+    # carried verbatim rather than quoted into an argument. It runs AFTER the
+    # marker, which is the order the readiness signal needs: the marker must be
+    # the first thing this prompt writes.
+    exported = f"{hook}; {inherited}" if inherited else hook
+    # _READY_HOOK_VAR mirrors the exported value (the WHOLE value, hook plus any
+    # inherited tail) so the hook can tell "still mine" from "a profile has taken
+    # this over" without pattern-matching its own text. Whenever the hook RUNS it
+    # unsets the mirror on both branches, withdrawing or not; the third path is a
+    # profile that replaced PROMPT_COMMAND, where the hook never runs and these
+    # names stay exported for that session (see the docstring).
+    env = {
+        _READY_TOKEN_VAR: token,
+        _READY_HOOK_VAR: exported,
+        "PROMPT_COMMAND": exported,
+    }
+    if inherited:
+        env[_READY_PREV_VAR] = inherited
+    return env
 
 
 def _consume_ready_marker(sess: "_TerminalSession", data: bytes) -> bool:
@@ -756,13 +835,13 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
                 "terminal: configured shell %r not executable; falling back to %r",
                 rejected_shell, shell,
             )
-        # Spawn new PTY. Bash gets a one-use init stream so it can emit a
-        # definitive readiness marker after login profiles return. Foreground
-        # process ownership alone is insufficient: a profile's builtin `read`
-        # runs in the shell process and would consume an early command batch.
+        # Spawn new PTY. Bash is a real login shell (`-l`) so the user's own
+        # profile chain runs with `shopt -q login_shell` true, and it inherits a
+        # PROMPT_COMMAND that emits a definitive readiness marker once the
+        # profiles return. Foreground process ownership alone is insufficient: a
+        # profile's builtin `read` runs in the shell process and would consume an
+        # early command batch.
         master_fd, worker_fd = _pty.openpty()
-        init_read_fd: int | None = None
-        init_write_fd: int | None = None
         ready_marker: bytes | None = None
         try:
             fcntl.ioctl(
@@ -812,18 +891,12 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
                 fcntl.ioctl(0, tiocsctty, 0)
 
             argv = [shell, "-l"]
-            pass_fds: tuple[int, ...] = ()
             if _is_bash_shell(shell):
                 token = uuid.uuid4().hex
                 ready_marker = (
                     f"\x1b]697;KiroCrewReady;{token}\x07".encode("ascii")
                 )
-                init_read_fd, init_write_fd = os.pipe()
-                os.write(init_write_fd, _bash_init_script(token))
-                os.close(init_write_fd)
-                init_write_fd = None
-                argv = [shell, "--init-file", f"/dev/fd/{init_read_fd}", "-i"]
-                pass_fds = (init_read_fd,)
+                env.update(_bash_ready_env(token))
 
             proc = await asyncio.create_subprocess_exec(
                 *argv,
@@ -832,7 +905,6 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
                 stderr=worker_fd,
                 start_new_session=True,
                 preexec_fn=_setup_ctty,
-                pass_fds=pass_fds,
                 cwd=cwd,
                 env=env,
             )
@@ -849,10 +921,6 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
             return ws
         finally:
             os.close(worker_fd)
-            if init_read_fd is not None:
-                os.close(init_read_fd)
-            if init_write_fd is not None:
-                os.close(init_write_fd)
 
         sess = _TerminalSession(
             session_id=session_id,
