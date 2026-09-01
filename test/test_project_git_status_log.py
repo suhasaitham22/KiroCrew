@@ -157,6 +157,34 @@ class TestGitStatus:
         assert c["status"] == "?"
 
     @pytest.mark.asyncio
+    async def test_redaction_collision_files_are_deduplicated(self, repo, mock_sel):
+        """Two distinct changed files that redact() collapses to one path must
+        not both appear in ``files``.
+
+        Real collision: two untracked files whose only differing segment is a
+        credential-shaped token (distinct AKIA... ids, each 4-letter prefix + 16
+        uppercase alphanumerics) both flatten to
+        ``[REDACTED: credential]_model.txt``. Without server-side de-dup the two
+        entries would reach the dashboard tree and @pierre/trees'
+        ``appendPresortedPaths`` would throw ``Duplicate path`` on the adjacent
+        identical rows. First occurrence is kept.
+        """
+        (repo / "AKIAIOSFODNN7EXAMPLE_model.txt").write_text("one\n")
+        (repo / "AKIAJKLMNOPQRSTUVWXY_model.txt").write_text("two\n")
+        async with TestClient(TestServer(_make_app(str(repo)))) as client:
+            resp = await client.get(f"/api/project/git/status?path={repo}")
+            data = await resp.json()
+        assert data["repo"] is True
+        paths = [f["path"] for f in data["files"]]
+        # Both filenames collapsed to the same redacted placeholder...
+        assert "[REDACTED: credential]_model.txt" in paths
+        # ...but only one entry survives, and the raw tokens never leak.
+        assert paths.count("[REDACTED: credential]_model.txt") == 1
+        assert len(paths) == len(set(paths))
+        assert "AKIAIOSFODNN7EXAMPLE" not in "\n".join(paths)
+        assert "AKIAJKLMNOPQRSTUVWXY" not in "\n".join(paths)
+
+    @pytest.mark.asyncio
     async def test_clean_repo_empty_files(self, repo, mock_sel):
         """Clean repo returns empty files list."""
         async with TestClient(TestServer(_make_app(str(repo)))) as client:

@@ -4778,8 +4778,22 @@ async def api_project_git_status(request: web.Request) -> web.Response:
         result["repoRoot"] = redact(result["repoRoot"])
     if result.get("branch"):
         result["branch"] = redact(result["branch"])
+    # Redact each file path, then drop entries whose redacted path duplicates an
+    # earlier one (preserving order and first occurrence). Same collision class
+    # as api_project_tree: redact() can collapse two genuinely-different paths to
+    # the same placeholder, and the dashboard tree's @pierre/trees would throw
+    # "Duplicate path" on adjacent identical entries. The files[:500] cap was
+    # already applied to the raw listing above, so this only removes collisions.
+    deduped_files: list[dict] = []
+    seen_paths: set[str] = set()
     for f in result.get("files", []):
         f["path"] = redact(f["path"])
+        if f["path"] in seen_paths:
+            continue
+        seen_paths.add(f["path"])
+        deduped_files.append(f)
+    if "files" in result:
+        result["files"] = deduped_files
     return web.json_response(result)
 
 
@@ -4916,7 +4930,15 @@ async def api_project_tree(request: web.Request) -> web.Response:
     # Egress redaction, same rationale as api_project_git_status: listed names
     # are repo content and this body is rendered by the dashboard.
     result["root"] = redact(result["root"])
-    result["paths"] = [redact(p) for p in result["paths"]]
+    # De-duplicate after redaction, preserving order and first occurrence.
+    # redact() collapses each matched token to a fixed placeholder, so two
+    # genuinely-different project-relative paths (e.g. a src/ vs target/ Maven
+    # prefix and a credential-shaped filename token) can flatten to the same
+    # redacted string. The dashboard tree hands this list straight to
+    # @pierre/trees, whose appendPresortedPaths throws "Duplicate path" on
+    # adjacent identical entries. dict.fromkeys keeps first occurrence. This
+    # does not affect "truncated": the cap is applied to the raw listing above.
+    result["paths"] = list(dict.fromkeys(redact(p) for p in result["paths"]))
     return web.json_response(result)
 
 
