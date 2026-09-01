@@ -141,7 +141,7 @@ rule aimed at anything else never reaches the document.
 |---|---|
 | `topbar` | the header shell (`App.tsx`) |
 | `sidebar` | the chat session list (`ChatSidebar.tsx`) |
-| `chat-container` | the chat scroll region (`ChatPane.tsx`, `ChatPage.tsx`) |
+| `chat-container` | the chat scroll region (`ChatPane.tsx`, `pages/chat/ChatPageView.tsx`) |
 | `message-bubble` | a user or assistant turn (`chat/UserMessage.tsx`, `chat/AssistantMessage.tsx`) |
 | `input-area` | the composer (`ChatInput.tsx`) |
 | `code-block` | a rendered fenced block (`CodeBlock.tsx`, `MonacoCodeBlock.tsx`) |

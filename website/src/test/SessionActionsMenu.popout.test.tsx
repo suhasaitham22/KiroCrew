@@ -26,7 +26,7 @@ vi.mock('../api/client', () => ({
   },
 }))
 
-import { ChatHeaderMenu } from '../pages/ChatPage'
+import { ChatHeaderMenu } from '../pages/chat/ChatPageMessageContent'
 import { registerPopout, __resetForTests, __setNavigateForTests } from '../utils/chatPopout'
 
 const dashboardState = {
