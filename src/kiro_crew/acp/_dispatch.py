@@ -558,6 +558,67 @@ def parse_text_chunk(update: dict[str, Any]) -> tuple[str | None, bool]:
     return None, False
 
 
+# claude-agent-acp has no out-of-band compaction notification: where kiro-cli
+# sends ``_kiro.dev/compaction/status`` and KAS sends its summarization kinds
+# under ``_meta.kiro``, the Claude adapter reports compaction as PLAIN
+# ``agent_message_chunk`` TEXT, indistinguishable from model prose to any
+# client.  Verbatim from the shipped adapter (``dist/acp-agent.js``, the
+# ``status`` case of its SDK-message switch):
+#
+#   status === "compacting"          -> "Compacting..."
+#   compact_result === "success"     -> "\n\nCompacting completed."
+#   compact_result === "failed"      -> "\n\nCompacting failed{reason}"
+#
+# where ``reason`` is ``": " + compact_error`` or ``"."``.  Recognising these
+# here makes the Claude backend the third producer of EVENT_COMPACTION_STATUS,
+# so every consumer that already handles the kiro-cli and KAS shapes (the
+# dashboard notice + context-meter reset, the messaging drivers, and
+# ``wait_for_compaction``) works on Claude with no per-surface change — and the
+# notice text stops leaking into transcripts as assistant output.
+#
+# Only ``compact_result`` carries a terminal, and per the adapter's own comment
+# the SDK sends it for MANUAL ``/compact`` only: an AUTOMATIC mid-turn
+# compaction takes the adapter's ``compact_boundary`` case, which emits a
+# ``usage_update`` and no text at all.  So an auto-compaction produces a
+# ``started`` with no terminal, and callers must settle it at turn end rather
+# than waiting for one (see ``AcpClient._dispatch_events``).
+_CLAUDE_COMPACTION_STARTED_MARKER = "Compacting..."
+_CLAUDE_COMPACTION_COMPLETED_MARKER = "Compacting completed."
+_CLAUDE_COMPACTION_FAILED_MARKER = "Compacting failed"
+
+
+def parse_claude_compaction_notice(chunk: str) -> tuple[str, str] | None:
+    """Classify a claude-agent-acp compaction notice chunk.
+
+    Returns ``(status_type, detail)`` with ``status_type`` in
+    ``started``/``completed``/``failed`` — the same vocabulary kiro-cli's
+    ``_kiro.dev/compaction/status`` and KAS's summarization kinds already use —
+    or ``None`` when *chunk* is not one of the adapter's notices.
+
+    Matched on the STRIPPED chunk (the adapter prefixes the two terminals with
+    ``\\n\\n``), and anchored: ``started``/``completed`` are exact equality and
+    ``failed`` is a prefix match because only that one carries a variable
+    reason.  Anchoring is the point — a model that merely quotes "Compacting..."
+    inside a sentence must not be mistaken for a backend notice, because doing
+    so would erase real assistant output from the transcript.
+
+    The returned detail is NOT redacted: it is backend-echoed text, so callers
+    that surface it must pass it through their own redaction the same way they
+    already do for the kiro-cli/KAS compaction summaries.
+    """
+    text = chunk.strip()
+    if not text:
+        return None
+    if text == _CLAUDE_COMPACTION_STARTED_MARKER:
+        return "started", ""
+    if text == _CLAUDE_COMPACTION_COMPLETED_MARKER:
+        return "completed", ""
+    if text.startswith(_CLAUDE_COMPACTION_FAILED_MARKER):
+        reason = text[len(_CLAUDE_COMPACTION_FAILED_MARKER) :].lstrip(": ").rstrip(".")
+        return "failed", reason
+    return None
+
+
 _ACP_SHELL_KIND = "execute"
 
 
@@ -1481,6 +1542,7 @@ __all__ = [
     "parse_usage_cost",
     "parse_prompt_token_usage",
     "parse_text_chunk",
+    "parse_claude_compaction_notice",
     "make_unified_diff",
     "select_tool_title",
     "is_shell_kind",
