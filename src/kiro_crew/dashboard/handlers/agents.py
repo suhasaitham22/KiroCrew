@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hashlib
 import json
 import logging
 import os
@@ -14,7 +15,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from aiohttp import web
+from aiohttp import BodyPartReader, web
 
 from kiro_crew import agent_state, model_registry
 from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
@@ -45,6 +46,7 @@ from kiro_crew.apps.manager import (
     app_enabled_state,
     apps_dir,
 )
+from kiro_crew.atomic_write import replace_with_retry
 from kiro_crew.config.loader import (
     ConfigReadError,
     KiroCrewAgentConfig,
@@ -59,6 +61,7 @@ from kiro_crew.config.loader import (
     resolve_effective_model,
     write_config_atomically,
 )
+from kiro_crew.config.paths import data_home
 from kiro_crew.config.schema import SCHEMA_REGISTRY, config_entry_to_dict
 from kiro_crew.dashboard.chat_persistence import get_reasoning_effort_ordered
 from kiro_crew.dashboard.chat_utils import (
@@ -2739,14 +2742,28 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
         )
     # Same convention as session_color: a non-empty raw value that the coercer
     # collapses to "no override" is a caller mistake worth a 400, not a silent
-    # fallback to the name-derived face.
+    # fallback to the name-derived face. The one exception is a well-formed
+    # ghost override whose traits all coerce to absent: that collapse is the
+    # validator's own all-empty→reset rule, not caller junk, so it stores as
+    # the canonical reset rather than being refused.
     _raw_avatar = body.get("avatar")
     avatar = _safe_avatar(_raw_avatar)
-    if _raw_avatar not in (None, {}) and not avatar:
+    if _raw_avatar not in (None, {}) and not avatar and not _is_ghost_shaped(_raw_avatar):
         return web.json_response(
             {
-                "error": "avatar must be {'kind': 'ghost', 'traits': {...}} or empty",
+                "error": "avatar must be {'kind': 'ghost', 'traits': {...}}, {'kind': 'image'}, or empty",
                 "code": "invalid_avatar",
+            },
+            status=400,
+        )
+    if avatar.get("kind") == "image":
+        # A crew that does not exist yet cannot have staged a picture (the
+        # upload endpoint 404s for unknown names), so an image override on
+        # create can never have a file to commit.
+        return web.json_response(
+            {
+                "error": "upload the picture after creating the crew",
+                "code": "avatar_file_missing",
             },
             status=400,
         )
@@ -2844,26 +2861,79 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
                 )
             agent.session_color = _norm
             changed.append("session_color")
+        _avatar_promoted = False
+        _remove_files_after_save = False
         if "avatar" in body:
             _raw_av = body["avatar"]
             _av = _safe_avatar(_raw_av)
             # Same 400 convention as session_color: junk that coerces to "no
             # override" is refused rather than silently clearing the face.
-            # None/{} are the explicit "reset to name-derived" spellings.
-            if _raw_av not in (None, {}) and not _av:
+            # None/{} are the explicit "reset to name-derived" spellings, and
+            # a well-formed ghost override that collapses all-empty is the
+            # validator's own reset rule, not caller junk.
+            if _raw_av not in (None, {}) and not _av and not _is_ghost_shaped(_raw_av):
                 return web.json_response(
                     {
-                        "error": "avatar must be {'kind': 'ghost', 'traits': {...}} or empty",
+                        "error": "avatar must be {'kind': 'ghost', 'traits': {...}}, {'kind': 'image'}, or empty",
                         "code": "invalid_avatar",
                     },
                     status=400,
                 )
+            if _av.get("kind") == "image":
+                # THE commit point for pictures, under this same config lock.
+                # `promote` is a wire-only directive (never persisted — the
+                # validator drops it): the client sets it exactly when THIS
+                # save staged a fresh upload. Without it, a leftover staging
+                # from an earlier failed or abandoned save must NOT ride along
+                # into an unrelated edit — it is discarded instead, and the
+                # crew keeps wearing its current picture.
+                _tok = _raw_av.get("token") if isinstance(_raw_av, dict) else None
+                _wants_promote = (
+                    isinstance(_raw_av, dict)
+                    and _raw_av.get("promote") is True
+                    and isinstance(_tok, str)
+                )
+                if _wants_promote:
+                    stamp = await asyncio.to_thread(_promote_pending_avatar, name, _tok)
+                    _avatar_promoted = stamp is not None
+                else:
+                    await asyncio.to_thread(_discard_pending_avatar, name)
+                    stamp = None
+                if stamp is None:
+                    stamp = await asyncio.to_thread(_live_avatar_stamp, name)
+                if stamp is None:
+                    return web.json_response(
+                        {
+                            "error": "no uploaded avatar file to commit — POST the picture first",
+                            "code": "avatar_file_missing",
+                        },
+                        status=400,
+                    )
+                _av = {"kind": "image", "v": stamp}
+            elif agent.avatar.get("kind") == "image":
+                # Leaving the picture tier: the stored file must not linger
+                # as a silently-retrievable orphan — but only once the config
+                # write that stops selecting it has actually succeeded.
+                _remove_files_after_save = True
             agent.avatar = _av
             changed.append("avatar")
         if "source" in body:
             agent.source = body["source"]
             changed.append("source")
-        cfg.save()
+        # The config write is the transaction's point of no return: a
+        # promotion is rolled back (old picture restored) when it fails, and
+        # committed (rollback copy dropped) or followed by the deferred file
+        # removal only when it succeeds.
+        try:
+            await asyncio.to_thread(cfg.save)
+        except BaseException:
+            if _avatar_promoted:
+                await asyncio.to_thread(_rollback_promoted_avatar, name)
+            raise
+        if _avatar_promoted:
+            await asyncio.to_thread(_commit_promoted_avatar, name)
+        if _remove_files_after_save:
+            await asyncio.to_thread(_remove_avatar_files, name)
     _sel().log_api_access(
         caller=request.get("user", "dashboard"),
         operation="agent.update",
@@ -2891,10 +2961,403 @@ async def api_kirocrew_agent_delete(request: web.Request) -> web.Response:
                 status=409,
             )
         del cfg.agents[name]
-        cfg.save()
+        await asyncio.to_thread(cfg.save)
+        # The crew is gone; its uploaded picture must not outlive it. Inside
+        # the same lock so the cleanup cannot run AFTER a concurrent
+        # same-name recreation has already uploaded and committed a new
+        # picture under the same digest stem.
+        await asyncio.to_thread(_remove_avatar_files, name)
     _sel().log_api_access(
         caller=request.get("user", "dashboard"),
         operation="agent.delete",
+        outcome="success",
+        source="dashboard",
+        resources=name,
+    )
+    return web.json_response({"ok": True})
+
+
+# ── Per-crew uploaded avatars ────────────────────────────────────────
+#
+# The "image" tier of per-crew custom avatars: the picture lives as a file
+# under the data home, the config field only records `{"kind": "image"}`
+# (see loader._safe_avatar). Serving goes through the authenticated API —
+# never a raw filesystem path — so remote dashboards work unchanged.
+
+#: Accepted image formats, sniffed from magic bytes — the client-sent
+#: Content-Type is attacker-controlled and is deliberately ignored.
+_AVATAR_IMAGE_EXTS = ("png", "jpg", "webp")
+_AVATAR_CONTENT_TYPES = {"png": "image/png", "jpg": "image/jpeg", "webp": "image/webp"}
+#: Upload ceiling. The client downscales to 512px before upload, so a
+#: compliant upload is tens of KB; 1 MB tolerates a generous margin while
+#: keeping a hostile body from ballooning memory (parts accumulate in RAM).
+_AVATAR_MAX_BYTES = 1024 * 1024
+
+
+def _is_ghost_shaped(value: object) -> bool:
+    """True when ``value`` is a structurally well-formed ghost override.
+
+    Used to tell the validator's all-empty→reset collapse apart from caller
+    junk at the 400 gate: a dict that names the ghost kind and carries a dict
+    of traits was written by someone speaking the schema, even when every
+    trait value coerces to absent.
+    """
+    return (
+        isinstance(value, dict)
+        and value.get("kind") == "ghost"
+        and isinstance(value.get("traits"), dict)
+    )
+
+
+def _avatars_dir() -> Path:
+    """Uploaded-avatar directory, resolved against the live data home.
+
+    Resolved per call, never captured at import — an import-time binding
+    freezes the data home and defeats pod isolation and test isolation
+    (dashboard/handlers/files.py is the precedent).
+    """
+    return data_home() / "avatars"
+
+
+def _avatar_stem(name: str) -> str:
+    """Path-safe filename stem for a crew's avatar.
+
+    Crew names are display strings (spaces, CJK, anything) — a digest
+    sidesteps every path-traversal and encoding question rather than
+    answering them one by one. Full digest: truncating buys nothing and a
+    shorter stem is the only thing a collision would need.
+    """
+    return hashlib.sha256(name.encode("utf-8")).hexdigest()
+
+
+def _avatar_path(name: str) -> Path | None:
+    """Return the LIVE (promoted) avatar file for ``name``, or None."""
+    stem = _avatar_stem(name)
+    for ext in _AVATAR_IMAGE_EXTS:
+        p = _avatars_dir() / f"{stem}.{ext}"
+        if p.is_file():
+            return p
+    return None
+
+
+def _pending_avatar_path(name: str) -> Path | None:
+    """Return the STAGED (uploaded, not yet committed) file, or None."""
+    stem = _avatar_stem(name)
+    for ext in _AVATAR_IMAGE_EXTS:
+        p = _avatars_dir() / f"{stem}.pending.{ext}"
+        if p.is_file():
+            return p
+    return None
+
+
+def _remove_avatar_files(name: str) -> bool:
+    """Delete every stored variant (live + staged + rollback) of ``name``'s
+    avatar.
+
+    Returns False when any unlink failed — the caller decides whether that
+    is reportable (an explicit DELETE must not claim success over a file
+    that is still being served) or best-effort (crew deletion).
+    """
+    stem = _avatar_stem(name)
+    ok = True
+    for ext in _AVATAR_IMAGE_EXTS:
+        for fname in (f"{stem}.{ext}", f"{stem}.pending.{ext}", f"{stem}.prev.{ext}"):
+            try:
+                (_avatars_dir() / fname).unlink(missing_ok=True)
+            except OSError:
+                logger.debug("could not remove avatar file %s for %s", fname, name)
+                ok = False
+    return ok
+
+
+def _discard_pending_avatar(name: str) -> None:
+    """Remove any staged-but-uncommitted upload (best-effort)."""
+    stem = _avatar_stem(name)
+    for ext in _AVATAR_IMAGE_EXTS:
+        try:
+            (_avatars_dir() / f"{stem}.pending.{ext}").unlink(missing_ok=True)
+        except OSError:
+            logger.debug("could not discard pending avatar for %s (.%s)", name, ext)
+
+
+def _staging_token(data: bytes) -> str:
+    """Identity of a staged upload: a content digest the PUT must echo.
+
+    Staging is keyed by crew, so overlapping saves share the slot; the token
+    is what stops save A's commit from promoting save B's bytes.
+    """
+    return hashlib.sha256(data).hexdigest()[:16]
+
+
+def _promote_pending_avatar(name: str, token: str) -> int | None:
+    """Promote the staged upload to live; return its cache stamp.
+
+    Promotes only when the staged bytes match ``token`` (the digest the
+    upload response handed THIS save) — a slot overwritten by a newer save's
+    staging returns None instead of committing someone else's bytes. The
+    previously live file is kept as a ``.prev`` sibling so a config-save
+    failure can roll the promotion back; a failure INSIDE the promotion also
+    restores it, so no step strands the saved picture. The caller MUST
+    follow with :func:`_commit_promoted_avatar` (save succeeded) or
+    :func:`_rollback_promoted_avatar` (save failed). Runs synchronous
+    filesystem work: call via ``asyncio.to_thread``.
+    """
+    pending = _pending_avatar_path(name)
+    if pending is None:
+        return None
+    try:
+        if _staging_token(pending.read_bytes()) != token:
+            return None
+    except OSError:
+        return None
+    stem = _avatar_stem(name)
+    d = _avatars_dir()
+    ext = pending.suffix.lstrip(".")
+    final = d / f"{stem}.{ext}"
+    old = _avatar_path(name)
+    try:
+        if old is not None:
+            # Preserve the currently saved picture (any format) for rollback.
+            replace_with_retry(old, d / f"{stem}.prev{old.suffix}")
+        # replace_with_retry rides out the Windows sharing-violation window an
+        # AV scanner or indexer opens on either path.
+        replace_with_retry(pending, final)
+    except BaseException:
+        _rollback_promoted_avatar(name)
+        raise
+    for other in _AVATAR_IMAGE_EXTS:
+        (d / f"{stem}.pending.{other}").unlink(missing_ok=True)
+    # Nanosecond mtime: a same-size same-second replacement must still get a
+    # fresh ?v= or the browser keeps showing the old bytes.
+    return int(final.stat().st_mtime_ns)
+
+
+def _commit_promoted_avatar(name: str) -> None:
+    """Drop the rollback copy after the config save succeeded."""
+    stem = _avatar_stem(name)
+    for ext in _AVATAR_IMAGE_EXTS:
+        try:
+            (_avatars_dir() / f"{stem}.prev.{ext}").unlink(missing_ok=True)
+        except OSError:
+            logger.debug("could not drop avatar rollback copy for %s (.%s)", name, ext)
+
+
+def _rollback_promoted_avatar(name: str) -> None:
+    """Undo a promotion whose config save failed: restore the old picture."""
+    stem = _avatar_stem(name)
+    d = _avatars_dir()
+    live = _avatar_path(name)
+    if live is not None:
+        live.unlink(missing_ok=True)
+    for ext in _AVATAR_IMAGE_EXTS:
+        prev = d / f"{stem}.prev.{ext}"
+        if prev.is_file():
+            replace_with_retry(prev, d / f"{stem}.{ext}")
+            break
+
+
+def _live_avatar_stamp(name: str) -> int | None:
+    """Cache stamp of the live avatar file, or None when there is none."""
+    live = _avatar_path(name)
+    if live is None:
+        return None
+    try:
+        return int(live.stat().st_mtime_ns)
+    except OSError:
+        return None
+
+
+def _sniff_image_ext(head: bytes) -> str:
+    """Return the format of ``head`` by magic bytes, or ``""``.
+
+    PNG / JPEG / WEBP only — the formats every target browser renders in an
+    ``<img>`` and none of which can carry active content the way SVG can.
+    """
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "webp"
+    return ""
+
+
+async def api_kirocrew_agent_avatar_get(request: web.Request) -> web.Response:
+    """GET /api/agents/{name}/avatar — serve the crew's uploaded picture.
+
+    Owner-gated and SEL-audited like its POST/DELETE peers. ``ETag`` derives
+    from the bytes served, so a replaced picture invalidates even when size
+    and second-granularity mtime coincide.
+    """
+    denied = await _require_owner(request, "agent.avatar_get")
+    if denied is not None:
+        return denied
+    name = request.match_info["name"]
+    # The file is served only while the crew's config actually selects it —
+    # a leftover file after an out-of-band config edit or a failed cleanup
+    # must not remain silently retrievable.
+    cfg = await asyncio.to_thread(KiroCrewConfig.load)
+    agent = cfg.agents.get(name)
+    if agent is None or agent.avatar.get("kind") != "image":
+        return web.json_response(
+            {"error": "no uploaded avatar", "code": "avatar_not_found"}, status=404
+        )
+    path = _avatar_path(name)
+    if path is None:
+        return web.json_response(
+            {"error": "no uploaded avatar", "code": "avatar_not_found"}, status=404
+        )
+    try:
+        data = await asyncio.to_thread(path.read_bytes)
+    except OSError:
+        return web.json_response(
+            {"error": "no uploaded avatar", "code": "avatar_not_found"}, status=404
+        )
+    _sel().log_api_access(
+        caller=request.get("user", "dashboard"),
+        operation="agent.avatar_get",
+        outcome="success",
+        source="dashboard",
+        resources=name,
+    )
+    etag = f'"{hashlib.sha256(data).hexdigest()[:32]}"'
+    if request.headers.get("If-None-Match") == etag:
+        return web.Response(status=304, headers={"ETag": etag})
+    return web.Response(
+        body=data,
+        content_type=_AVATAR_CONTENT_TYPES[path.suffix.lstrip(".")],
+        headers={"ETag": etag, "Cache-Control": "private, max-age=0, must-revalidate"},
+    )
+
+
+async def api_kirocrew_agent_avatar_upload(request: web.Request) -> web.Response:
+    """POST /api/agents/{name}/avatar — STAGE the crew's picture (multipart).
+
+    Staging only: the file lands as ``<stem>.pending.<ext>`` and nothing the
+    roster serves changes. The commit point is the ordinary agent update
+    (`PUT /api/agents/{name}` with ``avatar: {"kind": "image"}``), which
+    promotes the staged file and writes the field under one config lock —
+    so a failed or abandoned Save can never have replaced the live picture,
+    and the editor's Apply→Save two-step holds for images exactly as it
+    does for ghost traits.
+    """
+    denied = await _require_owner(request, "agent.avatar_upload")
+    if denied is not None:
+        return denied
+    name = request.match_info["name"]
+    if not (request.content_type or "").startswith("multipart/"):
+        return web.json_response(
+            {"error": "expected multipart/form-data", "code": "not_multipart"}, status=400
+        )
+    data = bytearray()
+    try:
+        reader = await request.multipart()
+        part = await reader.next()
+        # `next()` may yield a nested MultipartReader (multipart/mixed); only
+        # a concrete body part carries a file, so anything else is skipped.
+        while part is not None and (not isinstance(part, BodyPartReader) or part.name != "file"):
+            part = await reader.next()
+        if part is None:
+            return web.json_response(
+                {"error": "missing 'file' part", "code": "missing_file_part"}, status=400
+            )
+        while True:
+            chunk = await part.read_chunk(64 * 1024)
+            if not chunk:
+                break
+            data.extend(chunk)
+            if len(data) > _AVATAR_MAX_BYTES:
+                return web.json_response(
+                    {
+                        "error": f"avatar exceeds {_AVATAR_MAX_BYTES // 1024} KB limit",
+                        "code": "avatar_too_large",
+                    },
+                    status=413,
+                )
+    except (ValueError, AssertionError):
+        # aiohttp raises plain ValueError for a bad/missing boundary or a
+        # body truncated mid-part; that is caller junk, not a server error.
+        return web.json_response(
+            {"error": "malformed multipart body", "code": "invalid_multipart"}, status=400
+        )
+    ext = _sniff_image_ext(bytes(data[:16]))
+    if not ext:
+        return web.json_response(
+            {
+                "error": "avatar must be a PNG, JPEG, or WEBP image",
+                "code": "avatar_bad_format",
+            },
+            status=400,
+        )
+
+    def _stage() -> None:
+        d = _avatars_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        staged = d / f"{_avatar_stem(name)}.pending.{ext}"
+        # Atomic even for the staging file: a crash mid-write must not leave
+        # a truncated body a later promote would install.
+        tmp = staged.with_suffix(f".{ext}.tmp-{uuid.uuid4().hex[:8]}")
+        try:
+            tmp.write_bytes(bytes(data))
+            os.replace(tmp, staged)
+        finally:
+            tmp.unlink(missing_ok=True)
+        # A re-pick with a different format supersedes the previous staging.
+        for other in _AVATAR_IMAGE_EXTS:
+            if other != ext:
+                (d / f"{_avatar_stem(name)}.pending.{other}").unlink(missing_ok=True)
+
+    # Staging happens under the config lock, with the crew's existence
+    # re-checked inside it: an upload racing a crew deletion must not write
+    # an orphan file the deletion's cleanup already missed. The multipart
+    # body was fully read above, so the lock is held only for the short
+    # filesystem commit.
+    async with _get_config_lock():
+        cfg = await asyncio.to_thread(KiroCrewConfig.load)
+        if name not in cfg.agents:
+            return web.json_response(
+                {"error": f"Agent '{name}' not found", "code": "agent_not_found"},
+                status=404,
+            )
+        await asyncio.to_thread(_stage)
+    _sel().log_api_access(
+        caller=request.get("user", "dashboard"),
+        operation="agent.avatar_upload",
+        outcome="success",
+        source="dashboard",
+        resources=name,
+    )
+    return web.json_response({"ok": True, "staged": True, "token": _staging_token(bytes(data))})
+
+
+async def api_kirocrew_agent_avatar_delete(request: web.Request) -> web.Response:
+    """DELETE /api/agents/{name}/avatar — remove the picture, clear the field."""
+    denied = await _require_owner(request, "agent.avatar_delete")
+    if denied is not None:
+        return denied
+    name = request.match_info["name"]
+    async with _get_config_lock():
+        cfg = await asyncio.to_thread(KiroCrewConfig.load)
+        if name not in cfg.agents:
+            return web.json_response(
+                {"error": f"Agent '{name}' not found", "code": "agent_not_found"},
+                status=404,
+            )
+        agent = cfg.agents[name]
+        if agent.avatar.get("kind") == "image":
+            agent.avatar = {}
+            await asyncio.to_thread(cfg.save)
+        removed = await asyncio.to_thread(_remove_avatar_files, name)
+    if not removed:
+        # The field is already cleared (GET now 404s), but claiming full
+        # success over a file that is still on disk would be a lie.
+        return web.json_response(
+            {"error": "avatar file could not be removed", "code": "avatar_delete_failed"},
+            status=500,
+        )
+    _sel().log_api_access(
+        caller=request.get("user", "dashboard"),
+        operation="agent.avatar_delete",
         outcome="success",
         source="dashboard",
         resources=name,

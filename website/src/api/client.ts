@@ -2418,6 +2418,20 @@ export const api = {
     put('/api/agents/' + encodeURIComponent(name), body).then(j),
   deleteKirocrewAgent: (name: string) =>
     del('/api/agents/' + encodeURIComponent(name)).then(j),
+  /** Stage a crew's picture on the server (a `.pending` file only — the
+   *  config PUT with `avatar: {kind:'image'}` is what promotes it live,
+   *  keeping the editor's Apply→Save two-step a real commit point). */
+  uploadCrewAvatar: (name: string, file: Blob) => {
+    const form = new FormData()
+    form.append('file', file, 'avatar.png')
+    return fetch('/api/agents/' + encodeURIComponent(name) + '/avatar', {
+      method: 'POST',
+      body: form,
+    }).then(j) as Promise<{ ok?: boolean; staged?: boolean; token?: string; error?: string }>
+  },
+  /** Remove a crew's uploaded picture file (and the field, when it points at it). */
+  deleteCrewAvatar: (name: string) =>
+    del('/api/agents/' + encodeURIComponent(name) + '/avatar').then(j),
   models: () => fetch('/api/models').then(j),
   effortLevels: (slot?: string) =>
     fetch('/api/effort-levels' + (slot ? '?slot=' + encodeURIComponent(slot) : '')).then(j) as Promise<string[]>,

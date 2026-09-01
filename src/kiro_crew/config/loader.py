@@ -674,8 +674,17 @@ _AVATAR_TRAIT_MAX_LEN = 32
 def _safe_avatar(value: object) -> dict:
     """Return a validated per-crew avatar override, or ``{}`` on junk.
 
-    Accepted shape: ``{"kind": "ghost", "traits": {...}}``, where traits pins
-    the ghost face trait-by-trait instead of deriving it from the crew name.
+    Accepted shapes:
+
+    - ``{"kind": "ghost", "traits": {...}}`` — pins the ghost face
+      trait-by-trait instead of deriving it from the crew name.
+    - ``{"kind": "image"}`` (optional int ``v``) — the crew wears an uploaded
+      picture, served from ``GET /api/agents/{name}/avatar``. The file itself
+      lives under the data home's ``avatars/`` dir; the config field only
+      marks the choice. ``v`` is the upload's cache-busting stamp (file mtime,
+      seconds): the frontend appends it as ``?v=`` so a replaced picture is
+      re-fetched without waiting out the browser cache.
+
     Empty means "no override" — the frontend keeps rendering the name-seeded
     face. config.json is hand-editable (and agent-writable), so junk collapses
     to ``{}`` rather than crashing the load.
@@ -689,6 +698,13 @@ def _safe_avatar(value: object) -> dict:
     """
     if not isinstance(value, dict):
         return {}
+    if value.get("kind") == "image":
+        out: dict[str, object] = {"kind": "image"}
+        v = value.get("v")
+        # bool is an int subclass; a hand-written `"v": true` must not pass.
+        if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+            out["v"] = v
+        return out
     if value.get("kind") != "ghost":
         return {}
     raw = value.get("traits")
@@ -704,6 +720,13 @@ def _safe_avatar(value: object) -> dict:
         # opposite of what its author wrote. Only a real boolean counts.
         traits[key] = raw.get(key, False) is True
     traits["tile"] = _safe_color(raw.get("tile", ""))
+    # An all-empty trait set (every axis absent) is indistinguishable in
+    # intent from "no override" but would render a featureless ghost. The
+    # builder cannot produce it (Apply always carries the seeded defaults), so
+    # it only arrives via hand-written config or direct API use — collapse it
+    # to the one canonical "reset" spelling instead of storing a third state.
+    if all(not v for v in traits.values()):
+        return {}
     return {"kind": "ghost", "traits": traits}
 
 
@@ -3846,7 +3869,9 @@ class KiroCrewAgentConfig:
             "Avatar",
             "Per-crew avatar override. Empty means the face is derived from "
             "the crew's name. {'kind': 'ghost', 'traits': {...}} pins explicit "
-            "ghost traits chosen in the avatar builder.",
+            "ghost traits chosen in the avatar builder; {'kind': 'image'} "
+            "means an uploaded picture served from the per-crew avatar "
+            "endpoint.",
         ),
     )
 
