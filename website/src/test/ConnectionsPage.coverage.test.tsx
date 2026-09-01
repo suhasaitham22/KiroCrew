@@ -751,7 +751,13 @@ describe('connecting a new provider', () => {
     await waitFor(() => expect(mcpCustomAdd).toHaveBeenCalledWith({ notion: { url: NOTION_URL } }, true))
     expect(mcpProbe).toHaveBeenCalled()
     await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'waiting-for-approval'))
-    expect(screen.getByText('Finish approving in your browser…')).toBeInTheDocument()
+    // jsdom grants no window, so `window.open` returns null and this click lands
+    // on the refused-tab path -- where the neutral heading is the correct copy,
+    // because there is no browser page to finish approving in. Asserted as an
+    // absence: the neutral wording shares its text with the state badge, so a
+    // positive match cannot tell the two apart. The granted-tab wording is
+    // asserted in `the approval tab` below, against a stubbed open.
+    expect(screen.queryByText('Finish approving in your browser…')).toBeNull()
   })
 
   it('asks for the approval URL instead of waiting for one', async () => {
@@ -1375,5 +1381,198 @@ describe('the card description box', () => {
       // lines instead of clipping the second one mid-glyph.
       expect(description).toHaveClass('leading-[17px]')
     }
+  })
+})
+
+// Connect opens the approval tab. The requirement is that one click lands the
+// user on the provider's consent page; the "Re-open approval" link is the
+// recovery path for a tab the browser refused, not the primary route. What makes
+// it delicate is the ordering: POST /api/connections/mint answers BEFORE the URL
+// exists, so the tab has to be opened by the click -- while the user activation
+// is still current -- and filled when the poll produces a URL.
+//
+// `window.open` is swapped by hand rather than with vi.spyOn so the restore is
+// guaranteed by try/finally even when an assertion throws: a leaked stub would
+// silently change every test that ran after it.
+describe('the approval tab', () => {
+  type FakeTab = { closed: boolean; location: { href: string }; close: () => void }
+
+  const fakeTab = () => {
+    const body = { style: '', text: '', setAttribute: (_: string, v: string) => { body.style = v } }
+    const tab = {
+      closed: false,
+      location: { href: '' },
+      closeCalls: 0,
+      // Only the surface the card touches: a body it can style and fill, and a
+      // title. Deliberately not a real DOM -- the assertion is that the card
+      // writes TEXT rather than markup, which a string field states plainly.
+      document: {
+        title: '',
+        get body() {
+          return {
+            setAttribute: body.setAttribute,
+            set textContent(v: string) { body.text = v },
+            get textContent() { return body.text },
+          }
+        },
+      },
+      body,
+      close() {
+        tab.closeCalls += 1
+        tab.closed = true
+      },
+    }
+    return tab
+  }
+
+  const withOpen = async (
+    tab: FakeTab | ReturnType<typeof fakeTab> | null,
+    body: (calls: unknown[][]) => Promise<void>,
+  ): Promise<void> => {
+    const original = window.open
+    const calls: unknown[][] = []
+    window.open = ((...args: unknown[]) => {
+      calls.push(args)
+      return tab as unknown as Window
+    }) as typeof window.open
+    try {
+      await body(calls)
+    } finally {
+      window.open = original
+    }
+  }
+
+  const clickConnect = async () => {
+    fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: 'Connect' })))
+  }
+
+  it('opens the tab on the click, before any URL exists', async () => {
+    // The mint stays in `minting`, so no URL is available at any point here: the
+    // tab must still have been opened, which is the whole popup-blocker fix.
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'minting' })
+    await withOpen(fakeTab(), async calls => {
+      mount()
+      await clickConnect()
+
+      await waitFor(() => expect(connectionsMint).toHaveBeenCalledWith('notion'))
+      expect(calls).toEqual([['', '_blank']])
+    })
+  })
+
+  it('sends the approval URL to the tab the click opened', async () => {
+    const minted = 'https://mcp.notion.com/authorize?state=minted'
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'waiting', oauth_url: minted })
+    const tab = fakeTab()
+    await withOpen(tab, async () => {
+      mount()
+      await clickConnect()
+
+      await waitFor(() => expect(tab.location.href).toBe(minted))
+      // ...and the heading may now say the browser page exists, because it does.
+      expect(within(card('notion')).getByText(/Finish approving in your browser/)).toBeInTheDocument()
+    })
+  })
+
+  it('leaves the link as the way in when the browser refuses the tab', async () => {
+    const minted = 'https://mcp.notion.com/authorize?state=blocked'
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'waiting', oauth_url: minted })
+    // A blocked popup is a null handle, not a throw.
+    await withOpen(null, async () => {
+      mount()
+      await clickConnect()
+
+      const link = await waitFor(() =>
+        within(card('notion')).getByRole('link', { name: /Re-open approval/ }),
+      )
+      expect(link).toHaveAttribute('href', minted)
+      // No tab was granted, so the heading must NOT claim a browser page is open.
+      // Asserted as an absence on purpose: the neutral heading shares its wording
+      // with the state badge, so a positive match would not tell them apart.
+      expect(within(card('notion')).queryByText(/Finish approving in your browser/)).toBeNull()
+    })
+  })
+
+  it('reclaims the blank tab when the attempt fails', async () => {
+    connectionsMint.mockRejectedValue(new Error('mint refused'))
+    const tab = fakeTab()
+    await withOpen(tab, async () => {
+      mount()
+      await clickConnect()
+
+      // The mint never starts, so no URL will ever arrive: leaving the blank tab
+      // open would make the user close it by hand.
+      await waitFor(() => expect(screen.getByText(/mint refused/)).toBeInTheDocument())
+      await waitFor(() => expect(tab.closeCalls).toBe(1))
+    })
+  })
+
+  it('drops a tab the user closed instead of reopening it', async () => {
+    const minted = 'https://mcp.notion.com/authorize?state=closed'
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'waiting', oauth_url: minted })
+    const tab = fakeTab()
+    await withOpen(tab, async () => {
+      mount()
+      await clickConnect()
+      // Simulate the user closing the placeholder before the URL landed. Racing
+      // the poll would make this flaky, so close it and assert on the end state:
+      // whatever the ordering, the card must never resurrect a closed window.
+      tab.closed = true
+
+      const link = await waitFor(() =>
+        within(card('notion')).getByRole('link', { name: /Re-open approval/ }),
+      )
+      expect(link).toHaveAttribute('href', minted)
+    })
+  })
+
+  it('tells the user what the blank tab is for while the mint polls', async () => {
+    // The mint stays in `minting`, which is the whole poll window: a tab left on a
+    // bare about:blank for those seconds reads as a failure of the click.
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'minting' })
+    const tab = fakeTab()
+    await withOpen(tab, async () => {
+      mount()
+      await clickConnect()
+
+      await waitFor(() => expect(tab.body.text).toBe('Connecting…'))
+      expect(tab.document.title).toBe('Connecting…')
+      // Written as text, never markup, so a translated string cannot become nodes.
+      expect(tab.body.text).not.toMatch(/[<>]/)
+      // And laid out without hardcoded colours, so it cannot clash with the theme.
+      expect(tab.body.style).toContain('color-scheme:light dark')
+    })
+  })
+
+  it('never claims an open browser page while the tab stands refused', async () => {
+    // The refused-tab case during the POLL is the gap a boolean gated on
+    // `oauth.minted` could not express: minted is still false here, so the card
+    // used to tell a blocked-popup user to finish in a browser page they never
+    // got -- the same false claim this change set out to remove.
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'minting' })
+    await withOpen(null, async () => {
+      mount()
+      await clickConnect()
+
+      await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'waiting-for-approval'))
+      expect(within(card('notion')).queryByText(/Finish approving in your browser/)).toBeNull()
+    })
+  })
+
+  it('takes the blank tab back when the user cancels mid-mint', async () => {
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'minting' })
+    const tab = fakeTab()
+    await withOpen(tab, async () => {
+      mount()
+      await clickConnect()
+      await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'waiting-for-approval'))
+
+      fireEvent.click(within(card('notion')).getByRole('button', { name: /Cancel/ }))
+
+      // Cancel ends the attempt, so no URL is ever coming. Leaving the tab open
+      // also left the ref stale, and the NEXT Connect click then overwrote it and
+      // orphaned this tab for good -- so the ref being cleared is the half that
+      // matters beyond tidiness.
+      await waitFor(() => expect(tab.closeCalls).toBe(1))
+    })
   })
 })
