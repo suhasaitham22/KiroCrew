@@ -1,0 +1,24 @@
+{
+  "project_type": "Python package (kiro_crew) with a frontend; multi-lane CI. requires-python >=3.10.",
+  "language": "Python (primary), TypeScript/JS (frontend)",
+  "build_system": "setuptools via pyproject.toml + setup.cfg; pytest test suite; CI in .github/workflows/ci.yml",
+  "test_framework": "pytest with xdist (-n auto), pytest-split sharding in CI, pytest-cov; conftest.py at repo root and test/",
+  "build_command": "n/a for this diagnostic task (no product code build required)",
+  "test_command": "pytest test/test_pipeline_conductor_agent.py::TestFleetProbe (normally); BLOCKED in this sandbox - see environment_constraints",
+  "verification_instructions": "Empirical coverage measurement of fleet_probe.py would be: pytest --cov=kiro_crew test/test_pipeline_conductor_agent.py then coverage xml and inspect the fleet_probe.py line-rate. This requires coverage/pytest-cov which are NOT installed and cannot be installed (no PyPI under INTEGRATIONS_ONLY). Disposition therefore rests on static analysis, which is conclusive here.",
+  "snapshot_or_generated_files": ".github/coverage-baselines/backend.txt and frontend.txt are the per-file coverage baselines, maintained by scripts/check_per_file_coverage.py (--seed-baseline create-only, --update-baseline prune-only). fleet_probe.py is intentionally NOT to be added to them.",
+  "setup_instructions": "Repo already cloned at /projects/sandbox/KiroCrew. No dependency install possible in this sandbox.",
+  "environment_constraints": "NETWORK: INTEGRATIONS_ONLY - no external network, no PyPI. Verified coverage/pytest/pytest_cov are NOT importable from any pyenv interpreter (3.11.15, 3.12.13 both ModuleNotFoundError) and `pip install coverage` fails (no matching distribution). Empirical per-file coverage measurement is therefore impossible in-sandbox; the investigation is static.",
+  "contribution_requirements": "No CONTRIBUTING.md rule blocks a docs-only writeup. The per-file gate's own docstring (scripts/check_per_file_coverage.py) states the remedy for a genuinely-bare file is 'add tests, do not extend the baseline'; it does NOT say to baseline a covered file.",
+  "key_patterns": "Skill scripts under src/kiro_crew/builtin_skills/*/scripts/*.py are loaded in tests via test/skill_script_helpers.py::load_skill_script (importlib spec_from_file_location, not registered in sys.modules, no bytecode). coverage.py attributes execution by FILE PATH via [coverage:paths] source=src/, so these scripts ARE measured normally - confirmed by credit_spend.py (same dir, same loader, same test file) being unbaselined and passing the gate. CI backend coverage runs only on 3.12, sharded 4 ways via pytest-split; each shard uploads .coverage.<group>; coverage-combine merges whatever shards are present (no all-shards-present assertion) and always succeeds, so Coverage Gate runs on possibly-partial data. ci.yml lines 581-583 self-document: a 30/40-min shard wall kills a shard at the coverage step with tests green, its artifact never uploads, and the per-file gate then reds on the truncated file (the #7516/#7517 class).",
+  "relevant_files": [
+    "src/kiro_crew/builtin_skills/pipeline-conductor/scripts/fleet_probe.py",
+    "test/test_pipeline_conductor_agent.py",
+    "test/skill_script_helpers.py",
+    "scripts/check_per_file_coverage.py",
+    ".github/coverage-baselines/backend.txt",
+    ".github/workflows/ci.yml",
+    "setup.cfg"
+  ],
+  "directory_structure": "src/kiro_crew/ = package; src/kiro_crew/builtin_skills/pipeline-conductor/scripts/ = fleet_probe.py + credit_spend.py; test/ = pytest suite incl test_pipeline_conductor_agent.py; scripts/ = CI gate scripts; .github/workflows/ci.yml = the coverage pipeline; .github/coverage-baselines/ = per-file baselines."
+}

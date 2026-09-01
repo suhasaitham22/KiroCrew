@@ -1,0 +1,14 @@
+{
+  "task_id": "task-fleet-probe-coverage-investigation",
+  "task_description": "Investigate issue #7597: fleet_probe.py reported at 14.8% failing the per-file coverage floor. Determine whether the file is genuinely undertested (remedy: add tests) or whether the reading is a CI coverage-arm truncation artifact (remedy: documented investigation, no test-writing, no baseline entry). Produce a written investigation report grounded in codebase evidence, plus assess the separate CI-policy suggestion about running Coverage Gate on pushes to main.",
+  "status": "completed",
+  "feature_order": ["FEAT-001"],
+  "blocked_reason": null,
+  "verification": {
+    "build": "skipped",
+    "tests": "skipped",
+    "test_quality": "pass",
+    "docker_build": "skipped",
+    "summary": "Diagnostic/docs task: no product code changed, so build/test/docker are not applicable. Constraints verified held: git status shows only the new untracked .agents/ dir (no changes to test/test_pipeline_conductor_agent.py, fleet_probe.py, ci.yml, or setup.cfg); grep confirms neither fleet_probe nor credit_spend was added to .github/coverage-baselines/backend.txt. All report citations spot-checked against the tree and correct: TestFleetProbe at test/test_pipeline_conductor_agent.py:179 (loader :181, SKILL_DIR :26, 20 test_* methods), TestCreditSpend control case at :453, ci.yml on:push+pull_request at 3-6, concurrency 11-19, coverage-combine downloads coverage-shard-* with merge-multiple:true and no all-shards-present assertion. Empirical coverage measurement was blocked by INTEGRATIONS_ONLY (coverage/pytest_cov absent, no PyPI); disposition reached by static analysis. test_quality=pass reflects that no tests were added by design (existing TestFleetProbe already covers the file)."
+  }
+}
