@@ -82,6 +82,11 @@ export default function Composer(p: Props) {
     )
 
   return (
+    // File drag-and-drop target. Drag-drop is inherently pointer-only, and the
+    // keyboard path to the same action is the drop tile below (role="button",
+    // Enter/Space) which opens the hidden file input. The wrapper itself carries
+    // no click, so it is not a control the keyboard has to reach.
+    // eslint-disable-next-line jsx-a11y/no-static-element-interactions -- drop surface only; the tile inside is the keyboard-operable way to pick the same files
     <div style={S.composerMid} onDragOver={p.onDragOver} onDragLeave={p.onDragLeave} onDrop={p.onDrop}>
       <div style={S.card}>
         <input

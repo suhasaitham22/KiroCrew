@@ -13,7 +13,22 @@ export interface WfEvent {
   seq: number
   ts: string
   type: string
-  data: Record<string, any>
+  /** Unvalidated wire payload: the backend sends a different set of fields per
+   *  `type`, and nothing here parses it, so every read is coerced at the point
+   *  the `type` check has already picked the shape. */
+  data: Record<string, unknown>
+}
+
+/** One payload field as the string the view model needs, or `undefined` when the
+ *  event omits it (or carries something else there). */
+function asString(v: unknown): string | undefined {
+  return typeof v === 'string' ? v : undefined
+}
+
+/** One payload field as a number, with the same "absent or wrong type is absent"
+ *  rule as `asString`. */
+function asNumber(v: unknown): number | undefined {
+  return typeof v === 'number' ? v : undefined
 }
 
 export interface AgentRow {
@@ -40,17 +55,20 @@ export function groupByPhase(events: WfEvent[]): PhaseGroup[] {
   }
   for (const e of events) {
     if (e.type === 'phase_started') {
-      current = e.data.title || ''
+      current = asString(e.data.title) || ''
       ensure(current)
     } else if (e.type === 'agent_started') {
-      const row: AgentRow = { agent_id: e.data.agent_id, label: e.data.label }
-      byId.set(e.data.agent_id, row)
-      ensure(e.data.phase ?? current).agents.push(row)
+      // One binding for the id so the row and its map key cannot disagree when
+      // the event omits `agent_id` — both fold under the empty id.
+      const agentId = asString(e.data.agent_id) ?? ''
+      const row: AgentRow = { agent_id: agentId, label: asString(e.data.label) }
+      byId.set(agentId, row)
+      ensure(asString(e.data.phase) ?? current).agents.push(row)
     } else if (e.type === 'agent_progress') {
-      const row = byId.get(e.data.agent_id)
-      if (row) row.last_tool = e.data.last_tool
+      const row = byId.get(asString(e.data.agent_id) ?? '')
+      if (row) row.last_tool = asString(e.data.last_tool)
     } else if (e.type === 'agent_finished') {
-      const row = byId.get(e.data.agent_id)
+      const row = byId.get(asString(e.data.agent_id) ?? '')
       if (row) row.ok = !!e.data.ok
     }
   }
@@ -91,10 +109,11 @@ export function normalizeRunSessionKey(s: string): string {
 export function latestBudget(events: WfEvent[]): { spent: number; total: number | null } | null {
   let out: { spent: number; total: number | null } | null = null
   for (const e of events) {
-    if (e.type === 'run_started') out = { spent: 0, total: e.data.budget_total ?? null }
+    if (e.type === 'run_started') out = { spent: 0, total: asNumber(e.data.budget_total) ?? null }
     else if (e.type === 'budget_update') {
       const prevTotal: number | null = out ? out.total : null
-      out = { spent: e.data.spent, total: prevTotal }
+      // An update with no `spent` reports nothing spent rather than NaN.
+      out = { spent: asNumber(e.data.spent) ?? 0, total: prevTotal }
     }
   }
   return out

@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { checkSessionExpired, __resetAuthRecoveryStateForTests } from '../api/client'
+import { __resetAuthRecoveryStateForTests } from '../api/client'
 
 // We test that the tips API calls go through the shared response handler by
 // verifying the exported api.tipsNext / api.tipsStatus surface the proper
@@ -45,7 +45,7 @@ describe('tips API auth recovery (jNullable)', () => {
     fetchMock.mockResolvedValue(
       new Response('Internal Server Error', { status: 500, headers: { 'content-type': 'text/plain' } }),
     )
-    const { api, ApiError } = await import('../api/client')
+    const { api } = await import('../api/client')
     await expect(api.tipsStatus()).rejects.toThrow()
   })
 

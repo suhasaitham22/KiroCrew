@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import type { ChatMessage, SubagentActivity, ToolActivity } from '../types'
+import type { RootState } from '../store'
 import reducer, {
   setActiveSlot,
   setPendingInput,
@@ -628,7 +629,7 @@ describe('appendSlotMessage steer reconcile', () => {
     // Real-world duplicate: steer is by definition sent mid-turn, so chunks
     // keep streaming in. The optimistic bubble is NOT the last message when
     // the echo arrives — a tail-only check rendered two steer cards.
-    let state = { ...initial, activeSlot: 'A', messages: [] as any[] }
+    let state = { ...initial, activeSlot: 'A', messages: [] as ChatMessage[] }
     state = reducer(state, appendMessage({ role: 'user', content: 'u should rebase from remote beta', cls: 'msg msg-u', ts: 't1', meta: { steer: true, optimistic: true } }))
     // Streaming content lands between optimistic append and steer_push echo.
     state = reducer(state, appendSlotMessage({ slot: 'A', message: { role: 'thinking', content: '', cls: '' } }))
@@ -642,7 +643,7 @@ describe('appendSlotMessage steer reconcile', () => {
   })
 
   it('reconciles by most-recent optimistic steer bubble when redaction altered the echoed content', () => {
-    let state = { ...initial, activeSlot: 'A', messages: [] as any[] }
+    let state = { ...initial, activeSlot: 'A', messages: [] as ChatMessage[] }
     state = reducer(state, appendMessage({ role: 'user', content: 'raw with secret AKIA123', cls: 'msg msg-u', ts: 't1', meta: { steer: true, optimistic: true } }))
     state = reducer(state, appendSlotMessage({ slot: 'A', message: { role: 'streaming', content: 'working…', cls: 'msg msg-a' } }))
     state = reducer(state, appendSlotMessage({ slot: 'A', message: { role: 'user', content: 'raw with secret [REDACTED]', cls: 'msg msg-u', ts: 't2', meta: { steer: true } } }))
@@ -653,7 +654,7 @@ describe('appendSlotMessage steer reconcile', () => {
   })
 
   it('matches the correct bubble for rapid back-to-back steers', () => {
-    let state = { ...initial, activeSlot: 'A', messages: [] as any[] }
+    let state = { ...initial, activeSlot: 'A', messages: [] as ChatMessage[] }
     state = reducer(state, appendMessage({ role: 'user', content: 'first steer', cls: 'msg msg-u', ts: 'o1', meta: { steer: true, optimistic: true } }))
     state = reducer(state, appendMessage({ role: 'user', content: 'second steer', cls: 'msg msg-u', ts: 'o2', meta: { steer: true, optimistic: true } }))
     // Echo for the FIRST steer arrives after both optimistic bubbles exist.
@@ -746,7 +747,7 @@ describe('appendSlotMessage steer reconcile', () => {
   it('does not reconcile into an unrelated non-steer optimistic user message', () => {
     // A plain queued/optimistic user message (no meta.steer) with different
     // content must NOT swallow a steer echo — the echo appends instead.
-    let state = { ...initial, activeSlot: 'A', messages: [] as any[] }
+    let state = { ...initial, activeSlot: 'A', messages: [] as ChatMessage[] }
     state = reducer(state, appendMessage({ role: 'user', content: 'normal message', cls: 'msg msg-u', ts: 't1', meta: { optimistic: true } }))
     state = reducer(state, appendSlotMessage({ slot: 'A', message: { role: 'user', content: 'a steer', cls: 'msg msg-u', ts: 't2', meta: { steer: true } } }))
     expect(state.messages.filter(m => m.role === 'user')).toHaveLength(2)
@@ -756,7 +757,7 @@ describe('appendSlotMessage steer reconcile', () => {
     // The exact-content-match path must also require meta.steer — a plain
     // optimistic user message that happens to have identical text to the steer
     // echo is a different message and must keep its own bubble.
-    let state = { ...initial, activeSlot: 'A', messages: [] as any[] }
+    let state = { ...initial, activeSlot: 'A', messages: [] as ChatMessage[] }
     state = reducer(state, appendMessage({ role: 'user', content: 'same text', cls: 'msg msg-u', ts: 't1', meta: { optimistic: true } }))
     state = reducer(state, appendSlotMessage({ slot: 'A', message: { role: 'user', content: 'same text', cls: 'msg msg-u', ts: 't2', meta: { steer: true } } }))
     const users = state.messages.filter(m => m.role === 'user')
@@ -770,7 +771,7 @@ describe('appendSlotMessage steer reconcile', () => {
     // Remount-replay regression: the renderer keys rows by clientTs ?? ts.
     // Overwriting ts without stashing the client ts changed the React key,
     // remounting the bubble and replaying the steer entrance animation.
-    let state = { ...initial, activeSlot: 'A', messages: [] as any[] }
+    let state = { ...initial, activeSlot: 'A', messages: [] as ChatMessage[] }
     state = reducer(state, appendMessage({ role: 'user', content: 'steered text', cls: 'msg msg-u', ts: 'client-ts', meta: { steer: true, optimistic: true } }))
     state = reducer(state, appendSlotMessage({ slot: 'A', message: { role: 'user', content: 'steered text', cls: 'msg msg-u', ts: 'server-ts', meta: { steer: true } } }))
     const users = state.messages.filter(m => m.role === 'user')
@@ -781,7 +782,7 @@ describe('appendSlotMessage steer reconcile', () => {
   })
 
   it('does not stash clientTs when the echo carries the same ts (key already stable)', () => {
-    let state = { ...initial, activeSlot: 'A', messages: [] as any[] }
+    let state = { ...initial, activeSlot: 'A', messages: [] as ChatMessage[] }
     state = reducer(state, appendMessage({ role: 'user', content: 'steered text', cls: 'msg msg-u', ts: 'same-ts', meta: { steer: true, optimistic: true } }))
     state = reducer(state, appendSlotMessage({ slot: 'A', message: { role: 'user', content: 'steered text', cls: 'msg msg-u', ts: 'same-ts', meta: { steer: true } } }))
     const users = state.messages.filter(m => m.role === 'user')
@@ -790,7 +791,7 @@ describe('appendSlotMessage steer reconcile', () => {
   })
 
   it('does not stash clientTs when the echo has no ts (optimistic ts kept as-is)', () => {
-    let state = { ...initial, activeSlot: 'A', messages: [] as any[] }
+    let state = { ...initial, activeSlot: 'A', messages: [] as ChatMessage[] }
     state = reducer(state, appendMessage({ role: 'user', content: 'steered text', cls: 'msg msg-u', ts: 'client-ts', meta: { steer: true, optimistic: true } }))
     state = reducer(state, appendSlotMessage({ slot: 'A', message: { role: 'user', content: 'steered text', cls: 'msg msg-u', meta: { steer: true } } }))
     const users = state.messages.filter(m => m.role === 'user')
@@ -2839,7 +2840,7 @@ describe('createSlot.fulfilled switched-away guard', () => {
 describe('selectSlotPendingSpawnApprovals', () => {
   const initial = reducer(undefined, { type: '@@INIT' })
   const withSlot = { ...initial, activeSlot: 'slot-1' }
-  const wrap = (chat: typeof initial) => ({ chat }) as any
+  const wrap = (chat: typeof initial) => ({ chat }) as unknown as RootState
 
   it('returns pending spawn approvals for the active slot', () => {
     const state = reducer(withSlot, sseSubagentPending({ slot: 'slot-1', id: 'a1', task: 'do stuff', approval_id: 'spawn:a1' }))

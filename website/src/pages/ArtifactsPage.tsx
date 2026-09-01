@@ -1164,7 +1164,12 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
     queryFn: () => api.artifacts({}),
   })
 
-  const artifacts = data?.artifacts || []
+  // Memoized because it is the dep of `visible` and `folderPreviews`: the `|| []`
+  // fallback (query not yet resolved) is a fresh array each render, so both —
+  // plus `sortedVisible` / `scopedVisible` downstream of them, and the gallery's
+  // virtualized rows — would recompute on every render. React Query keeps `data`
+  // referentially stable between refetches that resolve deep-equal.
+  const artifacts = useMemo(() => data?.artifacts || [], [data?.artifacts])
   const allTags = useMemo(() => {
     const s = new Set<string>()
     for (const a of allTagsData?.artifacts || []) for (const t of a.tags || []) s.add(t)

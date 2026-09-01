@@ -1055,6 +1055,13 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
     <FilePathMenu filePath={path} kind={kind}>
       <code
         className={`${CHIP_BASE} cursor-pointer hover:underline`}
+        // The element cannot become a <button>: the markdown surface styles
+        // inline code by ELEMENT selector (`.msg-content :not(pre)>code`), and a
+        // button is an inline-BLOCK atom, which is what stopped a long path from
+        // wrapping the last time this chip was made flex (see above). role +
+        // tabIndex + Enter/Space give it the full button behaviour instead, the
+        // same trade SessionChip makes.
+        // eslint-disable-next-line jsx-a11y/no-noninteractive-element-to-interactive-role -- keeps the inline, wrappable, element-styled <code> box while exposing real button semantics and keyboard activation
         role="button"
         tabIndex={0}
         onClick={act}
@@ -3893,7 +3900,7 @@ export function Lightbox() {
   // On any zoom change, recentre at fit and otherwise re-clamp the existing pan
   // to the new (smaller/larger) bounds — zooming out must not strand the image
   // off-screen. Runs post-layout, so offsetWidth already reflects the new box.
-  useEffect(() => { setPan(p => (zoom <= LIGHTBOX_ZOOM_MIN ? { x: 0, y: 0 } : clampPan(p.x, p.y))) }, [zoom, clampPan])
+  useEffect(() => { setPan(p => (zoom <= LIGHTBOX_ZOOM_MIN ? { x: 0, y: 0 } : clampPan(p.x, p.y))) }, [zoom, clampPan, setPan])
   useEffect(() => {
     if (!isOpen) return
     const onKey = (e: KeyboardEvent) => {
@@ -3933,7 +3940,7 @@ export function Lightbox() {
     // modal open and Escape closes only the viewer.
     window.addEventListener('keydown', onKey, true)
     return () => window.removeEventListener('keydown', onKey, true)
-  }, [isOpen, zoomIn, zoomOut])
+  }, [isOpen, zoomIn, zoomOut, setZoom])
   if (!state) return null
   const img = state.images[state.index]
   const zoomed = zoom > LIGHTBOX_ZOOM_MIN

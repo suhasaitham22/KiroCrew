@@ -3168,6 +3168,7 @@
         "copy_markdown": "Copiar markdown",
         "dismiss": "Descartar",
         "edit_resend": "Editar y reenviar",
+        "open_image": "Abrir imagen",
         "open_in_file_explorer": "Abrir en el Explorador de archivos",
         "open_in_finder": "Abrir en Finder",
         "pinned_files": "Archivos fijados",
@@ -3392,7 +3393,8 @@
         "starting": "Iniciando una nueva sesión…"
       },
       "petWidget": {
-        "dismiss_bubble": "Cerrar mensaje"
+        "dismiss_bubble": "Cerrar mensaje",
+        "open_chat": "Abrir chat con {{name}}"
       },
       "petdex": {
         "by_name": "Por nombre o enlace",
