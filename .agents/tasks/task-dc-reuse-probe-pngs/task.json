@@ -1,7 +1,14 @@
 {
   "task_id": "task-dc-reuse-probe-pngs",
   "task_description": "Design Critique backend: reuse the discovery probe's route->PNG captures in /render so a picked route already captured by the probe is not re-captured, only capturing routes the probe did not cover. Cache probe PNG paths keyed by the discovery handle, retain them past discovery (with a TTL/sweep-coordinated window), apply a staleness rule for a changed source dir, and fall back to a fresh capture for uncovered picks. Scoped to src/kiro_crew/apps/builtins/design_critique/backend/routes.py and its tests; capture-build.mjs is not modified.",
-  "status": "in_progress",
+  "status": "completed",
   "feature_order": ["FEAT-001", "FEAT-002"],
-  "blocked_reason": null
+  "blocked_reason": null,
+  "verification": {
+    "build": "skipped",
+    "tests": "skipped",
+    "test_quality": "pass",
+    "docker_build": "skipped",
+    "summary": "Network mode INTEGRATIONS_ONLY blocks PyPI, so `pip install -e '.[dev]'` (build) and `python -m pytest` (tests) cannot run in-sandbox: aiohttp and the kiro_crew package are not importable, and no offline wheels exist. No Dockerfile-based build was attempted for the same reason. Feasible host validation all passed: `python -m py_compile` on backend/routes.py and tests/test_backend_routes.py exits 0; `ruff check backend/routes.py` shows exactly the 6 pre-existing RUF059 findings (FEAT-001 baseline) with no new findings; capture-build.mjs unchanged. test_quality PASS: the added /render tests (all-covered asserts _run is never called, mixed asserts the --routes CSV is only the uncovered ref and merge order, staleness-mismatch re-captures all, covered-PNG-deleted falls back to fresh) each exercise the new reuse code paths and would fail if the reuse logic were reverted; cache/staleness/sweep-purge helper tests are meaningful. Semantic review verdict APPROVED (v1, 2026-09-01-193647-review.md); its two non-blocking notes were addressed (local re-discovery orphan-dir fix + fallback-branch test) or accepted as an intentional documented tradeoff (reused PNGs are viewport, not --full)."
+  }
 }
