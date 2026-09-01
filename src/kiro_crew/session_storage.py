@@ -71,6 +71,7 @@ import os
 import re
 import shutil
 import stat
+import tempfile
 import threading
 import time
 import uuid
@@ -81,7 +82,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import IO, Any
 
 from kiro_crew import hooks, pinned_fs, platform_compat
-from kiro_crew.atomic_write import atomic_write
+from kiro_crew.atomic_write import atomic_write, fsync_dir, replace_with_retry
 from kiro_crew.config.paths import (
     CONFIG_DIR_LEAF,
     KIRO_BASE_DIR_NAME,
@@ -109,6 +110,11 @@ STAGE_CREW_LEAF = "crew"
 
 MANIFEST_NAME = "manifest.jsonl"
 MANIFEST_SCHEMA = 1
+
+# Prefix for a cross-filesystem copy still in flight, so an operator who finds one
+# after a crash can see what it is. Naming only — :func:`_unlisted_files` deliberately
+# does NOT exempt it, because a name says nothing about who wrote it.
+INCOMING_PREFIX = ".kc-incoming-"
 
 # Age buckets (in days) the report splits reclaimable sessions into. The
 # boundaries are what make a threshold choice legible: the reclaimable total is
@@ -1133,6 +1139,39 @@ def _batch_dir(batch_id: str) -> Path:
     return path
 
 
+def _publish_then_drop(src: Path, dst: Path) -> None:
+    """Make a just-created *dst* durable, then remove *src*. Both movers end here.
+
+    One code path for both of :func:`_move_file_exclusive`'s branches, because they have
+    the same shape and the same hazard: a hard link and a copy both leave TWO directory
+    entries for one file, and removing the source is a SECOND metadata operation. Unlike
+    a same-filesystem rename — one atomic operation, where forcing the destination side
+    forces the removal with it — nothing orders these two for us. If the unlink reaches
+    disk and the new name does not, the inode has no name left at all and the session is
+    gone, which is why the destination is synced BEFORE the source is dropped rather than
+    alongside it.
+
+    A failing destination sync withdraws *dst*. This function's callers read an exception
+    as "the origin was not taken", and that is only true if nothing of the move survives:
+    a caller told "not taken" while the origin holds a file keeps its manifest entry AND
+    can never restore it, because every later attempt finds the origin occupied. Only the
+    calling move created *dst*, so removing it destroys nothing that predates the call.
+
+    The source-side sync is ``best_effort`` and runs after the unlink, where nothing may
+    raise: the move is complete by then, so an exception could only mislabel finished work
+    as failed, and a source entry that is not yet durable can at worst resurrect a
+    duplicate — never lose the copy now at *dst*.
+    """
+    try:
+        fsync_dir(dst.parent)
+    except OSError:
+        with suppress(OSError):
+            dst.unlink()
+        raise
+    src.unlink()
+    fsync_dir(src.parent, best_effort=True)
+
+
 def _move_file_exclusive(src: Path, dst: Path) -> bool:
     """Move *src* to *dst*, never replacing an existing *dst*. False if occupied.
 
@@ -1141,6 +1180,9 @@ def _move_file_exclusive(src: Path, dst: Path) -> bool:
     destination silently, so undoing a deletion would destroy the newer data it was
     meant to protect. Creating the destination exclusively makes the check and the
     write one atomic step, so a lost race is reported rather than acted on.
+
+    Both branches finish through :func:`_publish_then_drop`, which is where the
+    durability ordering lives.
     """
     try:
         os.link(src, dst)
@@ -1156,14 +1198,24 @@ def _move_file_exclusive(src: Path, dst: Path) -> bool:
         try:
             with os.fdopen(fd, "wb") as out, open(src, "rb") as handle:
                 shutil.copyfileobj(handle, out)
-            shutil.copystat(src, dst)
+                # Before the unlink, not after: this is the moment the copy stops
+                # being a second copy. Buffered bytes live in this process and then
+                # in the page cache, so without forcing them out a power-off between
+                # the last write and the unlink reaching disk comes back to an
+                # empty-or-partial destination and no source — the one outcome a MOVE
+                # of the only copy must never produce.
+                #
+                # copystat first so the fsync forces the metadata with the bytes.
+                out.flush()
+                shutil.copystat(src, dst)
+                os.fsync(out.fileno())
         except OSError:
             with suppress(OSError):
                 dst.unlink()
             raise
-        src.unlink()
+        _publish_then_drop(src, dst)
         return True
-    src.unlink()
+    _publish_then_drop(src, dst)
     return True
 
 
@@ -1172,15 +1224,81 @@ def _move_file(src: Path, dst: Path) -> None:
 
     A rename is atomic and instant, which is what makes a trash usable at tens of
     gigabytes. It only works within one filesystem, so a data home mounted apart
-    from the kiro-cli store falls back to :func:`shutil.move` — correct, but it
-    copies, so it is slow and needs the space twice while it runs.
+    from the kiro-cli store falls back to a copy — slow, and it needs the space
+    twice while it runs.
+
+    That fallback is NOT ``shutil.move``. ``shutil.move`` copies straight to the
+    final name and then unlinks the source, so it spends the whole copy with a
+    partial file sitting under the name the manifest will record: an exit there
+    leaves a staged file that looks complete and silently is not. Copy into a
+    private incoming name instead, force the bytes out, and publish with a rename —
+    then the destination name only ever exists whole, and the source is not
+    unlinked until it is durable.
     """
     try:
         os.rename(src, dst)
+        return
     except OSError as exc:
         if getattr(exc, "errno", None) != getattr(os, "EXDEV", 18):
             raise
-        shutil.move(str(src), str(dst))
+    _copy_across_filesystems(src, dst)
+
+
+def _copy_across_filesystems(src: Path, dst: Path) -> None:
+    """Copy *src* to *dst* durably and atomically, then remove *src*.
+
+    The incoming file is created in ``dst.parent`` because the publishing step is a
+    rename, and a rename is only atomic within one filesystem — the destination's
+    own directory is the only place that is guaranteed to be. It carries
+    :data:`INCOMING_PREFIX` so a copy interrupted by a crash is recognisable as
+    scratch rather than counted as staged data (see :func:`_unlisted_files`).
+    """
+    fd, tmp_name = tempfile.mkstemp(dir=str(dst.parent), prefix=INCOMING_PREFIX)
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as out, open(src, "rb") as handle:
+            shutil.copyfileobj(handle, out)
+            out.flush()
+            # On the temp, not on dst: dst does not exist yet, and the point is that
+            # the name appears already carrying the source's mode and timestamps. The
+            # mtime in particular is what the rest of this module ages sessions by.
+            #
+            # BEFORE the fsync, because copystat writes the inode and the fsync is
+            # what forces the inode out. After it, a power loss could publish the
+            # bytes under the temp's own 0600 and its creation time instead.
+            shutil.copystat(src, tmp)
+            os.fsync(out.fileno())
+        replace_with_retry(tmp, dst)
+    except BaseException:
+        # BaseException, matching atomic_write: a Ctrl-C mid-copy must not leave the
+        # incoming file behind either. The exception itself propagates untouched.
+        with suppress(OSError):
+            tmp.unlink()
+        raise
+    # Publish, then make the publication durable, and only then drop the source.
+    # Reversing the last two would be the same lost-only-copy window the exclusive
+    # mover guards against.
+    #
+    # A failing sync takes the published name back out. The caller reads an exception
+    # as "this file did not move", and it is only entitled to read it that way if
+    # nothing of the move survives: leaving dst behind would put a file in the batch
+    # that no manifest entry names, which blocks emptying that batch for good. The
+    # source has not been touched yet, so unlinking dst restores the state this call
+    # started in exactly.
+    try:
+        fsync_dir(dst.parent)
+    except OSError:
+        with suppress(OSError):
+            dst.unlink()
+        raise
+    src.unlink()
+    # Nothing raising may follow the unlink. The move is COMPLETE here, and this
+    # function's caller reads an exception as "this file did not move" — it rolls the
+    # session back and omits the file from the manifest, which for a file that HAS
+    # moved is a half-staged session that nothing records: the exact split the loop's
+    # rollback exists to prevent. The source directory still wants syncing (see
+    # :func:`_sync_batch`, which does it once per batch), so the caller collects it
+    # rather than paying a per-file sync here.
 
 
 def _file_stamp(path: Path) -> tuple[int, float]:
@@ -1321,6 +1439,15 @@ def _unlisted_files(batch: Path) -> list[Path]:
 
     An unreadable manifest yields every file, which is the safe direction: without
     the manifest nothing in the batch is accounted for.
+
+    There is deliberately NO exemption for the incoming name
+    :func:`_copy_across_filesystems` writes, even though a crash can leave one here and
+    a caller then cannot empty the batch until an operator removes it. A name is not
+    proof of who wrote it: everything else in this module's threat model assumes a
+    batch can be planted in (a linked manifest, a file substituted at the manifest's
+    name), so anything that may rename a file inside a batch could pick that prefix and
+    have this scan pass over a staged file the manifest never approved for deletion.
+    Blocking a deletion that should proceed is recoverable; letting one through is not.
 
     A scan that cannot be completed RAISES rather than returning a short list. This
     function exists to block deletions, so an empty result must mean "there is
@@ -1892,6 +2019,83 @@ def _rewrite_manifest(batch: Path, header: dict[str, Any], entries: list[dict[st
     header_line = json.dumps(header) + "\n"
     entry_lines = "".join(json.dumps(entry) + "\n" for entry in entries)
     atomic_write(batch / MANIFEST_NAME, header_line + entry_lines, fsync=True)
+    # ``fsync=True`` made the new CONTENT durable; this makes the rename that gave
+    # it the manifest's name durable. Without it a power-off just after this returns
+    # can come back to the pre-restore manifest, which lists files restore has
+    # already moved back out — an entry that now names live session data.
+    fsync_dir(batch)
+
+
+def _levels_between(root: Path, leaf: Path) -> list[Path]:
+    """Every directory from *root*'s first child down to *leaf*, shallowest first.
+
+    ``mkdir(parents=True)`` creates intermediates, and a directory's own NAME lives in
+    its PARENT's entries — so syncing only the leaf leaves the entries that reach it
+    unrecorded. ``relative_to`` bounds the walk: a leaf outside *root* raises here
+    rather than climbing past it.
+    """
+    levels: list[Path] = []
+    level = root
+    for part in leaf.relative_to(root).parts:
+        level = level / part
+        levels.append(level)
+    return levels
+
+
+def _fsync_tree(root: Path, leaf: Path) -> None:
+    """Sync *root* and every level down to *leaf*, deepest first."""
+    for level in reversed(_levels_between(root, leaf)):
+        fsync_dir(level)
+    fsync_dir(root)
+
+
+def _sync_batch(
+    target: Path,
+    staged_dirs: set[Path],
+    manifest: IO[str],
+    source_dirs: set[Path] | None = None,
+) -> None:
+    """Force a staged batch out to disk: the manifest's bytes, then every name.
+
+    Called at each point :func:`_move_to_trash_locked` can leave a batch on disk,
+    because until this runs the batch is only durable by luck. The moves themselves
+    are renames, whose metadata a journalling filesystem commits on its own
+    schedule; the manifest is buffered text. So a power-off just after the move
+    reported success can come back to a batch holding the sessions' only copies with
+    an empty manifest — and a batch with no readable manifest is one
+    :func:`list_trash` omits, which puts those files out of reach of restore AND of
+    empty. That is the loss this whole layer exists to prevent, arrived at by
+    reporting success too early.
+
+    Order matters. The manifest's CONTENT first, because it is what makes the moves
+    reversible; then the directories that hold the staged names, deepest first, so a
+    child's entries are durable before the entry naming that child is.
+
+    A failing sync RAISES rather than being logged away. The files have already moved,
+    so raising costs the caller a reported failure for work that partly happened —
+    but the alternative is reporting a durable batch that is not one, and the batch is
+    the only copy. Each caller decides what to do with it; nothing is swallowed here.
+
+    *source_dirs* — the live-store directories the batch drained — are the exception,
+    on both counts. They are synced ONCE here rather than per file, because the
+    same-filesystem path is a bare ``os.rename`` and a sync per staged file is exactly
+    the cost that would stop a trash working at tens of gigabytes; and they are synced
+    ``best_effort`` because a source entry that is not yet durable can only resurrect
+    a name whose staged copy is intact — a duplicate the user thought they reclaimed,
+    never a lost session. Raising for that after the batch is fully recorded would
+    report a completed move as failed.
+
+    This does not make a crash MID-move consistent — a batch interrupted halfway
+    still holds files its manifest never named, which is what :func:`_unlisted_files`
+    exists to protect. It makes a move that RETURNED durable.
+    """
+    manifest.flush()
+    os.fsync(manifest.fileno())
+    for staged in sorted(staged_dirs, key=lambda path: len(path.parts), reverse=True):
+        fsync_dir(staged)
+    fsync_dir(target)
+    for source in sorted(source_dirs or (), key=lambda path: len(path.parts), reverse=True):
+        fsync_dir(source, best_effort=True)
 
 
 def _entry_bytes(entry: dict[str, Any]) -> int:
@@ -2105,6 +2309,17 @@ def _move_to_trash_locked(
     # ancestor reaching a different directory - however convincingly it is dressed up - is
     # refused rather than emptied.
     created_identity = _identity_of(target)
+    # And the entry itself has to exist ON DISK before anything is moved in: the batch
+    # directory is about to become the only home of these files, so a crash with the
+    # mkdir still in the page cache would come back to no batch directory at all — and
+    # the files were renamed INTO it, so they would be gone with it.
+    #
+    # Every level down from the data home, not just target.parent: on the FIRST batch
+    # this machine ever stages, parents=True creates `trash/` and `trash/sessions/`
+    # too, and an unsynced `trash/sessions` entry takes the batch inside it. Bounded
+    # by relative_to, which raises rather than climbing past the data home if the
+    # trash root is ever moved out from under it (_batch_dir already refuses that).
+    _fsync_tree(data_home(), target.parent)
     archives = _archive_index()
 
     moved_bytes = 0
@@ -2112,6 +2327,7 @@ def _move_to_trash_locked(
     revived: list[str] = []
     refresh_failed = False
     staged_dirs: set[Path] = set()
+    source_dirs: set[Path] = set()
     cli_files = _cli_index()
     with (target / MANIFEST_NAME).open("w", encoding="utf-8") as manifest:
         _write_header(manifest, batch_id, clock, reason)
@@ -2198,13 +2414,17 @@ def _move_to_trash_locked(
                 dst = target / rel
                 if dst.parent not in staged_dirs:
                     dst.parent.mkdir(parents=True, exist_ok=True)
-                    staged_dirs.add(dst.parent)
+                    staged_dirs.update(_levels_between(target, dst.parent))
                 try:
                     _move_file(src, dst)
                 except OSError:
                     logger.warning("could not move %s into the trash", src, exc_info=True)
                     failed = True
                     break
+                # The live-store directory this file just left. Synced once at the end
+                # rather than per file, because the same-filesystem path is a bare
+                # rename and this is the hot path (see :func:`_sync_batch`).
+                source_dirs.add(src.parent)
                 done.append((dst, src))
                 files.append({"rel": rel, "origin": str(src), "bytes": size})
             if woke:
@@ -2240,6 +2460,27 @@ def _move_to_trash_locked(
                     # place" would be false, so raise instead — matching how this
                     # module already treats a file it could not put back — and name
                     # the batch so the fragment can be found.
+                    #
+                    # The message promises the fragment "can be restored", and that
+                    # is only true of a manifest that reached disk: sync before
+                    # raising, because nothing after this point will.
+                    #
+                    # A sync failure here is logged rather than raised — the one place
+                    # in this module where that is right. This path is ALREADY
+                    # failing, with an error that names which session was resumed and
+                    # where its fragment is; replacing that with an OSError would cost
+                    # the operator the only pointer to the fragment in exchange for
+                    # information the log line already carries.
+                    try:
+                        _sync_batch(target, staged_dirs, manifest, source_dirs)
+                    except OSError:
+                        logger.warning(
+                            "could not sync %s while recording the stranded half of %r; "
+                            "the fragment is on disk but may not survive a power loss",
+                            target,
+                            uid,
+                            exc_info=True,
+                        )
                     raise SessionStorageError(
                         f"session {uid!r} was resumed while being staged and could "
                         f"not be fully put back; what is still staged is recorded in "
@@ -2275,6 +2516,9 @@ def _move_to_trash_locked(
                     continue
                 moved_sessions += 1
                 moved_bytes += sum(int(record["bytes"]) for record in files)
+        # Inside the handle's scope, so the manifest can still be synced through the
+        # descriptor that wrote it. Closing only flushes to the OS.
+        _sync_batch(target, staged_dirs, manifest, source_dirs)
 
     if revived:
         # Reported, not just skipped: the endpoint's own rule is that doing less

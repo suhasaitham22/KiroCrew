@@ -310,9 +310,55 @@ reversible move into data loss.
 
 On a default install both stores sit under `~/.kiro`, so staging is a
 same-filesystem `os.rename`: instant regardless of size, and instantly reversible.
-A data home mounted apart from the kiro-cli store falls back to `shutil.move`,
-which copies — correct, but slow and needing the space twice while it runs.
+A data home mounted apart from the kiro-cli store falls back to a copy — correct,
+but slow and needing the space twice while it runs.
 `StorageReport.trash_same_filesystem` reports which case applies.
+
+**The cross-filesystem copy is atomic and durable, in that order.**
+`_copy_across_filesystems()` copies into an `INCOMING_PREFIX` name beside the
+destination, carries the source's metadata onto it, `fsync`s it, publishes it with
+`replace_with_retry`, `fsync`s the destination's directory, and unlinks the source.
+Nothing there is cosmetic: copying straight to the final name (what `shutil.move`
+does) spends the whole copy with a partial file under the name the manifest will
+record; `copystat` runs BEFORE the file `fsync` because it writes the inode and the
+`fsync` is what forces the inode out, so the other order can publish the bytes under
+the temp's own `0600` and creation time — and this module ages sessions by their mtime;
+and unlinking before the destination `fsync` can return to a durable absence of the
+source with the destination's bytes still in the page cache.
+
+**Nothing that can raise runs after the unlink.** The staging loop reads an exception
+from the mover as "this file did not move" — it rolls the session back and omits the
+file from the manifest — so raising after the file HAS moved produces a half-staged
+session nothing records, which is the split the rollback exists to prevent. The source
+directory still wants syncing, because copy-then-unlink is TWO operations (unlike the
+same-filesystem rename, which is one, so forcing the destination side forces the
+removal with it) and a crash between them can leave BOTH names: a live session the user
+was told had been reclaimed beside a staged copy the manifest records as trashed. So
+the loop collects the drained directories and `_sync_batch()` syncs them once, after
+the batch is fully recorded, `best_effort` — a non-durable source entry can only
+resurrect a duplicate, never lose a copy. `test_nothing_that_can_raise_runs_after_a_file_has_moved`
+and `test_the_drained_source_directories_are_synced_once_per_batch` pin both halves.
+
+The incoming name is naming only: `_unlisted_files()` deliberately does NOT exempt it,
+because a name says nothing about who wrote it and this module's threat model already
+assumes a batch can be planted in. So a crash mid-copy leaves debris that blocks
+emptying that batch until an operator clears it — the same posture main already has for
+an interrupted cross-filesystem move, whose partial file is equally unlisted.
+`TestCrossFilesystemStaging` fails if the copy publishes under the final name, skips
+any of the syncs, or if the scan starts passing over the incoming prefix.
+
+**`fsync_dir()` is quiet only where a directory sync cannot be expressed.** Windows
+has no directory descriptor to open and some network mounts reject `fsync` on a
+directory, so those return without complaint; every other errno is raised. The
+distinction is load-bearing rather than fussy, because each caller's next step is to
+destroy the only other copy — a swallowed `EIO` would hand it a false "durable" just
+before the unlink. `best_effort=True` downgrades even that to a warning, and is for
+callers whose operation is ALREADY COMMITTED (the drained source directories above; the
+vault's key and store writes, where a raise would report a stored secret as never
+written and drop it from a migration's rollback set). It is a keyword rather than a
+bare `except OSError` per call site so the decision is visible and still logged.
+`TestFsyncDirDiscriminates` fails if a device error is logged away by default or if a
+platform without directory descriptors starts raising.
 
 **Staging does not free space.** The bytes stay on disk until the trash is
 emptied. `StorageReport.trash_bytes` and the payload's `trash.still_on_disk` exist
@@ -321,9 +367,9 @@ its own payload.
 
 ### Manifests
 
-Every new batch starts an append-only `manifest.jsonl`: a header line followed by one entry per staged session recording each file's relative staged path, original path, and size. `_append_entry()` flushes each entry, but it does not `fsync`, so the implementation does not promise device-persistent durability across a power loss. `_manifest_records()` retains every valid record it can read and ignores a trailing malformed record, while `_unlisted_files()` prevents deletion of files that no retained manifest entry names. `TestTrashAccounting::test_a_truncated_final_line_does_not_lose_the_batch` pins that recovery posture.
+Every new batch starts an append-only `manifest.jsonl`: a header line followed by one entry per staged session recording each file's relative staged path, original path, and size. `_append_entry()` flushes each entry, and `_sync_batch()` `fsync`s the manifest and then EVERY staged directory level, deepest first, at each point `_move_to_trash_locked()` can leave a batch on disk. That is what makes a move that RETURNED durable: the moves are renames whose metadata the filesystem commits on its own schedule, so without it a power loss could come back to the sessions' only copies under an empty manifest — and a batch with no readable manifest is omitted from `list_trash()`, out of reach of restore and of empty alike. Every level, not just each file's own parent, because `mkdir(parents=True)` also creates the intermediates and a directory's name lives in its PARENT's entries — a session with archive segments but no transcript never otherwise records `crew` at all, and on the FIRST batch a machine ever stages the same call creates `trash/` and `trash/sessions/`, whose own entries `_fsync_tree()` walks down from the data home. A failing sync RAISES: the batch is the only copy, so reporting a durable batch that is not one is worse than reporting a failure for work that partly happened. The single exception is the "resumed while being staged" path, which is already raising an error that names the session and locates its fragment; there a sync failure is logged so that pointer is not replaced by an `OSError`. None of this makes a crash mid-move consistent; a batch interrupted halfway still holds files its manifest never named, which is what `_unlisted_files()` is for. `_manifest_records()` retains every valid record it can read and ignores a trailing malformed record, while `_unlisted_files()` prevents deletion of files that no retained manifest entry names. `TestTrashAccounting::test_a_truncated_final_line_does_not_lose_the_batch` pins that recovery posture, and `TestStagedBatchDurability` fails if a returned move left the manifest or any staged directory level unsynced.
 
-A partial restore is the exception to append-only growth: `_rewrite_manifest()` writes a temporary replacement and uses `os.replace`. That gives readers the old or replacement pathname during the running filesystem operation, not a power-loss durability guarantee. A batch with no readable manifest is omitted from `list_trash()`: its files could not be put back, so offering it as restorable would be a false promise.
+A partial restore is the exception to append-only growth: `_rewrite_manifest()` writes the replacement through `atomic_write(..., fsync=True)` and then `fsync`s the batch directory, so both the new content and the rename that gave it the manifest's name are durable before the call returns. Without the directory half a power loss could return the pre-restore manifest, whose entries name files restore has already moved back into live storage. A batch with no readable manifest is omitted from `list_trash()`: its files could not be put back, so offering it as restorable would be a false promise.
 
 **A manifest that is a link stops the empty before anything is removed**
 (`SKIP_UNREADABLE`), and the check runs BEFORE the manifest is read and before the
@@ -751,7 +797,15 @@ so undoing a deletion would destroy the newer data it exists to protect.
 `_move_file_exclusive()` creates the destination exclusively (`os.link`, falling back
 to `O_CREAT | O_EXCL` across filesystems), making the check and the write one atomic
 step. A lost race rolls the session back and **retains** its manifest entry, because
-restoring the rest would splice two generations of one session together.
+restoring the rest would splice two generations of one session together. On the copy
+branch the destination is `fsync`ed and its directory `fsync`ed **before** the source
+is unlinked, and the source's directory `fsync`ed after: that unlink is the moment the
+copy stops being a second copy, buffered bytes on the far side of it are a session a
+power loss can erase from both places at once, and a non-durable unlink can instead
+leave both names — a session restored into live storage while its staged copy is still
+in the batch under its manifest entry.
+`test_a_cross_filesystem_restore_syncs_before_it_unlinks_the_source`
+fails if either sync moves after the unlink.
 
 `_rollback()` uses the same exclusive move. A rollback runs *after* something already
 failed, so the origin may have been recreated in the meantime, and a plain rename
