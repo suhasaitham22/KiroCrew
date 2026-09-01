@@ -276,6 +276,7 @@ const UserMessage = memo(function UserMessage({ content, meta, timestamp, timest
             className="text-muted hover:text-text p-0.5 rounded transition-colors"
             title={pinned ? i18nT('pages.chat.userMessage.unpin_message') : i18nT('pages.chat.userMessage.pin_message')}
             aria-label={pinned ? i18nT('pages.chat.userMessage.unpin_message') : i18nT('pages.chat.userMessage.pin_message')}
+            aria-pressed={!!pinned}
           >
             {pinned ? <PinOff size={14} /> : <Pin size={14} />}
           </button>

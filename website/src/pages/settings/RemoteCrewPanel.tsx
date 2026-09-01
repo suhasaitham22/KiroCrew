@@ -65,6 +65,8 @@ import type { ErrorReport } from '../../utils/errorReport'
 import { parseErrorCode } from '../../utils/errorReport'
 import { reportInstanceFailure } from '../../utils/instanceFailureReport'
 import { readPersistedString, usePersistedString } from '../../hooks/usePersistedString'
+import { usePersistedBool } from '../../hooks/usePersistedBool'
+import { AUTO_CONNECT_KEY } from '../../hooks/useAutoConnectInstances'
 import { copyToClipboard } from '../../utils/clipboard'
 import { useAppDispatch, useAppSelector } from '../../store'
 import { removeWarm, setCrewEditForm } from '../../store/instancesSlice'
@@ -652,6 +654,10 @@ export function RemoteCrewPanel() {
   const dispatch = useAppDispatch()
   const [tab, setTab] = useState<'crews' | 'setup'>('crews')
   const remoteCrewChat = usePreviewFlag(PREVIEW_REMOTE_CREW_CHAT)
+  // Default-on: when set, the web app auto-connects every crew on load and on
+  // tab focus (see useAutoConnectInstances). Off lets a many-crew user stop the
+  // per-load SSH + token-mint fan-out.
+  const [autoConnect, setAutoConnect] = usePersistedBool(AUTO_CONNECT_KEY, true)
 
   // Setup-tab form + preflight state. `checkedProfile`/`checkedRegion` are the
   // committed values the preflight ran against, so typing a profile does not
@@ -1162,6 +1168,14 @@ export function RemoteCrewPanel() {
               description={i18nT('pages.settings.remoteCrewPanel.chat_on_a_crew_desc')}
               checked={remoteCrewChat}
               onChange={v => setPreviewFlag(PREVIEW_REMOTE_CREW_CHAT, v)}
+            />
+          </Card>
+          <Card>
+            <SettingsToggle
+              label={i18nT('pages.settings.remoteCrewPanel.auto_connect')}
+              description={i18nT('pages.settings.remoteCrewPanel.auto_connect_desc')}
+              checked={autoConnect}
+              onChange={setAutoConnect}
             />
           </Card>
           <Card>

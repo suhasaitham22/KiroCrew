@@ -2426,6 +2426,12 @@ export const api = {
     post('/api/chat/slots/' + encodeURIComponent(slot) + '/agent', { agent }).then(j) as Promise<{ ok?: boolean; agent?: string; workspace?: string }>,
   chatSlotModel: (slot: string, model: string) =>
     post('/api/chat/slots/' + encodeURIComponent(slot) + '/model', { model }).then(j) as Promise<{ ok?: boolean; model?: string }>,
+  /** This slot's auto-compact threshold override (null = follows the global). */
+  chatSlotAutocompact: (slot: string) =>
+    fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/autocompact').then(j) as Promise<{ pct: number | null; global_pct: number; min: number; max: number }>,
+  /** Set (number) or clear (null) this slot's auto-compact threshold override. */
+  setChatSlotAutocompact: (slot: string, pct: number | null) =>
+    post('/api/chat/slots/' + encodeURIComponent(slot) + '/autocompact', { pct }).then(j) as Promise<{ ok?: boolean; pct: number | null; global_pct: number }>,
   chatSlotsModel: (model: string, skip_running: boolean) =>
     post('/api/chat/slots/model', { model, skip_running }).then(j) as Promise<{ ok: boolean; model: string; switched: string[]; skipped_running: string[]; unchanged: string[]; failed: string[] }>,
   chatSlotReasoningEffort: (slot: string, reasoning_effort: string) =>
@@ -2541,7 +2547,15 @@ export const api = {
   setWebhooksEnabled: (enabled: boolean) => post('/api/webhooks/switch', { enabled }).then(j),
   // Prompts (Agent SOPs)
   prompts: () => fetch('/api/prompts').then(j),
-  promptDetail: (name: string) => fetch('/api/prompts/' + name.split('/').map(encodeURIComponent).join('/')).then(j),
+  promptDetail: (name: string, scope?: 'global' | 'local') =>
+    fetch('/api/prompts/' + name.split('/').map(encodeURIComponent).join('/')
+      + (scope ? '?scope=' + scope : '')).then(j),
+  createPrompt: (name: string, content: string, scope: 'global' | 'local') =>
+    post('/api/prompts', { name, content, scope }).then(j),
+  updatePrompt: (name: string, scope: 'global' | 'local', content: string, baseHash: string) =>
+    put('/api/prompts/' + encodeURIComponent(name) + '?scope=' + scope, { content, base_hash: baseHash }).then(j),
+  deletePrompt: (name: string, scope: 'global' | 'local') =>
+    del('/api/prompts/' + encodeURIComponent(name) + '?scope=' + scope).then(j),
   // Skills
   // sessionKey names the REAL chat slot so the server can resolve THIS chat's
   // project and include its `<project>/.kiro/skills`. Without it the shared

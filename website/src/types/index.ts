@@ -3,9 +3,16 @@ export interface StatusData {
   start_time?: number
   sessions: number
   messages: number
-  cron_jobs: number
+  /**
+   * `null` means UNKNOWN — the WS pusher's count refresh has not succeeded
+   * yet (e.g. the lesson store is failing). StatCard renders null as a
+   * loading skeleton; publishing 0 instead would assert an authoritative
+   * false zero (issue #7204). HTTP/SSE paths always send numbers.
+   */
+  cron_jobs: number | null
   subagents: number
-  lessons: number
+  /** See cron_jobs — null = unknown, rendered as a skeleton, never a fake 0. */
+  lessons: number | null
   /**
    * Is a newer build available? `null`/absent means NO VERDICT — a check that
    * never ran, or one that failed. Only `true` may light an update affordance,

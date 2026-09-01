@@ -134,6 +134,7 @@ import { getCapsuleSegments } from './apps/capsuleSegments'
 import { FEATURE_REQUEST_PROMPT_FALLBACK } from './prompts/featureRequest'
 import { useKeyboardShortcuts, IS_MAC } from './hooks/useKeyboardShortcuts'
 import { useInstanceShortcuts } from './hooks/useInstanceShortcuts'
+import { useAutoConnectInstances } from './hooks/useAutoConnectInstances'
 import { useCommandPalette } from './hooks/useCommandPalette'
 import { useProvider } from './providers/context'
 import { useAgents } from './hooks/useAgents'
@@ -2215,6 +2216,11 @@ export default function App() {
   // Registered here (once) rather than in InstanceTabBar, which can mount more
   // than once (strip + inline header copies).
   useInstanceShortcuts()
+
+  // Proactively bring remote-crew tunnels up on web-app load and on tab focus
+  // (behind the default-on mc-auto-connect setting), so a crew is live without
+  // a manual switcher click. Registered here once, like useInstanceShortcuts.
+  useAutoConnectInstances()
 
   // Kiro CLI monthly credit usage. /api/sessions/usage TRIGGERS the background
   // `kiro-cli /usage` fetch AND returns the cached result, so the pill is

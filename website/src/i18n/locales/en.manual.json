@@ -1134,6 +1134,8 @@
       "constants": {
         "blocked_figma_app_missing_hint": "Open the file in Figma desktop and try again, or export the frames as PNGs and drop them here.",
         "blocked_figma_app_missing_say": "I can’t reach Figma — the desktop app isn’t running, or I don’t have the Figma tools available.",
+        "blocked_figma_export_needed_hint": "Export each frame as a PNG and drop them in as screenshots — I critique the pixels either way.",
+        "blocked_figma_export_needed_say": "I can’t pull frames straight from a Figma link here — I don’t run the Figma desktop tools.",
         "blocked_figma_file_closed_hint": "Open it in Figma desktop, then try again.",
         "blocked_figma_file_closed_say": "Figma is running, but that file isn’t open.",
         "blocked_figma_no_permission_auth_lead": "Figma access is per account, and I read whatever the desktop app has open — I have no login of my own. Here is how to fix it.",
@@ -1143,8 +1145,6 @@
         "blocked_figma_no_permission_auth_tail": "If access isn’t coming, exporting the frames as PNGs works just as well — I critique pixels either way.",
         "blocked_figma_no_permission_hint": "Ask for access, or export the frames as PNGs and drop them here.",
         "blocked_figma_no_permission_say": "Your Figma account can’t view that file.",
-        "blocked_no_access_auth_lead": "Git access is set up per machine, not per app — do it once and every private repo works, here and everywhere else. Run these in your terminal.",
-        "blocked_no_access_auth_tail": "Then come back and press Try again. I never ask for or store a token — anything pasted into this app would end up in a saved transcript.",
         "blocked_no_access_hint": "If you have it checked out, give me the folder path instead.",
         "blocked_no_access_say": "I couldn’t open that repo. It’s either private (and I have no credentials for it) or it doesn’t exist — GitHub returns the same error for both.",
         "blocked_not_found_hint": "Check the owner and name, or give me a local folder path.",
@@ -1444,7 +1444,12 @@
       "queue_run_after_the_current_work_finishes_desc": "Run after the current work finishes",
       "steer_act_on_this_right_away_desc": "Act on this right away",
       "finishing": "Finishing…",
-      "keep_holding_to_record": "Keep holding to record"
+      "keep_holding_to_record": "Keep holding to record",
+      "auto_compact_at": "Auto-compact at",
+      "auto_compact_threshold": "Auto-compact threshold",
+      "auto_compact_load_failed": "Couldn't load the auto-compact setting",
+      "reset_to_global": "Reset to global ({{pct}}%)",
+      "following_global": "Following global ({{pct}}%)"
     },
     "chatPane": {
       "earlier_messages_load_failed": "Couldn't load earlier messages. Scroll to the top of the session to try again.",
@@ -4077,12 +4082,10 @@
         "save": "Save"
       },
       "promptsTab": {
-        "prompts_count": "Prompts ({{count}})",
-        "prompts_filtered_count": "Prompts ({{count}} of {{total}})",
+        "failed_to_load_prompts": "Failed to load prompts",
+        "no_prompts_match_query": "No prompts match “{{query}}”.",
         "saved_prompts_from": "Saved prompts from {{registry}} and ~/.kiro/prompts/. Invoke with @name in chat or /prompts get name.",
-        "user_prompts_count": "User Prompts ({{count}})",
-        "user_prompts_filtered_count": "User Prompts ({{count}} of {{total}})",
-        "failed_to_load_prompts": "Failed to load prompts"
+        "user_prompts_count": "User Prompts ({{count}})"
       },
       "skillsTab": {
         "adds_new_requirements_to": "Adds new requirements to {{target}} — {{description}}",
@@ -4682,7 +4685,9 @@
       },
       "remoteCrewPanel": {
         "chat_on_a_crew": "Chat on a crew",
-        "chat_on_a_crew_desc": "Adds “New chat on crew” to the create menu, which starts a session that runs on a connected crew. Unfinished: it opens in that crew’s own pane, and sessions running on a crew are not listed here yet."
+        "chat_on_a_crew_desc": "Adds “New chat on crew” to the create menu, which starts a session that runs on a connected crew. Unfinished: it opens in that crew’s own pane, and sessions running on a crew are not listed here yet.",
+        "auto_connect": "Auto-connect crews",
+        "auto_connect_desc": "When on, opening the web app connects every crew automatically, and reconnects them when you come back to the tab. Turn off to connect a crew only when you switch to it."
       },
       "privacyPanel": {
         "recordMetricsLabel": "Record metrics",

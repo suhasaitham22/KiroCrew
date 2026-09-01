@@ -12,14 +12,14 @@ import {
   ArrowLeft, Download, Check, Loader2, Power, PowerOff,
   Trash2, RefreshCw, Bot, Zap, ArrowUp,
   Clock, ChevronLeft, ChevronRight, X, Monitor, Copy, Terminal,
-  Sparkles, Target, Settings2,
+  Sparkles, Target, Settings2, Star,
 } from 'lucide-react'
 import { needsDesktopApp } from '../lib/electron'
 import { api } from '../api/client'
 import { PageHeader, Card, CardTitle, Badge, Btn } from '../components/ui'
 import AppIcon from '../components/AppIcon'
 import TrustAppModal, { APP_EXECUTION_DENIED, isTrustDeniedError, useTrustGate } from '../components/appstore/TrustAppModal'
-import { isRegistrySourced } from '../components/appstore/types'
+import { isRegistrySourced, sanitizeStargazersCount } from '../components/appstore/types'
 import { recordEvent } from '../rum'
 import { useTheme } from '../hooks/useTheme'
 import { DOUBLE_TAP_MS, DOUBLE_TAP_SLOP, DOUBLE_TAP_ZOOM, usePinchZoom } from '../hooks/usePinchZoom'
@@ -31,7 +31,7 @@ import {
 } from '../components/appstore/appManifest'
 import { isBuiltinServerRow, mergeBuiltinRow } from '../components/appstore/mergeBuiltinRow'
 import { classifyManifestArt, installedArt, installedArtList, installedArtListAligned, installedIcon } from '../components/appstore/useHeroArt'
-import { fmtDateNumeric } from '../i18n/format'
+import { fmtDateNumeric, fmtCompact, fmtNumber } from '../i18n/format'
 type AppInfo = {
   name: string
   displayName: string
@@ -69,6 +69,12 @@ type AppInfo = {
   repo?: string
   trustRepository?: string
   branch?: string
+  /**
+   * GitHub star count baked into git-type third-party rows by the publisher.
+   * Display-only and server-sanitized; built-ins never carry it, so presence
+   * is the display gate.
+   */
+  stargazersCount?: number
   // Installed state
   installed: boolean
   installedVersion?: string
@@ -646,6 +652,10 @@ export default function AppDetailPage() {
             resources: installed.resources,
             lifecycle: installed.lifecycle,
             updateAvailable: registryEntry.updateAvailable || false,
+            // Built-ins never carry a star count (they have no repository of
+            // their own) — enforce the invariant here rather than trusting the
+            // spread above, since mergeBuiltinRow copies the raw server row.
+            stargazersCount: undefined,
             manifest: m,
           })
         } else {
@@ -751,6 +761,7 @@ export default function AppDetailPage() {
             // fallback identifier is a separate decision from resolving art.
             repo: registryEntry?.repo || '',
             trustRepository: installed.trustRepository,
+            stargazersCount: sanitizeStargazersCount(registryEntry?.stargazersCount),
             installed: true,
             installedVersion: installed.version,
             enabled: installed.enabled,
@@ -774,6 +785,11 @@ export default function AppDetailPage() {
           description: registryEntry.description || '',
           version: registryEntry.version || '0.0.0',
           author: registryEntry.author || '',
+          // The spread above copies the RAW listRegistry payload, which never
+          // went through normalizeRegistryApp — sanitize the display-only star
+          // count explicitly so a hostile/older gateway cannot render NaN/-1
+          // or a layout-breaking 1e308 here (the list path is already covered).
+          stargazersCount: sanitizeStargazersCount(registryEntry.stargazersCount),
           // Preserve install status from registry (set by detectInstalled)
           installed: registryEntry.installed ?? false,
           platform: registryEntry.platform,
@@ -1226,7 +1242,15 @@ export default function AppDetailPage() {
               {app.installed && isSelfManaged && !isBuiltin && <Badge variant="ok">{i18nT('pages.appDetailPage.self_managed')}</Badge>}
               {app.installed && !isSelfManaged && !isBuiltin && <Badge variant={app.enabled ? 'ok' : 'warn'}>{app.enabled ? i18nT('pages.appDetailPage.enabled') : i18nT('pages.appDetailPage.disabled')}</Badge>}
             </div>
-            <div className="text-[13px] text-muted mb-3">{app.author} {i18nT('pages.appDetailPage.v_2')}{app.version}</div>
+            <div className="text-[13px] text-muted mb-3 flex items-center gap-1 flex-wrap">
+              <span>{app.author} {i18nT('pages.appDetailPage.v_2')}{app.version}</span>
+              {typeof app.stargazersCount === 'number' && (
+                <span className="inline-flex items-center gap-0.5">
+                  · <Star size={13} className="shrink-0" role="img" aria-label={i18nT('pages.appDetailPage.github_stars')} />
+                  {fmtCompact(app.stargazersCount)}
+                </span>
+              )}
+            </div>
 
             {/* Actions */}
             <div className="flex items-center gap-2 flex-wrap">
@@ -1595,6 +1619,7 @@ export default function AppDetailPage() {
             <CardTitle>{i18nT('pages.appDetailPage.details')}</CardTitle>
             <div className="grid gap-1.5 mt-2 text-[13px] text-muted">
               {app.repo && <div>{i18nT('pages.appDetailPage.repository')} {app.repo}</div>}
+              {typeof app.stargazersCount === 'number' && <div>{i18nT('pages.appDetailPage.github_stars_2', { value: fmtNumber(app.stargazersCount) })}</div>}
               {app.author && <div>{i18nT('pages.appDetailPage.author')} {app.author}</div>}
               {app.installedAt && <div>{i18nT('pages.appDetailPage.installed')} {fmtDateNumeric(app.installedAt)}</div>}
               {app.origin && <div>{i18nT('pages.appDetailPage.origin')} {app.origin} {i18nT('pages.appDetailPage.resources_2')} {app.resources || 'gateway'} {i18nT('pages.appDetailPage.lifecycle')} {app.lifecycle || 'gateway'}</div>}

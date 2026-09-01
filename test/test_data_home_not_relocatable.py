@@ -259,14 +259,16 @@ class TestTheFencedPathsAreHiddenFromSubprocesses:
     protected only against the spelling nobody uses.
     """
 
-    # The keystone leaves this branch's base already fences by NAME. Both halves of
-    # the coupling are assertable for these.
-    MUST_BE_HIDDEN = [
-        ".kiro/crew/profiles",
-        ".kiro/crew/security_policy.json",
-        ".kiro/crew/admission_policy.json",
-        ".kiro/crew/computer_use.json",
-    ]
+    # The keystone leaves this branch's base originally fenced by NAME and hid
+    # outright. `profiles`, `security_policy.json`, `admission_policy.json`, and
+    # `computer_use.json` moved to the READONLY disposition on `main` (#7439):
+    # in-sandbox code (a script cron's `boot_platform()`) READS each of these, so
+    # hiding them as an empty stub broke the legitimate reader instead of
+    # protecting the ceiling. `test_sandbox_governance_mask.py`'s
+    # `TestKeystonesAreSealedInEveryMode` covers that coupling now -- sealed
+    # read-only rather than hidden, on every tier and both backends -- so nothing
+    # is left here that is both name-fenced AND hidden.
+    MUST_BE_HIDDEN: "list[str]" = []
 
     # Hidden here, but fenced by NAME only once the crew-variables work lands, so the
     # command-gate half of the coupling cannot be asserted on this base yet. Listed
@@ -276,11 +278,12 @@ class TestTheFencedPathsAreHiddenFromSubprocesses:
     # `.kiro/crew/variables` itself is NOT listed here: this branch creates and reads
     # no such store (that lands with #4371), so hiding it protects nothing yet and
     # belongs with the PR that adds the store (First Principles review).
+    #
+    # `crons.json` is NOT listed here either: #7439 moved it to
+    # `_CREW_SANDBOX_VISIBLE_LEAVES` (`mcp_cron` builds a `CronService` in-sandbox
+    # and both reads and rewrites the job store through it), so hiding it here
+    # would break cron scheduling from a chat session.
     HIDDEN_AHEAD_OF_ITS_NAME_FENCE = [
-        # Persisted authorship records. Same reasoning: the flag is derived carefully
-        # in process and forgeable on disk, so the file has to be out of reach. Name
-        # fence lands with the crew-variables work; the hide list is independent.
-        ".kiro/crew/crons.json",
         ".kiro/crew/autonudge.json",
     ]
 
@@ -299,13 +302,11 @@ class TestTheFencedPathsAreHiddenFromSubprocesses:
             hidden.update(getattr(sandbox, name, []))
         return hidden
 
+    # `security_policy.json`, `admission_policy.json`, `computer_use.json`,
+    # `denied_commands.json`, and `crons.json` moved off `_KEYSTONE_FILES`
+    # entirely with #7439 -- see the comment on `sandbox._KEYSTONE_FILES` itself.
     KEYSTONE_FILES = [
-        ".kiro/crew/security_policy.json",
-        ".kiro/crew/admission_policy.json",
-        ".kiro/crew/computer_use.json",
-        ".kiro/crew/crons.json",
         ".kiro/crew/autonudge.json",
-        ".kiro/crew/denied_commands.json",
     ]
 
     @pytest.mark.skipif(
@@ -357,22 +358,28 @@ class TestTheFencedPathsAreHiddenFromSubprocesses:
         assert ".npmrc" in sandbox._build_launcher_script("cc")
         assert ".npmrc" not in sandbox._build_launcher_script("standard")
 
-    def test_the_directories_still_hold_on_every_tier(self) -> None:
+    def test_profiles_does_not_return_to_the_hide_lists(self) -> None:
+        """Regression guard, not a hiding assertion: `profiles` moved to the
+        READONLY disposition (#7439) specifically because in-sandbox code reads
+        it, so re-adding it to a hide list would silently reopen the "hiding a
+        ceiling removes it" bug that move fixed."""
         from kiro_crew import sandbox
 
-        for d in (".kiro/crew/profiles",):
-            for tier in ("_STRICT_DIRS", "_STANDARD_DIRS", "_CC_DIRS"):
-                assert d in getattr(sandbox, tier), f"{d} missing from {tier}"
+        for tier in ("_STRICT_DIRS", "_STANDARD_DIRS", "_CC_DIRS"):
+            assert ".kiro/crew/profiles" not in getattr(
+                sandbox, tier
+            ), f"profiles is back in {tier} -- it must stay in _CREW_READONLY_LEAVES instead"
 
-    def test_the_cron_record_is_the_one_cron_actually_writes(self) -> None:
+    def test_the_cron_record_is_the_one_cron_declares_visible(self) -> None:
         """Derived, because a hardcoded name passed while covering nothing.
 
-        An earlier revision hid `cron.json`; cron writes `crons.json`. The hide list
-        takes plain strings, so the wrong name is silently inert -- there is no file to
-        fail against."""
+        An earlier revision hid `cron.json`; cron writes `crons.json`. #7439 moved
+        the real store to `_CREW_SANDBOX_VISIBLE_LEAVES` (`mcp_cron` reads and
+        rewrites it in-sandbox), so the coupling this test guards is now with
+        THAT list, not with `_KEYSTONE_FILES`."""
         from kiro_crew import cron, sandbox
 
-        assert f".kiro/crew/{cron._CRONS_FILE}" in sandbox._KEYSTONE_FILES
+        assert cron._CRONS_FILE in sandbox._CREW_SANDBOX_VISIBLE_LEAVES
 
     @pytest.mark.parametrize("path", MUST_BE_HIDDEN)
     def test_each_fenced_path_is_hidden_from_the_agent(self, path: str) -> None:
@@ -404,13 +411,9 @@ class TestTheFencedPathsAreHiddenFromSubprocesses:
         assert path in self._all_hidden()
         assert path.replace(".kiro/crew/", ".kirocrew/") in self._all_hidden()
 
-    def test_hiding_is_in_every_mode_not_only_strict(self) -> None:
-        """A protection that only applies in strict mode is absent on the default."""
-        from kiro_crew import sandbox
-
-        for name in ("_STRICT_DIRS", "_STANDARD_DIRS", "_CC_DIRS"):
-            entries = getattr(sandbox, name)
-            assert ".kiro/crew/profiles" in entries, f"{name} does not hide the store"
+    # `profiles` sealed read-only "in every mode, not only strict" is covered by
+    # `test_sandbox_governance_mask.py::TestKeystonesAreSealedInEveryMode`, which
+    # parametrizes the identical property over every tier and both backends.
 
 
 class TestTheMatcherDoesNotDivergeFromBash:
@@ -1063,7 +1066,7 @@ class TestTheDataHomeReanchoringItself:
     -- covering none of this.
     """
 
-    @pytest.mark.parametrize("leaf", ["profiles", ".vault"])
+    @pytest.mark.parametrize("leaf", [".vault"])
     def test_a_crew_relative_entry_is_reanchored(self, monkeypatch, tmp_path, leaf) -> None:
         from kiro_crew import sandbox
 
@@ -1085,8 +1088,8 @@ class TestTheDataHomeReanchoringItself:
         from kiro_crew import sandbox
 
         monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "crewdata"))
-        assert ".kiro/crew/profiles" in sandbox._STRICT_DIRS
-        assert ".kirocrew/profiles" in sandbox._STRICT_DIRS
+        assert ".kiro/crew/.vault" in sandbox._STRICT_DIRS
+        assert ".kirocrew/.vault" in sandbox._STRICT_DIRS
 
 
 class TestRepeatedTrailingSeparators:
@@ -1388,40 +1391,20 @@ class TestTheSeatbeltProfileMatchesTheLinuxLauncher:
         return str(config_dir())
 
     @pytest.mark.parametrize("tier", ["standard", "cc", "strict"])
-    @pytest.mark.parametrize(
-        "leaf",
-        [
-            "security_policy.json",
-            "admission_policy.json",
-            "computer_use.json",
-            "crons.json",
-            "autonudge.json",
-        ],
-    )
-    def test_a_keystone_file_is_read_and_WRITE_denied(self, crew_root, tier, leaf) -> None:
-        """Write, not just read. Forging `computer_use.json` is how an agent grants
-        itself the operator's own opt-in, and a read-only deny leaves that open."""
+    def test_a_keystone_file_is_read_and_WRITE_denied(self, crew_root, tier) -> None:
+        """Write, not just read. Forging `autonudge.json` after a reload is the
+        same class of bypass `_KEYSTONE_FILES` closes for a subprocess. The other
+        keystone JSON files (`security_policy.json`, `admission_policy.json`,
+        `computer_use.json`, `denied_commands.json`) moved to the READONLY
+        disposition (#7439) -- in-sandbox code READS them, so they stay
+        write-denied but WITHOUT a read-deny; that coupling is covered by
+        `test_sandbox_governance_mask.py::TestKeystonesAreSealedInEveryMode`,
+        which asserts the read-deny's ABSENCE as part of the same property.
+        """
         profile = self._profile(tier)
-        target = os.path.join(crew_root, leaf)
+        target = os.path.join(crew_root, "autonudge.json")
         assert '(deny file-read* (literal "%s"))' % target in profile
         assert '(deny file-write* (literal "%s"))' % target in profile
-
-    @pytest.mark.parametrize("leaf", ["profiles"])
-    def test_a_keystone_directory_follows_the_custom_home(self, crew_root, leaf) -> None:
-        assert '(deny file-read* (subpath "%s"))' % os.path.join(crew_root, leaf) in self._profile(
-            "standard"
-        )
-
-    @pytest.mark.parametrize("tier", ["standard", "cc", "strict"])
-    def test_the_profiles_directory_is_read_and_WRITE_denied(self, crew_root, tier) -> None:
-        """GPT review: `file-read*` alone hides the governance profiles'
-        CONTENT but leaves the directory itself renamable -- a sandboxed
-        `os.rename(".../profiles", ...)` makes it vanish, and whatever
-        hot-reloads governance profiles on this host could read that
-        absence as "no restrictions configured" instead of failing closed.
-        Same treatment the policy cache and voice runtime already get."""
-        target = os.path.join(crew_root, "profiles")
-        assert '(deny file-write* (subpath "%s"))' % target in self._profile(tier)
 
     def test_credential_files_keep_read_only_denial(self, crew_root) -> None:
         """`.npmrc` and `.git-credentials` are read-denied but NOT write-denied: npm and
@@ -3643,13 +3626,21 @@ class TestDeniedCommandsJsonIsAKeystoneFile:
     subprocess never goes through that gate -- but was missing from
     `sandbox._KEYSTONE_FILES`, the list that hides these files from an agent's OWN
     sandboxed subprocess on every tier.
+
+    Superseded by #7439 (landed on `main` after this finding): the OS-level
+    control for all four moved from `_KEYSTONE_FILES` (hide as an empty stub) to
+    `_CREW_READONLY_LEAVES` (seal read-only, keep the real content readable) --
+    `hooks.read_denied_commands_config` reads this file IN-SANDBOX, and a hidden
+    stub broke that read the same way a hidden `profiles/` broke `boot_platform()`.
+    `test_sandbox_governance_mask.py::TestKeystonesAreSealedInEveryMode` now
+    covers `denied_commands.json` under that disposition, on every tier and both
+    backends -- a strictly stronger guarantee than list membership alone.
     """
 
-    def test_denied_commands_json_is_in_the_keystone_list(self) -> None:
+    def test_denied_commands_json_is_a_declared_readonly_ceiling(self) -> None:
         from kiro_crew import sandbox
 
-        assert ".kiro/crew/denied_commands.json" in sandbox._KEYSTONE_FILES
-        assert ".kirocrew/denied_commands.json" in sandbox._KEYSTONE_FILES
+        assert "denied_commands.json" in sandbox._CREW_READONLY_LEAVES
 
 
 class TestADeclarationBuiltinsOwnFlagsDoNotHideTheAssignment:
@@ -3817,16 +3808,22 @@ class TestAPartiallyGlobShapedGroupIsNotTreatedAsFullyEnumerated:
 class TestAnAbsentKeystoneFileGetsASafePlaceholder:
     """GPT review: the Linux namespace sandbox hides a keystone FILE by bind-
     mounting an empty tmpfs file OVER it, and `mount(2)` requires the target to
-    already exist -- so a keystone file this box never configured
-    (`computer_use.json` on most fresh installs, since it is operator opt-in
-    only) got no hiding mount at all. Nothing then stopped a sandboxed
-    subprocess from CREATING `computer_use.json` with `{"enabled": true, ...}`
+    already exist -- so a keystone file this box never configured got no hiding
+    mount at all. Nothing then stopped a sandboxed subprocess from CREATING it
     directly -- the exact "opaque script defeats the tool gate" bypass
     `_KEYSTONE_FILES` exists to close, just for a file that happens not to exist
     yet. `_sensitive_file_placeholders` maps each keystone file with a content
     confirmed to read BYTE-IDENTICALLY to "absent" through its own loader to the
     text materialized (then immediately hidden by the same mount) before that
     check, so the mount can exist at all.
+
+    `computer_use.json`, `denied_commands.json`, and `admission_policy.json` --
+    the files this class originally exercised -- moved to the READONLY
+    disposition (#7439) and left `_KEYSTONE_FILES`; their absence is now handled
+    by `READONLY_DIRS`'s own `os.path.exists` guard, which needs no placeholder
+    at all (an absent ceiling is simply left absent, matching what happens
+    outside the sandbox too). `autonudge.json`, the one entry still hidden this
+    way, exercises the identical mechanism.
     """
 
     def test_every_registered_placeholder_is_a_real_keystone_entry(self) -> None:
@@ -3835,37 +3832,18 @@ class TestAnAbsentKeystoneFileGetsASafePlaceholder:
         for entry in sandbox._KEYSTONE_FILE_ABSENT_PLACEHOLDERS:
             assert entry in sandbox._KEYSTONE_FILES
 
-    def test_computer_use_json_has_the_reported_pocs_placeholder(self) -> None:
+    def test_autonudge_json_has_a_registered_placeholder(self) -> None:
         from kiro_crew import sandbox
 
-        assert sandbox._KEYSTONE_FILE_ABSENT_PLACEHOLDERS[".kiro/crew/computer_use.json"] == b"{}"
-        assert sandbox._KEYSTONE_FILE_ABSENT_PLACEHOLDERS[".kirocrew/computer_use.json"] == b"{}"
-
-    def test_governance_policy_files_are_deliberately_excluded_or_special_cased(
-        self,
-    ) -> None:
-        """`security_policy.json` has NO content that reads the same as absent:
-        any PRESENT file either parses -- and then fails `parse_policy`'s
-        `version == 1` check -- or fails to parse, and BOTH raise
-        `PlatformCompositionError` (abort boot), unlike absence's clean `None`
-        return (boots fine, ungoverned defaults). `admission_policy.json`'s only
-        safe placeholder is UNPARSEABLE content, not a plain `{}` -- `{}` is
-        valid JSON and `AdmissionPolicy.from_dict({})` fails OPEN
-        (`mode=MODE_OPEN`, no signature required), the opposite of absence's
-        fail-CLOSED `_fail_closed_policy()`."""
-        from kiro_crew import sandbox
-
-        assert ".kiro/crew/security_policy.json" not in sandbox._KEYSTONE_FILE_ABSENT_PLACEHOLDERS
-        assert ".kirocrew/security_policy.json" not in sandbox._KEYSTONE_FILE_ABSENT_PLACEHOLDERS
-        assert sandbox._KEYSTONE_FILE_ABSENT_PLACEHOLDERS[".kiro/crew/admission_policy.json"] == b""
-        assert sandbox._KEYSTONE_FILE_ABSENT_PLACEHOLDERS[".kirocrew/admission_policy.json"] == b""
+        assert sandbox._KEYSTONE_FILE_ABSENT_PLACEHOLDERS[".kiro/crew/autonudge.json"] == b"{}"
+        assert sandbox._KEYSTONE_FILE_ABSENT_PLACEHOLDERS[".kirocrew/autonudge.json"] == b"{}"
 
     def test_the_placeholder_map_is_anchored_to_the_real_home(self) -> None:
         from kiro_crew import sandbox
 
         files = sandbox._CC_FILES + sandbox._KEYSTONE_FILES
         placeholders = sandbox._sensitive_file_placeholders(files)
-        expected = os.path.join(HOME, ".kiro", "crew", "computer_use.json")
+        expected = os.path.join(HOME, ".kiro", "crew", "autonudge.json")
         assert placeholders.get(expected) == "{}"
 
     def test_an_unregistered_keystone_file_is_absent_from_the_map(self) -> None:
@@ -3884,7 +3862,7 @@ class TestAnAbsentKeystoneFileGetsASafePlaceholder:
         monkeypatch.setenv("KIROCREW_HOME", str(custom))
         files = sandbox._CC_FILES + sandbox._KEYSTONE_FILES
         placeholders = sandbox._sensitive_file_placeholders(files)
-        assert placeholders.get(os.path.join(str(custom), "computer_use.json")) == "{}"
+        assert placeholders.get(os.path.join(str(custom), "autonudge.json")) == "{}"
 
     # The materialize-then-hide RUNTIME behavior (exclusive create, an existing
     # file left untouched, an unregistered file left absent) is covered against

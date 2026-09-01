@@ -850,3 +850,19 @@ describe('action footer touch sizing', () => {
     expect(screen.getByTitle('Regenerate').className).toContain('p-0.5')
   })
 })
+
+describe('pin toggle a11y state', () => {
+  // The pin toggle is a stateful control: assistive tech needs its on/off
+  // state via aria-pressed, not only the title/aria-label text swap.
+  it('exposes aria-pressed on the pin toggle reflecting the pinned prop', () => {
+    const { rerender } = render(
+      <AssistantMessage content="Hi" isStreaming={false} slotRunning={false} messageTs="ts-pin" onTogglePin={() => {}} />
+    )
+    expect(screen.getByTitle('Pin message')).toHaveAttribute('aria-pressed', 'false')
+
+    rerender(
+      <AssistantMessage content="Hi" isStreaming={false} slotRunning={false} messageTs="ts-pin" pinned onTogglePin={() => {}} />
+    )
+    expect(screen.getByTitle('Unpin message')).toHaveAttribute('aria-pressed', 'true')
+  })
+})

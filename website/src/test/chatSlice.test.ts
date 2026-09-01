@@ -25,6 +25,7 @@ import reducer, {
   sseSubagentTool,
   sseSubagentDone,
   sseSubagentSnapshot,
+  sseSubagentRetrying,
   sseToolActivity,
   sseToolResult,
   sseActivityEvent,
@@ -1391,6 +1392,20 @@ describe('subagent reducers', () => {
       streaming: '', last_tool: '', started: 1,
     }))
     expect(state.subagents['a1'].model).toBe('claude-opus-4.8')
+  })
+
+  it('sseSubagentSnapshot preserves a live retrying flag on reconnect (#7472-adjacent)', () => {
+    // A subagent_retrying frame set retrying=true on a still-running card; a
+    // reconnect replay snapshot must not blank the ⟳ cue (it carries no attempt
+    // field, so it can only preserve, never set, retrying).
+    let state = reducer(withSlot, sseSubagentSpawn({ slot: 'slot-1', id: 'a1', task: 't', agent: 'kirocrew' }))
+    state = reducer(state, sseSubagentRetrying({ slot: 'slot-1', id: 'a1', attempt: 1 }))
+    expect(state.subagents['a1'].retrying).toBe(true)
+    state = reducer(state, sseSubagentSnapshot({
+      id: 'a1', slot: 'slot-1', task: 't', agent: 'kirocrew',
+      streaming: '', last_tool: '', started: 1,
+    }))
+    expect(state.subagents['a1'].retrying).toBe(true)
   })
 
   it('sseSubagentSpawn preserves existing streaming text from pending', () => {

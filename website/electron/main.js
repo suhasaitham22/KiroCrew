@@ -1692,8 +1692,10 @@ function setupWindowContents(win, backendUrl) {
       removeView: (v) => win.contentView.removeChildView(v),
       // Chrome the embedded page needs but the module must not import Electron
       // for: the shared right-click menu (spelling suggestions, cut/copy/paste,
-      // Look Up). Safe for untrusted content — every item is a plain edit role,
-      // none reaches app state.
+      // Look Up, Copy Link Address). Safe for untrusted content — every item is
+      // a plain edit role or a clipboard write, none reaches app state. No
+      // origin is passed: an arbitrary site's same-origin pathname that happens
+      // to exist on disk is not a local file.
       onCreate: (v) => attachContextMenu(v.webContents),
       onEvent: (name, payload) => {
         // Page-driven window.open goes to the real browser, never a second
@@ -1910,7 +1912,11 @@ function setupWindowContents(win, backendUrl) {
   });
   win._mcAgentChannel.start();
 
-  attachContextMenu(view.webContents);
+  // The dashboard's own webContents, so the link block also gets the origin --
+  // which is what turns a `/abs/path` link into a bare-path copy instead of a
+  // useless localhost URL. The embedded browser panel below passes no origin:
+  // an arbitrary site's same-origin pathname is not a local file.
+  attachContextMenu(view.webContents, { getAppOrigin: () => backendUrl });
 
   // Keep native window controls centered in the zoom-scaled header row.
   // "zoom-changed" covers pinch / ctrl+wheel gestures; the View-menu zoom

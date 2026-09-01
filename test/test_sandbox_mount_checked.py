@@ -136,6 +136,7 @@ def _run(
     keystone_files: "list[str] | None" = None,
     extra_sensitive_dirs: "list[str] | None" = None,
     trust_root_dirs: "list[str] | None" = None,
+    extra_readonly_dirs: "list[str] | None" = None,
 ) -> tuple[_FakeLibc, str | None]:
     """Run the mount region. Returns ``(fake_libc, refusal_message_or_None)``.
 
@@ -183,7 +184,7 @@ def _run(
         "EXPOSE_FILES": [],
         "SENSITIVE_DIRS": [str(aws)] + (extra_sensitive_dirs or []),
         "TRUST_ROOT_DIRS": trust_root_dirs or [],
-        "READONLY_DIRS": [str(cache)],
+        "READONLY_DIRS": [str(cache)] + (extra_readonly_dirs or []),
         "SENSITIVE_FILES": [str(lone)] + (extra_sensitive_files or []),
         "SENSITIVE_FILE_PLACEHOLDERS": sensitive_file_placeholders or {},
         "KEYSTONE_FILES": keystone_files or [],
@@ -268,14 +269,20 @@ def test_a_symlinked_trust_root_directory_refuses_the_spawn(tmp_path: Path) -> N
     leaving the link's own directory-entry slot exactly as replaceable as
     ever, same as the file case above and the container's own `UNRENAMABLE_DIRS`
     check this mirrors. Run through the REAL, verbatim-extracted region: a
-    symlinked `profiles/` (a TRUST_ROOT_DIRS entry) must refuse the spawn
-    rather than silently protect the wrong directory.
+    symlinked entry HIDDEN via `SENSITIVE_DIRS` and named in `TRUST_ROOT_DIRS`
+    (`policy_cache`/`voice-runtime`-shaped -- `profiles/` moved to the
+    `READONLY_DIRS`-sealed disposition in #7439, covered by the sibling test
+    below) must refuse the spawn rather than silently protect the wrong
+    directory.
     """
-    real_profiles = tmp_path / "home" / "real_profiles"
-    real_profiles.mkdir(parents=True, exist_ok=True)
-    symlinked = tmp_path / "home" / ".kiro" / "crew" / "profiles"
+    # A synthetic stand-in path, not the real ``.kiro/crew/policy_cache`` --
+    # ``_run`` already materializes a REAL directory at that exact path for
+    # its own READONLY_DIRS fixture, so reusing it here would collide.
+    real_target = tmp_path / "home" / "real_trust_root"
+    real_target.mkdir(parents=True, exist_ok=True)
+    symlinked = tmp_path / "home" / ".kiro" / "crew" / "voice-runtime"
     symlinked.parent.mkdir(parents=True, exist_ok=True)
-    symlinked.symlink_to(real_profiles, target_is_directory=True)
+    symlinked.symlink_to(real_target, target_is_directory=True)
     libc, refusal = _run(
         tmp_path,
         fail_at=None,
@@ -290,6 +297,50 @@ def test_a_symlinked_trust_root_directory_refuses_the_spawn(tmp_path: Path) -> N
     # in the loop -- the refusal fires before the mount call, not alongside it.
     mounted_targets = [call[1] for call in libc.calls]
     assert str(symlinked).encode() not in mounted_targets
+
+
+def test_a_symlinked_readonly_ceiling_refuses_the_spawn(tmp_path: Path) -> None:
+    """#7439 moved `profiles/` (and the other governance ceilings) from
+    `SENSITIVE_DIRS` (hidden) to `READONLY_DIRS` (sealed read-only via a
+    bind-over-self plus an `MS_RDONLY` remount), so `_is_profiles_dir` no
+    longer sees it in `hidden_dirs` and the `TRUST_ROOT_DIRS` check above
+    stops firing for it -- but the shipped `READONLY_DIRS` loop merged in
+    from #7439 guards on `os.path.exists`, which follows a symlink exactly
+    the way `os.path.isdir` does. A symlinked `profiles/` would bind-and-seal
+    the link's TARGET for the session while its own directory-entry slot
+    stayed replaceable, reopening the identical bypass the `SENSITIVE_DIRS`
+    check above closes -- just relocated to the loop `profiles/` actually
+    flows through now. Every `READONLY_DIRS` entry is one of Crew's own
+    generated trust roots (a ceiling file, the governance cache, the
+    launcher's own parent), never a credential path an operator would
+    legitimately symlink, so this refusal is unconditional across the whole
+    list rather than scoped like `TRUST_ROOT_DIRS`.
+    """
+    real_profiles = tmp_path / "home" / "real_profiles"
+    real_profiles.mkdir(parents=True, exist_ok=True)
+    symlinked = tmp_path / "home" / ".kiro" / "crew" / "profiles"
+    symlinked.parent.mkdir(parents=True, exist_ok=True)
+    symlinked.symlink_to(real_profiles, target_is_directory=True)
+    libc, refusal = _run(tmp_path, fail_at=None, extra_readonly_dirs=[str(symlinked)])
+    assert refusal is not None
+    assert "sandbox: BLOCKED" in refusal
+    assert "symlink" in refusal
+    assert str(symlinked) in refusal
+    # No mount was attempted for the symlinked path or anything after it in
+    # the loop -- the refusal fires before the mount call, not alongside it.
+    mounted_targets = [call[1] for call in libc.calls]
+    assert str(symlinked).encode() not in mounted_targets
+
+
+def test_an_ordinary_readonly_ceiling_still_seals_normally(tmp_path: Path) -> None:
+    """The property that must NOT regress: the new `READONLY_DIRS` islink
+    check must not touch an ORDINARY, non-symlinked ceiling -- the governance
+    cache fixture `_run` already seals by default."""
+    libc, refusal = _run(tmp_path, fail_at=None)
+    assert refusal is None
+    mounted_targets = [call[1] for call in libc.calls]
+    cache_target = str(tmp_path / "home" / ".kiro" / "crew" / "policy_cache").encode()
+    assert mounted_targets.count(cache_target) == 2  # bind, then the RDONLY remount
 
 
 def test_a_symlinked_non_trust_root_directory_binds_through_instead_of_refusing(
@@ -447,8 +498,8 @@ def test_all_mounts_succeeding_lets_the_exec_proceed(tmp_path: Path) -> None:
     [
         (1, "propagation"),
         (2, "credential directory"),
-        (3, "exposing read-only directory"),
-        (4, "sealing read-only directory"),
+        (3, "exposing read-only path"),
+        (4, "sealing read-only path"),
         (5, "sensitive file"),
         (6, "ssh key directory"),
     ],
@@ -555,13 +606,13 @@ _ARMS: dict[str, tuple[str, str]] = {
     ),
     "site3": (
         "_mount_or_die(target, target, _MS_BIND,\n"
-        '                              "exposing read-only directory %s" % d)',
+        '                              "exposing read-only path %s" % d)',
         "_libc.mount(target, target, None, _MS_BIND, None)",
     ),
     "site4": (
         "_mount_or_die(target, target,\n"
         "                              _MS_REMOUNT | _MS_BIND | _MS_RDONLY,\n"
-        '                              "sealing read-only directory %s" % d)',
+        '                              "sealing read-only path %s" % d)',
         "_libc.mount(target, target, None, _MS_REMOUNT | _MS_BIND | _MS_RDONLY, None)",
     ),
     "site5": (

@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from aiohttp import web
 
     from kiro_crew.config.loader import KiroCrewConfig, TelemetryConfig
+    from kiro_crew.skill_providers.base import SkillProvider
 
 
 class InterceptDecision(enum.Enum):
@@ -595,6 +596,41 @@ class PromptSourceProvider(Protocol):
         resolved package prompt/SOP roots so its installed SOPs appear in the
         ``/api/prompts`` catalog and ``@agent-sop:`` mentions. Read fail-closed
         through ``safe_context_call`` at the call site (fallback ``[]``).
+        """
+        ...
+
+
+class SkillDiscoveryProvider(Protocol):
+    """Edition-contributed skill discovery providers for the multi-provider search.
+
+    A distinct edition concern with its own interface (not folded into
+    ``McpToolingProvider``) so each edition hook lands on its own interface.
+    """
+
+    def skill_providers(self) -> List["SkillProvider"]:
+        """Extra skill discovery providers the edition contributes.
+
+        WIRED: the dashboard discover registry
+        (``handlers/discover._build_registry``) registers each returned provider
+        AFTER the built-in one, gated per provider by the same
+        ``external_access.admits_registry("skill", name, api_base)`` decision the
+        built-in provider passes through — so an edition provider is subject to
+        the composed discovery policy uniformly, and a managed allowlist needs no
+        edition-specific carve-out. ADD-only and de-duped by name: a provider
+        whose ``name`` collides with an already-registered one is skipped with a
+        warning (the built-in wins), so an edition cannot silently replace the
+        catalog identity a policy admitted.
+
+        Each returned object implements
+        ``kiro_crew.skill_providers.base.SkillProvider`` (async ``search`` /
+        ``fetch_skill_content`` plus ``is_available()``, so an unconfigured
+        provider is skipped by the registry rather than erroring) and SHOULD
+        expose an ``api_base`` naming its catalog endpoint — that is the identity
+        an allowlist is written against; a provider without one is gated on an
+        empty base. Read fail-closed through ``safe_context_call`` at the call
+        site (fallback ``[]``). The public Default returns ``[]`` (discovery
+        offers the built-in catalog only). v1 addition (no ``CONTRACT_VERSION``
+        bump).
         """
         ...
 

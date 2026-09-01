@@ -2929,6 +2929,7 @@ class _ChatSlot:
         "agent",
         "model",
         "reasoning_effort",
+        "autocompact_pct",
         "mode",
         "workspace",
         "project",
@@ -3049,6 +3050,7 @@ class _ChatSlot:
         "_disk_older_durable_count",
         "_disk_window_len",
         "_disk_meta_created_at",
+        "_disk_meta_observed",
         "_disk_tail_ts",
         "_frozen_prefix_cache",
         "_pending_rewrite",
@@ -3090,6 +3092,10 @@ class _ChatSlot:
         # Reasoning effort: "" = provider default, else one of low/medium/high/max.
         # Currently consumed by an alternate ACP backend (--effort flag); ACP wired later.
         self.reasoning_effort: str = ""
+        # Per-session auto-compact threshold override (percent). None = follow
+        # the global session.autocompact_pct. Persisted with the slot and
+        # re-seeded into the SessionManager after restore.
+        self.autocompact_pct: float | None = None
         # "" = default chat, "orchestrator" = orchestrated chat
         self.mode = mode
         self.workspace = workspace
@@ -3528,6 +3534,17 @@ class _ChatSlot:
         # deleted window into the latter. Empty means "never observed a disk
         # identity" (fresh slot), which the guard treats as no evidence.
         self._disk_meta_created_at: str = ""
+        # Whether this slot has OBSERVED its transcript's metadata on disk at
+        # all — set wherever ``_disk_meta_created_at`` is recorded (hydrate
+        # sites and committed saves). Legacy metadata carries no
+        # ``created_at``, which leaves the identity string above EMPTY even
+        # though the file was genuinely observed; without this bit the
+        # delete-won guard would read that empty identity as "fresh slot, no
+        # evidence" and let a save racing a permanent delete recreate the
+        # deleted transcript. The bit supplies the missing-file witness for
+        # legacy sessions; the identity COMPARISON still requires a non-empty
+        # ``created_at`` on both sides.
+        self._disk_meta_observed: bool = False
         # The newest ``ts`` seen on disk at the last save, INCLUDING rows this
         # slot never observed. A subagent, cron, or CLI appending to a session a
         # live tab also has open writes rows that ``_save_slot_to_history``
@@ -5053,7 +5070,10 @@ class DashboardState:
         if self.context_builder:
             vs = self.context_builder.memory.vector_store
             if vs:
-                count += len(vs.get_lessons())
+                # COUNT(*) — not get_lessons() — so the status paths that poll
+                # this per client do not materialize the whole lesson corpus
+                # just to len() it.
+                count += vs.count_lessons()
         return count
 
     def status_snapshot(
@@ -6311,6 +6331,16 @@ class DashboardState:
             self._chat_pins = []
             return
 
+        # Reuse the create-time ingress caps (source of truth: chat_pins.py) so a
+        # hand-edited chat_pins.json cannot smuggle an over-long mid/message_ts/
+        # preview past a loader that only checked type + non-emptiness. Imported
+        # here (not at module top) because chat_pins.py imports this module.
+        from kiro_crew.dashboard.chat_pins import (
+            _MAX_MESSAGE_TS_CHARS,
+            _MAX_MID_CHARS,
+            _MAX_PREVIEW_INPUT_CHARS,
+        )
+
         def _is_valid(pin: Any) -> bool:
             return (
                 isinstance(pin, dict)
@@ -6325,6 +6355,19 @@ class DashboardState:
                 and isinstance(pin.get("preview"), str)
                 and isinstance(pin.get("pinned_at"), str)
                 and bool(pin.get("pinned_at"))
+                # Enforce the create-time length caps at load, so an over-long
+                # record is partitioned into _unparsed rather than served. Guard
+                # each optional identity with isinstance before len(): a
+                # hand-edited record can carry a non-string mid/message_ts (e.g.
+                # a JSON number) while still being valid via the other identity,
+                # and len() on a non-string would crash the whole loader. preview
+                # is already isinstance-checked as a str above.
+                and (not isinstance(pin.get("mid"), str) or len(pin["mid"]) <= _MAX_MID_CHARS)
+                and (
+                    not isinstance(pin.get("message_ts"), str)
+                    or len(pin["message_ts"]) <= _MAX_MESSAGE_TS_CHARS
+                )
+                and len(pin.get("preview") or "") <= _MAX_PREVIEW_INPUT_CHARS
             )
 
         valid, unparsed = self._partition_preserving(

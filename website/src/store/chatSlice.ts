@@ -4021,6 +4021,14 @@ const chatSlice = createSlice({
         // the plain "no activity" fallback reachable for an older gateway.
         idleSecs: stalled ? d.idle_secs : undefined,
         stalledAt: stalled && typeof d.idle_secs === 'number' ? Date.now() : undefined,
+        // Snapshot rebuilds the entry from scratch, so a `retrying` flag a live
+        // subagent_retrying/subagent_recovering frame set just before this
+        // replay landed would be dropped — the ⟳ recovering cue would vanish
+        // until the next live frame. Carry it forward for the same reason the
+        // model pill does above: a reconnect must not blank live-only state.
+        // A snapshot never turns retrying ON (it has no attempt field); it only
+        // preserves what a live frame already set.
+        retrying: existing?.retrying,
         approval_id: existing?.approval_id, approving: existing?.approving,
       }
     },

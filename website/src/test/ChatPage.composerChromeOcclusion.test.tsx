@@ -86,8 +86,8 @@ describe('composer status chrome cannot occlude the header rename editor', () =>
     // to @media (pointer: coarse) — a permanent (unscoped) thumb would trip the
     // hover-revealed assertion above on fine pointers. Precedence: the house
     // already carries @media (pointer: coarse) blocks in index.css.
-    expect(INDEX_CSS).toMatch(/@media \(pointer: coarse\) \{[\s\S]*?\.scrollbar-overlay\{scrollbar-color:var\(--border\) transparent\}/)
-    expect(INDEX_CSS).toMatch(/@media \(pointer: coarse\) \{[\s\S]*?\.scrollbar-overlay::-webkit-scrollbar-thumb\{background:var\(--border\)\}/)
+    expect(INDEX_CSS).toMatch(/@media \(pointer: coarse\) \{[\s\S]*?\.scrollbar-overlay\{scrollbar-color:var\(--muted\) transparent\}/)
+    expect(INDEX_CSS).toMatch(/@media \(pointer: coarse\) \{[\s\S]*?\.scrollbar-overlay::-webkit-scrollbar-thumb\{background:var\(--muted\)\}/)
   })
 
   it('caps the bar stack and scrolls it internally, so it never climbs into the band', () => {

@@ -1189,6 +1189,17 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "chokepoint that applies the deploy handlers' credential + "
         "exfiltration-URL chain before the text reaches the dashboard.",
     ),
+    (
+        "Job runtime error responses",
+        "apps/job_routes.py",
+        "Error text returned by the shared `_jobs/*` HTTP surface that every app's "
+        "job runtime is served through. The SDK scrubs what a RUNNER produces, but "
+        "the refusal this surface raises itself quotes caller-supplied material -- "
+        "a job kind name, a dedupe key, or a path carried out of the SDK's own "
+        "exception -- so the `job_start_failed` body funnels through one `_safe` "
+        "chokepoint that applies the credential + exfiltration-URL chain before the "
+        "text reaches the dashboard.",
+    ),
 )
 
 # Modules that call a redactor but are NOT an output egress boundary, so they do
@@ -1263,6 +1274,14 @@ NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
         # the account snapshot is BUILT. It owns no output — the snapshot is
         # served only through routes.py, the registered sink for this app.
         "apps/builtins/aws_control/backend/accounts.py",
+        # Same shape, one layer earlier: scrubs runner-supplied job payload as the
+        # run record is BUILT and persisted. `_redact` covers `step`, `error` and
+        # each progress line, and `_json_safe` recurses through nested structures
+        # (dict KEYS as well as values) before `_persist` writes the record. It
+        # owns no output -- the record reaches a human only through
+        # apps/job_routes.py, the registered sink for this surface. The on-disk
+        # file is not the egress boundary the panel counts.
+        "apps/job_sdk.py",
         # Same shape: hosts _redact_memory_field, the shared recursive scrubber
         # for memory fields. It owns no output of its own — the handler modules
         # that call it (memory.py, cron.py) are the covered surfaces.

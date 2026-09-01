@@ -1907,6 +1907,57 @@ one of those symlinked would be an availability regression with no
 compensating security gain — the write-deny/bind-refuse reasoning these
 three directories exist for never applied to ordinary credentials.
 
+### Merging with `main`'s own governance-tree reconciliation moved `profiles/` again
+
+`main` landed its own fix in the same area (#7439, "mask the crew
+governance tree at the OS gate") while this branch still carried the two
+sections above, and reconciling the two surfaced a real functional
+conflict, not just a textual one. `#7439`'s own analysis is more complete
+than this branch's earlier premise: `profiles/`, `security_policy.json`,
+`admission_policy.json`, `computer_use.json`, and `denied_commands.json`
+are all read by in-sandbox code (a script cron's `boot_platform()`,
+`hooks.read_denied_commands_config`), so *hiding* them (this branch's
+`_STRICT_DIRS`/`_KEYSTONE_FILES` treatment, `TRUST_ROOT_DIRS` above
+included) broke the legitimate reader instead of protecting the ceiling
+— the same "hiding a ceiling REMOVES it" mistake finding 54 already
+diagnosed for `profiles/` specifically, just not yet generalized to the
+other four leaves. `#7439` generalizes it: each crew-home leaf is
+HIDDEN (no legitimate in-sandbox reader — a bind-mounted empty dir/file,
+`_CREW_HIDDEN_LEAVES`), READONLY (read in-sandbox, never written —
+sealed via bind-over-self + `MS_RDONLY`, `_CREW_READONLY_LEAVES`), or
+VISIBLE (read AND written in-sandbox, e.g. `crons.json` for `mcp_cron`'s
+own `CronService` — left on the tool gate alone,
+`_CREW_SANDBOX_VISIBLE_LEAVES`). `main`'s disposition is the one that
+ships: `profiles/` (and the four ceiling files above) moved out of this
+branch's `_STRICT_DIRS`/`_STANDARD_DIRS`/`_CC_DIRS`/`_KEYSTONE_FILES`
+entirely, deferring to `_CREW_READONLY_TARGETS`'s already-thorough
+read+write+hardlink deny.
+
+That reclassification reopened the exact symlink gap the previous
+section closes, just relocated: `#7439`'s `READONLY_DIRS` loop (Linux)
+seals a target with `if os.path.exists(target): _mount_or_die(target,
+target, _MS_BIND, ...)` — no `islink` check, so a symlinked `profiles/`
+now flowing through `READONLY_DIRS` instead of `SENSITIVE_DIRS` bypasses
+`TRUST_ROOT_DIRS` (which is computed from `hidden_dirs`, and `profiles/`
+is no longer in it) exactly the way it bypassed the pre-fix
+`SENSITIVE_DIRS` loop. Closed the same way again: the `READONLY_DIRS`
+loop refuses the spawn on `islink`, mirroring `UNRENAMABLE_DIRS` and the
+`SENSITIVE_DIRS`/`TRUST_ROOT_DIRS` check above — unconditionally across
+the whole list rather than scoped like `TRUST_ROOT_DIRS`, since every
+`READONLY_DIRS` entry is one of Crew's own generated trust roots (a
+ceiling file, the governance cache, the launcher's own parent), never a
+credential path an operator would legitimately symlink the way `.aws` is.
+
+`crons.json` (`_CREW_SANDBOX_VISIBLE_LEAVES`) is the one leaf where this
+branch's original protective intent — an unrelated spawned script
+forging `"operator_authored": true` — is knowingly given up rather than
+preserved under a new mechanism: `mcp_cron` builds its `CronService`
+in-sandbox and both reads and rewrites the job store through it, and a
+mount namespace cannot distinguish "the trusted MCP server" from "an
+arbitrary script" — both share it identically. `#7439` already made
+that trade-off on `main`; this branch defers to it rather than
+reverting an already-shipped fix out from under cron scheduling.
+
 ### An absent `security_policy.json` is unprotected on Linux — accepted, not fixed
 
 `security_policy.json` has no entry in `_KEYSTONE_FILE_ABSENT_PLACEHOLDERS`

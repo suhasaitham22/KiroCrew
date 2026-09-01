@@ -3078,6 +3078,21 @@ class VectorMemoryStore:
             rows = self._fetch_all_locked(sql)
         return [dict(r) for r in rows]
 
+    def count_lessons(self) -> int:
+        """Return the number of live lessons without materializing them.
+
+        ``get_lessons()`` returns full row dicts (including embedding blobs);
+        callers that only need the COUNT (the status paths poll it every few
+        seconds per client) must not pull every lesson row into memory just to
+        ``len()`` it. Same predicate and ``_db_lock`` serialization as
+        ``get_lessons``, so it is safe from executor threads and the loop
+        alike and always agrees with ``len(get_lessons())``.
+        """
+        rows = self._fetch_all_locked(
+            "SELECT COUNT(*) AS n FROM semantic_memory WHERE is_deleted = 0 AND key LIKE 'lesson.%'"
+        )
+        return int(rows[0]["n"]) if rows else 0
+
     def delete_lesson(self, rule_substring: str) -> bool:
         """Delete lessons whose value contains rule_substring."""
         deleted = False

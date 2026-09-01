@@ -49,6 +49,7 @@ if TYPE_CHECKING:  # avoid import cycles — config.loader imports heavy modules
         ProviderRegistry,
         PublishRegistry,
         SandboxPolicy,
+        SkillDiscoveryProvider,
         SlackEnterpriseGate,
         TelemetryProvider,
         TunnelProvider,
@@ -292,6 +293,7 @@ class PlatformContext:
     mcp_tooling: "McpToolingProvider"
     agent_catalog: "AgentCatalogProvider"
     prompt_sources: "PromptSourceProvider"
+    skill_discovery: "SkillDiscoveryProvider"
     import_sources: "ImportSourceProvider"
     capability_manager: "CapabilityManager"
 
