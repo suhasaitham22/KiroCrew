@@ -3435,7 +3435,10 @@ class TestAutoApplyUpdateVenvPath:
                         ):
                             with patch("kiro_crew.slack.gateway.build_frontend_async", new_callable=AsyncMock):
                                 with patch("os.execv", side_effect=OSError("test")):
-                                    with patch("shutil.which", return_value=None):
+                                    with patch(
+                                        "kiro_crew.slack.gateway.resolve_kiro_cli",
+                                        return_value=None,
+                                    ):
                                         await orch._auto_apply_update()
 
         # The install runs through the shared entry point, which picks a reinstall
@@ -3471,7 +3474,7 @@ class TestAutoApplyUpdateVenvPath:
 
         async def _fake_exec(*args, **kwargs):
             argv = [a for a in args if isinstance(a, str)]
-            if argv and argv[0] == "kiro-cli":
+            if argv and argv[0] == "/opt/kiro/bin/kiro-cli":
                 proc = AsyncMock()
                 proc.kill = MagicMock()
                 proc.returncode = None
@@ -3504,9 +3507,13 @@ class TestAutoApplyUpdateVenvPath:
                                 new_callable=AsyncMock,
                             ) as mock_build:
                                 with patch("os.execv", side_effect=OSError("test")):
-                                    # Truthy: the optional kiro-cli step runs.
+                                    # A resolved absolute path makes the
+                                    # optional kiro-cli step run (issue #7704:
+                                    # a fixed-dir install off PATH must not be
+                                    # silently skipped).
                                     with patch(
-                                        "shutil.which", return_value="/usr/bin/kiro-cli"
+                                        "kiro_crew.slack.gateway.resolve_kiro_cli",
+                                        return_value="/opt/kiro/bin/kiro-cli",
                                     ):
                                         # The gateway resolves _kill_and_reap
                                         # function-locally on every call, so

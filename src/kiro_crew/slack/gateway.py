@@ -167,6 +167,7 @@ from kiro_crew.heartbeat import (
 )
 from kiro_crew.history import ConversationLog, HistoryConsolidator
 from kiro_crew.hooks import HookManager, HooksConfig, hooks_config_from_config_dict
+from kiro_crew.kiro_cli import resolve_kiro_cli
 from kiro_crew.learn import LessonStore
 from kiro_crew.llm_helpers import (
     PromptBusyExhaustedError,
@@ -9605,12 +9606,18 @@ class GatewayOrchestrator:
                 return
             logger.info("Auto-update: reset to origin/%s, rebuilding", branch)
 
-            # Update the optional kiro-cli backend if present.
-            if shutil.which("kiro-cli"):
+            # Update the optional kiro-cli backend if present. Resolve the
+            # absolute path via resolve_kiro_cli() rather than gating on
+            # shutil.which("kiro-cli") and spawning the bare name: a working
+            # install reachable only through a fixed known_kiro_cli_dirs()
+            # entry (not the inherited PATH) would otherwise be silently
+            # skipped.
+            kiro_cli_bin = resolve_kiro_cli()
+            if kiro_cli_bin:
                 kiro_update: asyncio.subprocess.Process | None = None
                 try:
                     kiro_update = await asyncio.create_subprocess_exec(
-                        "kiro-cli",
+                        kiro_cli_bin,
                         "update",
                         stdout=asyncio.subprocess.DEVNULL,
                         stderr=asyncio.subprocess.DEVNULL,

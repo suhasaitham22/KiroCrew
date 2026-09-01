@@ -52,6 +52,7 @@ from kiro_crew.git_divergence import (
 from kiro_crew.history import ConversationLog, HistoryConsolidator
 from kiro_crew.hooks import HookManager, hooks_config_from_config_dict
 from kiro_crew.instances import run_marker
+from kiro_crew.kiro_cli import resolve_kiro_cli
 from kiro_crew.learn import LessonStore
 from kiro_crew.loopback_http import loopback_urlopen
 from kiro_crew.memory import MemoryStore
@@ -1332,12 +1333,17 @@ def _update(force: bool = False) -> None:
         print(f"  ❌ git reset failed:\n{result.stderr.strip()}")
         sys.exit(1)
 
-    # Update the optional kiro-cli backend if present.
-    if shutil.which("kiro-cli"):
+    # Update the optional kiro-cli backend if present. Resolve the absolute
+    # path via resolve_kiro_cli() rather than gating on shutil.which("kiro-cli")
+    # and spawning the bare name: a working install reachable only through a
+    # fixed known_kiro_cli_dirs() entry (not the inherited PATH) would
+    # otherwise be silently skipped.
+    kiro_cli_bin = resolve_kiro_cli()
+    if kiro_cli_bin:
         print("  🔄 kiro-cli update")
         try:
             subprocess.run(
-                ["kiro-cli", "update"],
+                [kiro_cli_bin, "update"],
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 timeout=120,

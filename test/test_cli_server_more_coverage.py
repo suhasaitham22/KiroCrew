@@ -1193,7 +1193,9 @@ class TestUpdateGitPath:
     ) -> None:
         stub = _GitStub()
         monkeypatch.setattr(subprocess, "run", stub)
-        monkeypatch.setattr(cli_server.shutil, "which", lambda name: "/usr/bin/kiro-cli")
+        # resolve_kiro_cli() returns an absolute path (a fixed-dir install need
+        # not be on PATH); the spawn must use that path, not the bare name.
+        monkeypatch.setattr(cli_server, "resolve_kiro_cli", lambda: "/opt/kiro/bin/kiro-cli")
         built: list[Path] = []
         monkeypatch.setattr(cli_server, "build_frontend_sync", lambda p: built.append(p))
         cli_server._update()
@@ -1201,8 +1203,41 @@ class TestUpdateGitPath:
         assert "Kiro Crew updated!" in out
         assert "Agent config refreshed" in out
         assert built == [git_checkout]
-        assert ["kiro-cli", "update"] in stub.calls
+        assert ["/opt/kiro/bin/kiro-cli", "update"] in stub.calls
         assert any("setup" in c for c in stub.calls)
+
+    def test_fixed_dir_only_kiro_cli_is_updated_not_skipped(
+        self, monkeypatch, git_checkout, capsys
+    ) -> None:
+        """A kiro-cli reachable only via a fixed known dir (absent from PATH)
+        must still be updated (issue #7704).
+
+        Regression guard: the old code gated on ``shutil.which("kiro-cli")``,
+        so an install off PATH was silently skipped. ``resolve_kiro_cli()``
+        finds it via a fixed ``known_kiro_cli_dirs()`` entry, and the spawn
+        uses the returned absolute path.
+        """
+        stub = _GitStub()
+        monkeypatch.setattr(subprocess, "run", stub)
+        # No PATH-resolvable kiro-cli, but resolve_kiro_cli() finds a fixed-dir
+        # install and returns its absolute path.
+        monkeypatch.setattr(cli_server.shutil, "which", lambda name: None)
+        monkeypatch.setattr(cli_server, "resolve_kiro_cli", lambda: "/opt/kiro/bin/kiro-cli")
+        cli_server._update()
+        assert "Kiro Crew updated!" in capsys.readouterr().out
+        assert ["/opt/kiro/bin/kiro-cli", "update"] in stub.calls
+
+    def test_no_kiro_cli_skips_the_backend_update(
+        self, monkeypatch, git_checkout, capsys
+    ) -> None:
+        """When resolve_kiro_cli() returns None the backend update is skipped
+        (best-effort no-op), preserving the current behavior."""
+        stub = _GitStub()
+        monkeypatch.setattr(subprocess, "run", stub)
+        monkeypatch.setattr(cli_server, "resolve_kiro_cli", lambda: None)
+        cli_server._update()
+        assert "Kiro Crew updated!" in capsys.readouterr().out
+        assert not any("kiro-cli" in str(c[0]) for c in stub.calls)
 
     def test_agent_config_refresh_failure_only_warns(
         self, monkeypatch, git_checkout, capsys
@@ -1246,7 +1281,7 @@ class TestUpdateSubprocessHardening:
 
         monkeypatch.setattr(subprocess, "run", _run)
         # A findable kiro-cli makes the sixth (best-effort) site reachable.
-        monkeypatch.setattr(cli_server.shutil, "which", lambda name: "/usr/bin/kiro-cli")
+        monkeypatch.setattr(cli_server, "resolve_kiro_cli", lambda: "/opt/kiro/bin/kiro-cli")
         cli_server._update()
         assert "Kiro Crew updated!" in capsys.readouterr().out
 
@@ -1256,7 +1291,7 @@ class TestUpdateSubprocessHardening:
             ["git", "diff"],
             ["git", "status"],
             ["git", "reset"],
-            ["kiro-cli", "update"],
+            ["/opt/kiro/bin/kiro-cli", "update"],
         ]
         for prefix in six:
             matching = [kw for argv, kw in recorded if argv[: len(prefix)] == prefix]
@@ -1311,8 +1346,10 @@ class TestUpdateSubprocessHardening:
         """The backend update's result is not inspected today, so its timeout
         warns and the update continues — the #5637 handler shape."""
         stub = _GitStub()
-        monkeypatch.setattr(subprocess, "run", self._timeout_on(["kiro-cli", "update"], stub))
-        monkeypatch.setattr(cli_server.shutil, "which", lambda name: "/usr/bin/kiro-cli")
+        monkeypatch.setattr(
+            subprocess, "run", self._timeout_on(["/opt/kiro/bin/kiro-cli", "update"], stub)
+        )
+        monkeypatch.setattr(cli_server, "resolve_kiro_cli", lambda: "/opt/kiro/bin/kiro-cli")
         cli_server._update()
         out = capsys.readouterr().out
         assert "kiro-cli update timed out" in out
