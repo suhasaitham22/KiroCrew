@@ -25,12 +25,10 @@ import logging
 import os
 import platform
 import re
-import subprocess
 import sys
 import time
 import uuid
 import zipfile
-from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,6 +37,8 @@ from urllib.parse import quote, urlencode
 from kiro_crew import __version__, release_channel
 from kiro_crew.config.loader import config_dir
 from kiro_crew.kiro_cli import resolve_kiro_cli
+from kiro_crew.sandbox import run_limited, scrub_env
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 from kiro_crew.security import (
     is_sensitive_path,
     redact_credentials,
@@ -277,12 +277,7 @@ def _macos_crash_reports() -> list[Path]:
     return reports[:_MAX_IPS_REPORTS]
 
 
-def _kiro_cli_version(
-    *,
-    platform_name: str | None = None,
-    home: Path | None = None,
-    environ: Mapping[str, str] | None = None,
-) -> str:
+def _kiro_cli_version() -> str:
     """Version string of the installed Kiro CLI, for the support bundle.
 
     Resolves the binary through :func:`kiro_crew.kiro_cli.resolve_kiro_cli`
@@ -291,8 +286,7 @@ def _kiro_cli_version(
     spawning the bare name: a collector process whose inherited ``PATH`` lacks
     the install directory made the bare-name spawn misreport a working install
     as ``unavailable`` in both ``versions.txt`` and the prefilled bug-report
-    footer (#7674). The keyword-only parameters are passthroughs to the
-    resolver so tests can pin the host layout; production callers pass nothing.
+    footer (#7674).
 
     Return values, each a plain one-line string (both consumers interpolate
     it verbatim):
@@ -306,20 +300,33 @@ def _kiro_cli_version(
       printed nothing.
 
     Never raises: diagnostics collection must degrade to a string, so the
-    spawn keeps its existing containment boundary.
+    whole spawn (including preparation) runs inside one broad exception
+    containment, logged at DEBUG. Hardening — the resolver's first candidates
+    live in user-writable install dirs, so the child gets a credential-
+    scrubbed environment (:func:`kiro_crew.sandbox.scrub_env`, the tailnet-
+    probe posture) and a kernel resource ceiling (:func:`run_limited`).
+    Deliberately NOT routed through the ``sandboxed_spawn_argv`` OS wrapper:
+    its preparation resolves the governance sandbox floor, which raises
+    ``PlatformCompositionError`` outside a booted gateway context (verified
+    empirically — a working install then misreports as not runnable, the
+    exact defect class #7674 exists to eliminate), and diagnostics must work
+    precisely when the rest of the system is broken. Tests pin the host
+    layout by monkeypatching this module's ``resolve_kiro_cli`` binding.
     """
-    binary = resolve_kiro_cli(platform_name=platform_name, home=home, environ=environ)
+    binary = resolve_kiro_cli()
     if binary is None:
         return "unavailable"
     try:
-        out = subprocess.run(
+        out = run_limited(  # noqa: S603 - fixed argv, resolver-vetted binary
             [binary, "--version"],
             capture_output=True,
-            text=True,
+            **UTF8_TEXT,
             timeout=5,
             check=False,
+            env=scrub_env(),
         )
-    except (OSError, subprocess.SubprocessError):
+    except Exception:
+        logger.debug("kiro-cli version probe failed for %r", binary, exc_info=True)
         return "present but not runnable"
     if out.returncode != 0:
         return "present but not runnable"

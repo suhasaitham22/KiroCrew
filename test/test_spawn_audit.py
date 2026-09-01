@@ -256,16 +256,16 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         # every mocked-git test passed.
         "apps/builtins/ops_mission_control/tests/test_ledger_sync_git.py::_git",
         "apps/builtins/ops_mission_control/tests/test_ledger_sync_git.py::setUp",
-        # Diagnostics support-bundle version probe: fixed argv
-        # ``[<resolved kiro-cli>, "--version"]`` with a 5s timeout, no shell,
-        # no cwd, and no agent-influenced args — it only stamps the collected
-        # kiro-cli version into versions.txt. The binary is resolved through
-        # ``kiro_cli.resolve_kiro_cli`` (fixed install directories first), the
-        # same resolver that selects the trusted agent-runtime binary itself in
-        # ``acp/client.py`` — so this probe trusts exactly what the runtime
-        # already trusts, and a resource ceiling / sandbox adds nothing to a
-        # ``--version`` call.
-        "diagnostics.py::_kiro_cli_version",
+        # (diagnostics.py::_kiro_cli_version removed — the support-bundle
+        # version probe now spawns via run_limited with a scrub_env()
+        # environment (review hardening on #7674's fix; the resolver-vetted
+        # binary lives in a user-writable install dir, so the child gets no
+        # inherited credentials and a kernel resource ceiling). Deliberately
+        # NOT wrapped by sandboxed_spawn_argv: its preparation resolves the
+        # governance sandbox floor, which raises PlatformCompositionError
+        # outside a booted gateway context — diagnostics must work precisely
+        # when the rest of the system is broken. An entry here would be stale
+        # and would mask a regression that dropped the limits/scrub.)
         # Tailnet origin derivation + forwarded-peer whois (RFC:
         # rfc-tailnet-dashboard-access): one fixed argv — ``["<tailscale>",
         # "status", "--json"]`` or ``["<tailscale>", "whois", "--json",
