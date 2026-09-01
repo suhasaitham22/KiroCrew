@@ -66,11 +66,21 @@ atomic for a reader, so the reads go through ``atomic_write``'s
 
 Staleness is decided by ``_ORIGIN``, a token minted once per gateway process —
 not by pid, which can be reused by the very process doing the reconciling.
+
+That token is the GATEWAY process, which also bounds what this SDK describes: an
+app whose work executes in another process is outside it. An app declaring
+``backend.entryPoint`` is spawned as its own OS process (``apps/backend.py``,
+``start_app_backend``), and ``register`` binds a kind to a callable held here in
+the gateway, so such an app has no registration path. It is also not merely
+unsupported: on a restart that ``_reap_stale_app_backends`` leaves the backend
+alive through, ``reconcile`` marks that still-running work ``INTERRUPTED``, a
+terminal state no later pass revisits.
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -112,6 +122,43 @@ INTERRUPTED = "interrupted"
 
 #: A run in a terminal state is never resumed and never reconciled.
 TERMINAL_STATES = frozenset({DONE, FAILED, CANCELLED, INTERRUPTED})
+
+#: Why a run was reconciled, on the record. A closed SET rather than a bool
+#: because the not-registered case already covers two different events -- the app
+#: was disabled, or the kind was removed -- so a boolean would freeze that
+#: conflation on the day the field is introduced. Adding the third value later
+#: costs one constant and one table entry.
+CAUSE_PROCESS_GONE = "process_gone"
+CAUSE_RUNNER_UNREGISTERED = "runner_unregistered"
+
+#: How far a run had got, in words -- and deliberately COARSER than
+#: ``interrupted_from`` itself. A consumer needs ``queued`` apart from
+#: ``starting`` (only one of them owns a dedupe key), but a person reading a
+#: message does not: both mean no line of the runner's body ran. Keeping the
+#: field's granularity and the sentence's granularity separate is the reason the
+#: message is derived here rather than being the only record of what happened.
+_PROGRESS_PHRASE = {
+    QUEUED: "had not started yet",
+    STARTING: "had not started yet",
+    RUNNING: "was running",
+}
+
+#: The ONE place an interruption's message is composed. A table keyed on cause,
+#: not a nested conditional: with two axes the conditional form needs four arms
+#: and grows multiplicatively, while this grows by one line per cause. The
+#: ``process_gone`` + ``running`` cell reproduces the message this SDK shipped
+#: with, byte for byte, because that cell was the only one that was ever true.
+_INTERRUPT_MESSAGE = {
+    CAUSE_PROCESS_GONE: "the gateway restarted while this {progress}",
+    CAUSE_RUNNER_UNREGISTERED: (
+        "the gateway restarted while this {progress}, and no runner is registered for {kind!r}"
+    ),
+}
+
+#: Used when a record carries a status this build does not know -- a file written
+#: by a newer gateway, or hand-edited. The pass must still resolve it, and the
+#: message must not claim a progress it cannot support.
+_UNKNOWN_PROGRESS_PHRASE = "had not finished"
 
 #: Length of an SDK-minted run id (``uuid.uuid4().hex``). Validated, not just
 #: assumed: a caller reaches ``{run_id}`` on the HTTP surface directly, and a
@@ -158,6 +205,93 @@ def _redact(text: str) -> str:
         return text
 
 
+def _interrupt_error(cause: str, interrupted_from: str, kind: str) -> str:
+    """Compose an interruption's human-readable message. The ONLY site that does.
+
+    Two facts go in, and they are independent because they describe different
+    TIMES: ``interrupted_from`` is how far the run got before its process died,
+    ``cause`` is whether this process can service the kind now. Neither implies
+    the other, so both are on the record; the sentence is derived from them here
+    rather than being the place they are stored.
+
+    An unrecognised ``cause`` falls back to the process-gone template instead of
+    raising: this runs inside the pass that clears stuck ``running`` records, and
+    a record with a cause this build does not know must still be resolved.
+    """
+    template = _INTERRUPT_MESSAGE.get(cause) or _INTERRUPT_MESSAGE[CAUSE_PROCESS_GONE]
+    progress = _PROGRESS_PHRASE.get(interrupted_from, _UNKNOWN_PROGRESS_PHRASE)
+    return template.format(progress=progress, kind=kind)
+
+
+def _undriven_result(result: Any) -> str:
+    """Name what a runner handed back that still needs driving, else ``""``.
+
+    The counterpart to :func:`_lazy_call_shape`, and the load-bearing half. That
+    one inspects the callable's SHAPE at registration, which is a proxy: it can
+    only refuse the spellings somebody thought of. This one reads the FACT, at the
+    one moment it exists -- a runner that returns something awaitable did not do
+    the work, however it was written. A plain ``def run(h): return _do_it(h)`` over
+    an ``async def _do_it`` defeats every shape check and is caught here.
+
+    ``isawaitable`` covers coroutines, futures and anything with ``__await__``. An
+    async generator is not awaitable but equally undriven, so it is named too.
+    """
+    if inspect.isawaitable(result):
+        return "an unawaited awaitable"
+    if inspect.isasyncgen(result):
+        return "an undriven async generator"
+    return ""
+
+
+def _close_quietly(result: Any) -> None:
+    """Close an undriven result so it does not warn from the garbage collector.
+
+    A coroutine that is never awaited emits ``RuntimeWarning: coroutine ... was
+    never awaited`` when collected, at a point far from the run that caused it.
+    The record already says what happened, so the warning is noise pointing at
+    the wrong place. Coroutines, generators and futures expose a synchronous
+    ``close``; an async generator's ``aclose`` is itself a coroutine needing a
+    loop, so it is left to the interpreter rather than driven from this thread.
+    """
+    closer = getattr(result, "close", None)
+    if not callable(closer):
+        return
+    try:
+        closer()
+    except Exception:  # noqa: BLE001 - closing is hygiene, never the outcome
+        logger.debug("could not close an undriven job result", exc_info=True)
+
+
+def _lazy_call_shape(fn: Any) -> str:
+    """Name the shape of a callable whose CALL does not run its body, else ``""``.
+
+    Three shapes return a lazy object instead of doing the work: a coroutine
+    function, an async generator function, and a plain generator function. The
+    SDK calls its runner on a worker thread and discards the return value, so for
+    all three the body never executes and the run is still recorded ``done``.
+    One defect with three spellings, so the check names the class rather than the
+    one spelling that was reported.
+
+    A callable OBJECT is examined through its ``__call__``, because that is what
+    invocation actually reaches -- ``inspect`` reports the instance itself as an
+    ordinary object, so a check written against bare functions passes it through.
+    That was the gap two reviewers found in the first version of this guard.
+
+    No legitimate runner is refused by this: a callable whose invocation returns a
+    lazy object cannot do the work the SDK is calling it to do, whatever it is.
+    """
+    for target in (fn, getattr(fn, "__call__", None)):
+        if target is None:
+            continue
+        if inspect.iscoroutinefunction(target):
+            return "a coroutine function"
+        if inspect.isasyncgenfunction(target):
+            return "an async generator function"
+        if inspect.isgeneratorfunction(target):
+            return "a generator function"
+    return ""
+
+
 @dataclass
 class JobRun:
     """One run's durable record. Serialized whole; never partially updated.
@@ -179,6 +313,21 @@ class JobRun:
     updated_at: str = ""
     finished_at: str = ""
     error: str = ""
+    #: Set only by ``reconcile``: the status this run held when a process that no
+    #: longer exists was executing it. Structured because a CONSUMER acts on it --
+    #: a run interrupted from ``running`` may have side effects already committed,
+    #: while one interrupted from ``queued`` or ``starting`` provably has none, and
+    #: those need different recovery. Before this field the pass overwrote
+    #: ``status`` in place and chose ``error`` from whether a runner was
+    #: registered, so all three collapsed into one record that read "while this was
+    #: running" even for a run whose worker thread was never started.
+    interrupted_from: str = ""
+    #: Set only by ``reconcile``: why the run could not be resumed, from the
+    #: ``CAUSE_*`` set. Orthogonal to ``interrupted_from`` -- that says how far the
+    #: run got, this says whether the kind can be serviced now -- so a consumer
+    #: deciding "offer a retry" reads this one and a consumer deciding "warn about
+    #: partial work" reads the other.
+    interrupt_cause: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -351,7 +500,19 @@ class JobStore:
             # string. Reached only off the loop (the routes offload every call),
             # which is what lets the helper's sleep apply at all.
             raw = read_bytes_with_retry(self._path(run_id)).decode("utf-8")
-        except (FileNotFoundError, NotADirectoryError, ValueError):
+        # ``OSError``, not the two subclasses that used to be named here. Both
+        # ``FileNotFoundError`` and ``NotADirectoryError`` ARE ``OSError``s, so
+        # the tuple collapses rather than widening -- and it collapses onto the
+        # exception the comment above is ABOUT. ``read_bytes_with_retry`` re-raises
+        # ``PermissionError`` once its budget is spent (and immediately on POSIX,
+        # where it is a genuine access fault), and ``PermissionError`` is an
+        # ``OSError`` that was not in the list: an unreadable record left this
+        # method by raising, reached ``get`` and left the route as a 500. The
+        # sibling scan twelve lines below already catches ``OSError`` for exactly
+        # this file, so the two readers disagreed about the same damage; a record
+        # this method cannot read is one it does not have, which is the 404
+        # ``_path`` above already argues for.
+        except (OSError, ValueError):
             return None
         try:
             return JobRun.from_dict(json.loads(raw))
@@ -484,9 +645,37 @@ class JobSDK:
         app's assertion that ``fn`` polls ``handle.cancelled`` at checkpoints;
         the SDK cannot verify it, so the consumer's migration checklist has to
         name those checkpoints.
+
+        A CALLABLE WHOSE INVOCATION DOES NOT RUN ITS BODY IS REFUSED HERE, at
+        registration, rather than failing at run time. ``_execute`` calls
+        ``fn(handle)`` on a worker thread and discards the return value by design,
+        and three shapes return a lazy object instead of doing the work: a
+        coroutine function, an async generator function, and a plain generator
+        function. For each, the object is dropped, no line of the runner's body
+        ever runs, and the record is written ``done``. That is the worst available
+        outcome -- a run that reports success having executed nothing -- and it is
+        silent, since an un-awaited coroutine warning goes to the gateway log at
+        most. The check goes through ``__call__`` as well as the object itself, so
+        a callable instance with an ``async def __call__`` is caught too.
+
+        Refusing is deliberately not the same as supporting: driving a coroutine
+        correctly means deciding which loop owns it, how cancellation crosses
+        the thread boundary, and what a blocking runner does to that loop, and
+        those are design questions this refusal does not answer. It answers only
+        the question a caller cannot currently ask -- "did my runner run" -- at
+        the one point where the answer is still cheap.
         """
         if not kind:
             raise ValueError("job kind must be a non-empty string")
+        lazy = _lazy_call_shape(fn)
+        if lazy:
+            raise ValueError(
+                f"job kind {kind!r} was registered with {lazy}; the runner is called on "
+                "a worker thread and its return value is discarded, so its body would "
+                "never execute and the run would still be recorded as done. Register a "
+                "callable that does the work when called (it may drive its own loop "
+                "with asyncio.run)."
+            )
         with self._lock:
             self._runners[kind] = _Runner(fn=fn, cancellable=cancellable)
         logger.info("App %s registered job kind: %s", self._app_name, kind)
@@ -658,10 +847,28 @@ class JobSDK:
     def _execute(self, run: JobRun, runner: _Runner, handle: JobHandle) -> None:
         """The worker body. Sole writer of this run's record from here on.
 
-        The runner's return value is DISCARDED. P1 records that a run finished,
-        not what it produced: a return value is arbitrary nested data, and
-        holding it is what required a recursive sanitizer over channels no P1
-        consumer reads. It returns in P2 on a type that is safe by construction.
+        The runner's return value is DISCARDED, but it is INSPECTED first. P1
+        records that a run finished, not what it produced: a return value is
+        arbitrary nested data, and holding it is what required a recursive
+        sanitizer over channels no P1 consumer reads. It returns in P2 on a type
+        that is safe by construction.
+
+        One thing is read off it before it is dropped, and it is the fact this
+        method could not otherwise state honestly: whether the runner actually did
+        the work. If the call handed back something that still needs to be driven
+        -- an awaitable, or an async generator -- then the body did not run to
+        completion and ``done`` would be a false record. ``register`` refuses the
+        callable SHAPES that produce this, but a shape check is an adjacent-state
+        proxy and cannot see every route to it: a plain ``def run(h): return
+        _do_it(h)`` over an ``async def _do_it`` passes every registration check
+        and still returns an unperformed coroutine. Observing the result is the
+        only place the fact itself is available, which makes this the safety
+        property and the registration guard a fast, friendly error.
+
+        A returned plain generator is deliberately NOT treated as failure here.
+        Generator FUNCTIONS are refused at registration, and a generator object
+        handed back by a runner that did its work -- a lazy view over results --
+        is ambiguous in a way an awaitable is not.
         """
         # Completing the STARTING -> RUNNING transition is the worker's first act,
         # because the worker is the only party that knows it is actually running.
@@ -670,8 +877,28 @@ class JobSDK:
         run.status = RUNNING
         self._persist(run, handle)
         try:
-            runner.fn(handle)
-            run.status = CANCELLED if handle.cancelled.is_set() else DONE
+            result = runner.fn(handle)
+            undriven = _undriven_result(result)
+            if undriven:
+                # Inside the SAME try, so the terminal write below is still the one
+                # write site. A second write path here is what leaked a dedupe claim
+                # before, and `_write_terminal` already owns the discard check.
+                run.status = FAILED
+                run.error = (
+                    f"the runner for {run.kind!r} returned {undriven} instead of doing "
+                    "the work; its body did not run to completion, so this run is "
+                    "recorded as failed rather than done"
+                )
+                _close_quietly(result)
+                logger.warning(
+                    "App %s job %s (%s) returned %s and did no work",
+                    self._app_name,
+                    run.run_id,
+                    run.kind,
+                    undriven,
+                )
+            else:
+                run.status = CANCELLED if handle.cancelled.is_set() else DONE
         except Exception as exc:  # noqa: BLE001 - a runner's failure is data, not a crash
             run.status = FAILED
             run.error = _redact(str(exc))[:2000]
@@ -804,10 +1031,18 @@ class JobSDK:
         """Resolve records left non-terminal by a process that is gone.
 
         A run must never be left ``running`` forever and must never silently
-        vanish — the two directions the hand-rolled predecessors got wrong. The
-        reason distinguishes a lost process from a kind whose runner is no
-        longer registered (the app was disabled, or the kind was removed), which
-        is why this runs only after every app has registered.
+        vanish — the two directions the hand-rolled predecessors got wrong. Each
+        resolved record carries TWO facts rather than a sentence: how far the run
+        had got (``interrupted_from``) and why it cannot be resumed
+        (``interrupt_cause``). They are independent because they describe
+        different times -- past progress, present capability -- and a consumer
+        acts on them separately: a run interrupted from ``running`` may have
+        committed side effects, one interrupted from ``queued`` or ``starting``
+        provably has not, and only the cause says whether offering a retry makes
+        sense. ``error`` is composed from both by :func:`_interrupt_error`, which
+        is why the pass no longer has to choose one of two strings from the runner
+        table alone. This runs only after every app has registered, so a missing
+        runner means the kind is gone rather than not yet loaded.
 
         This is the ONE path that consumes records it did not write -- a file
         left by an older build, or hand-edited during an incident -- so a single
@@ -829,13 +1064,17 @@ class JobSDK:
             # state the pass exists to clear.
             if run.origin == _ORIGIN and live:
                 continue
+            # BOTH axes are recorded, and the message is DERIVED from them. The
+            # previous form assigned `status` over the top of the only evidence of
+            # how far the run got, then picked one of two strings from `known`
+            # alone -- so a run whose worker thread was never started was written
+            # a record claiming it "was running", and a consumer could not tell a
+            # run that committed side effects from one that provably had not.
+            run.interrupted_from = run.status
+            run.interrupt_cause = CAUSE_PROCESS_GONE if known else CAUSE_RUNNER_UNREGISTERED
             run.status = INTERRUPTED
             run.finished_at = _now()
-            run.error = (
-                "the gateway restarted while this was running"
-                if known
-                else f"the gateway restarted and no runner is registered for {run.kind!r}"
-            )
+            run.error = _interrupt_error(run.interrupt_cause, run.interrupted_from, run.kind)
             if not self._persist(run):
                 continue
             flipped += 1
