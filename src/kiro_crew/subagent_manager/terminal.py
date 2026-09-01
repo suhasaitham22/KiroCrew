@@ -878,6 +878,12 @@ class TerminalCoordinator(ManagerComponent):
         if recovery_task and not recovery_task.done():
             recovery_task.cancel()
 
+        # A protected coordinator row keeps its terminal event unclaimable until
+        # teardown is proven.  Preserve that proof across the terminal commit;
+        # otherwise the reaper waits forever while its own process guard blocks
+        # the immediate outbox drain.
+        process_stopped = asyncio.Event() if info._coordinator_process_protected else None
+
         if info._session_sharing:
             # Session-sharing subagent: NEVER SIGKILL the shared runtime —
             # the parent session owns it and other co-tenants may be active.
@@ -916,9 +922,30 @@ class TerminalCoordinator(ManagerComponent):
         else:
             # Kill the process FIRST so the pipe unblocks, then cancel the task.
             try:
-                await asyncio.wait_for(
+                reset_session = await asyncio.wait_for(
                     self._manager._sessions.reset(session_key), timeout=_RESET_TIMEOUT
                 )
+                if reset_session and process_stopped is not None:
+                    try:
+                        run = await self._manager._coordinator.get_run(info.id)
+                        if (
+                            run is not None
+                            and run.process_owned
+                            and run.process_id > 1
+                            and not await asyncio.to_thread(
+                                platform_compat.pid_exists, run.process_id
+                            )
+                        ):
+                            process_stopped.set()
+                    except Exception:
+                        # Session reset success only proves the registry entry was
+                        # removed.  Recovery keeps the PID fence when process
+                        # absence cannot be established independently.
+                        logger.warning(
+                            "Reaper: protected process check failed for %s",
+                            agent_id,
+                            exc_info=True,
+                        )
             except asyncio.TimeoutError:
                 logger.warning("Reaper: reset hung for %s, attempting SIGKILL", agent_id)
                 await self._manager._sigkill_session(session_key)
@@ -1003,6 +1030,7 @@ class TerminalCoordinator(ManagerComponent):
                     f"delivery timed out after {int(_ON_DONE_TIMEOUT)}s (reaper)"
                 ),
                 mark_delivered_on_success=False,
+                process_stopped=process_stopped,
                 # This member's own result is NOT marked delivered (it was
                 # reaped, not completed) — but if it was the wave member whose
                 # `_on_done` flushed the batch digest, its SIBLINGS' successful
