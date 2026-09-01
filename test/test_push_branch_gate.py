@@ -244,6 +244,40 @@ class TestGitPushEnforcement:
         assert allow[0].outcome == "allowed"
         assert allow[0].metadata.get("mechanism") == "BRANCH_GATE"
 
+    def test_allow_audit_records_the_raw_command_not_the_matching_view(
+        self, captured_sel_events
+    ) -> None:
+        """``is_denied`` audits the RAW command, never its lowercased match view.
+
+        Case is preserved for two reasons and this pins both. Faithfulness: a
+        branch name is case-sensitive, so an audit of a push to ``Feature-ABC``
+        must not read as a push to ``feature-abc``. Redaction: the emitter
+        redacts before it clips to 200 chars, but the credential scrubber matches
+        an AWS key ID case-SENSITIVELY on purpose, so a case-folded key slips
+        past that pass, gets cut by the clip, and the surviving prefix is too
+        short for SEL's any-case write-path net to match either -- a partial key
+        in the durable log. The key is planted so it STRADDLES index 200, which
+        is the only window where both nets miss.
+        """
+        # Named ``planted`` rather than anything in CodeQL's sensitive-name
+        # vocabulary: ``py/clear-text-logging-sensitive-data`` classifies purely
+        # on the identifier, so a name like ``secret`` here makes this AWS
+        # example key taint the pre-existing ``logger.warning`` calls that
+        # ``is_denied`` reaches on its failure paths.
+        planted = "AKIA" + "IOSFODNN7EXAMPLE"  # 20-char AWS access key ID
+        prefix = f"{PUSH} origin Feature-"
+        pad = "b" * (190 - len(prefix))  # key starts at 190, so the clip cuts it
+        command = prefix + pad + planted + "-branch-suffix"
+        assert len(command) > 200
+
+        assert is_denied(command) is None
+
+        allow = [e for e in captured_sel_events if e.event_type == "push_allowed"]
+        assert len(allow) == 1
+        audited = allow[0].metadata["command"]
+        assert "akia" not in audited.lower(), audited
+        assert "Feature-" in audited, audited
+
     def test_protected_push_blocked_no_audit(self, captured_sel_events) -> None:
         assert is_denied(f"{PUSH} origin main").startswith("Blocked by security policy")
         assert is_denied(f"{PUSH} --force origin master").startswith("Blocked by security policy")

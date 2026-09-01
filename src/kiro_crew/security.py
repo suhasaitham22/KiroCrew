@@ -5219,7 +5219,7 @@ def _emit_push_allow_event(command: str) -> None:
                 outcome="allowed",
                 resources="feature_branch_push",
                 metadata={
-                    "command": command[:200],
+                    "command": redact_and_truncate(command, 200),
                     "mechanism": "BRANCH_GATE",
                 },
             )
@@ -11901,8 +11901,20 @@ def is_denied(
                     return _reason(pattern)
     # All windows cleared the deny passes — the input is allowed.  If it was a
     # feature-branch push, emit the deferred allow audit now (final outcome).
+    #
+    # The RAW input is audited, never ``lower``.  ``lower`` exists for MATCHING;
+    # nothing matched on an allow, so the case fold buys the record nothing and
+    # costs it two things.  Faithfulness: branch names and remote URLs are
+    # case-sensitive, so folding records a push to ``Feature-ABC`` as a push to
+    # ``feature-abc``.  And redaction: the credential scrubber inside
+    # ``redact_and_truncate`` matches an AWS key ID case-SENSITIVELY on purpose
+    # (widening it would false-positive on ordinary prose — ``asia`` is a word —
+    # across every egress surface; see ``credential_patterns``), so a key handed
+    # in already case-folded slips past the pre-slice redaction, gets cut by the
+    # 200-char clip, and the surviving prefix is short enough to escape SEL's own
+    # any-case write-path net too — a partial key persisting in the durable log.
     if push_allow_pending:
-        _schedule_push_allow_audit(lower)
+        _schedule_push_allow_audit(tool_name)
     return None
 
 
@@ -12339,7 +12351,7 @@ def audit_injection_dropped(
                     "surface": surface,
                     "channel_id": channel_id,
                     "thread_ts": thread_ts,
-                    "sample": sample[:200] if sample else "",
+                    "sample": redact_and_truncate(sample, 200),
                     "mechanism": "contains_injection",
                 },
             )
