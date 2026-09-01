@@ -2404,6 +2404,7 @@
             "kind_reply": "Отвечено",
             "kind_review": "Ревью",
             "kind_skip": "Отклонено",
+            "kind_sweep": "Проверено",
             "kind_yield": "Отпущено",
             "no_next_recorded": "следующий шаг не записан",
             "no_open_work_items": "Ничего в работе",
@@ -2439,6 +2440,7 @@
             "state_idle": "простой",
             "state_paused": "на паузе",
             "work_log": "Журнал работы",
+            "work_log_checking_since": "проверяет с {{when}}",
             "work_log_hint": "последние 24 ч выделены"
           },
           "rail_section": "Команды",

@@ -2354,6 +2354,7 @@
             "kind_reply": "Respondida",
             "kind_review": "Revisión",
             "kind_skip": "Descartada",
+            "kind_sweep": "Revisado",
             "kind_yield": "Liberada",
             "no_next_recorded": "sin siguiente paso registrado",
             "no_open_work_items": "Nada en curso",
@@ -2388,6 +2389,7 @@
             "state_idle": "inactivo",
             "state_paused": "en pausa",
             "work_log": "Registro de trabajo",
+            "work_log_checking_since": "revisando desde {{when}}",
             "work_log_hint": "24 h destacadas"
           },
           "rail_section": "Equipos",

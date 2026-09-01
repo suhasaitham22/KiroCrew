@@ -685,6 +685,7 @@
             "kind_reply": "Replied",
             "kind_review": "Review",
             "kind_skip": "Passed",
+            "kind_sweep": "Swept",
             "kind_yield": "Yielded",
             "no_next_recorded": "no next step recorded",
             "no_open_work_items": "Nothing in flight",
@@ -718,6 +719,7 @@
             "state_idle": "idle",
             "state_paused": "paused",
             "work_log": "Work log",
+            "work_log_checking_since": "checking since {{when}}",
             "work_log_hint": "24h highlighted"
           },
           "rail_section": "Crews",

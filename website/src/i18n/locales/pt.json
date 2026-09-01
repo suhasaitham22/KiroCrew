@@ -2354,6 +2354,7 @@
             "kind_reply": "Respondido",
             "kind_review": "Revisão",
             "kind_skip": "Dispensado",
+            "kind_sweep": "Verificado",
             "kind_yield": "Liberado",
             "no_next_recorded": "nenhum próximo passo registrado",
             "no_open_work_items": "Nada em andamento",
@@ -2388,6 +2389,7 @@
             "state_idle": "inativo",
             "state_paused": "em pausa",
             "work_log": "Registro de trabalho",
+            "work_log_checking_since": "verificando desde {{when}}",
             "work_log_hint": "últimas 24h destacadas"
           },
           "rail_section": "Crews",

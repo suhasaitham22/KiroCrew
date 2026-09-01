@@ -2304,6 +2304,7 @@
             "kind_reply": "উত্তর দিয়েছে",
             "kind_review": "রিভিউ",
             "kind_skip": "পরিধির বাইরে",
+            "kind_sweep": "পরীক্ষিত",
             "kind_yield": "ছেড়ে দিয়েছে",
             "no_next_recorded": "পরবর্তী ধাপ কিছু লেখা নেই",
             "no_open_work_items": "কিছুই চলছে না",
@@ -2337,6 +2338,7 @@
             "state_idle": "নিষ্ক্রিয়",
             "state_paused": "থামানো",
             "work_log": "কাজের লগ",
+            "work_log_checking_since": "{{when}} থেকে পরীক্ষা করছে",
             "work_log_hint": "24 ঘণ্টার অংশ চিহ্নিত"
           },
           "rail_section": "ক্রু",

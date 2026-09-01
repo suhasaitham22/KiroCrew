@@ -2348,6 +2348,7 @@
             "kind_reply": "Geantwortet",
             "kind_review": "Review",
             "kind_skip": "Übergangen",
+            "kind_sweep": "Geprüft",
             "kind_yield": "Freigegeben",
             "no_next_recorded": "kein nächster Schritt vermerkt",
             "no_open_work_items": "Nichts in Arbeit",
@@ -2381,6 +2382,7 @@
             "state_idle": "Leerlauf",
             "state_paused": "pausiert",
             "work_log": "Arbeitsprotokoll",
+            "work_log_checking_since": "prüft seit {{when}}",
             "work_log_hint": "24 h hervorgehoben"
           },
           "rail_section": "Crews",

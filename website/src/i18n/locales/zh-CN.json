@@ -2254,6 +2254,7 @@
             "kind_reply": "已回复",
             "kind_review": "评审",
             "kind_skip": "超范围略过",
+            "kind_sweep": "已巡检",
             "kind_yield": "已让出",
             "no_next_recorded": "未记录下一步",
             "no_open_work_items": "没有进行中的工作",
@@ -2286,6 +2287,7 @@
             "state_idle": "空闲",
             "state_paused": "已暂停",
             "work_log": "工作日志",
+            "work_log_checking_since": "自 {{when}} 起持续检查",
             "work_log_hint": "高亮显示最近 24h"
           },
           "rail_section": "小队",

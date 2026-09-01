@@ -122,6 +122,7 @@ const KIND_LABEL_KEY: Record<CrewEventKind, string> = {
   'handback': 'apps.issueRadar.views.crews.page.kind_handback',
   'skip': 'apps.issueRadar.views.crews.page.kind_skip',
   'yield': 'apps.issueRadar.views.crews.page.kind_yield',
+  'sweep': 'apps.issueRadar.views.crews.page.kind_sweep',
 }
 
 function phaseVariant(phase: CrewPhase): 'ok' | 'err' | 'warn' | 'aim' | 'muted' {
@@ -139,7 +140,42 @@ function kindVariant(kind: CrewEventKind): 'ok' | 'err' | 'warn' | 'aim' | 'mute
   if (kind === 'merge') return 'ok'
   if (kind === 'ci' || kind === 'conflict') return 'warn'
   if (kind === 'skip' || kind === 'yield' || kind === 'handback') return 'muted'
+  // A sweep took no work, so it reads as background like the other did-not-act
+  // kinds rather than competing with the lines that moved something.
+  if (kind === 'sweep') return 'muted'
   return 'aim'
+}
+
+/** The Issue cell's text for one ledger line.
+ *
+ *  A crew-level line has no issue, and the honest cell is an em dash rather than
+ *  `#` followed by nothing: the column is monospaced and right-aligned against
+ *  numbers, so a bare `#` reads as a number that failed to load. */
+function issueCell(number: number | undefined): string {
+  return number === undefined ? '—' : `#${number}`
+}
+
+/** Whether this line's WHEN column describes a stretch that is STILL RUNNING.
+ *
+ *  Consecutive sweeps coalesce in the store, so a sweep line's timestamp marks
+ *  when the crew's idle stretch BEGAN rather than a moment something happened.
+ *  Rendered with the bare "3h ago" the other kinds use, an actively-idling crew
+ *  reads as one that has done nothing for three hours.
+ *
+ *  Two conditions gate the qualifier, and both are about not putting a claim on
+ *  screen that something else on the same page contradicts:
+ *
+ *  * RECENCY, not kind. A stretch is open only while nothing newer has happened.
+ *    Once the crew takes work again its old sweep row is a closed stretch, and
+ *    leaving it saying "checking since" would be contradicted by the newer rows
+ *    directly above it. So at most ONE row can carry it -- the newest, and only
+ *    when that newest row is a sweep.
+ *  * The crew must be RUNNING. "checking since" is a present-tense activity
+ *    claim, and a paused crew is not checking -- the page's own paused badge says
+ *    so a few hundred pixels higher up. A paused crew's newest sweep is a closed
+ *    stretch like any other, so it renders as a past instant. */
+function isOngoing(e: CrewEvent, ongoingId: string | null, running: boolean): boolean {
+  return running && ongoingId !== null && e.id === ongoingId
 }
 
 /** A calendar date with the year elided while it is THIS year — `Aug 6` now,
@@ -272,9 +308,18 @@ export default function CrewPageView({ crewId, onEdit }: CrewPageViewProps) {
     // Sorted newest-first, so the first row older than the cutoff starts the tail —
     // one boundary, and recent/earlier stay contiguous.
     const split = sorted.findIndex((e) => stampMs(e.ts) < cutoff)
+    // WHICH line, if any, describes a stretch that is still running. Consecutive
+    // sweeps coalesce in the store, so a sweep's timestamp marks when an idle
+    // stretch BEGAN -- but the stretch is only still open while nothing newer has
+    // happened. Keyed on RECENCY, not on kind: once the crew takes work again, that
+    // sweep's stretch has ended, and a row still claiming "checking since 3h ago"
+    // would be contradicted by the newer rows sitting above it in this very log.
+    // Sorted newest-first, so at most the first row can qualify.
+    const newest = sorted[0]
+    const ongoingId = newest && newest.kind === 'sweep' ? newest.id : null
     return split === -1
-      ? { nowMs, recent: sorted, earlier: [] as CrewEvent[] }
-      : { nowMs, recent: sorted.slice(0, split), earlier: sorted.slice(split) }
+      ? { nowMs, ongoingId, recent: sorted, earlier: [] as CrewEvent[] }
+      : { nowMs, ongoingId, recent: sorted.slice(0, split), earlier: sorted.slice(split) }
   }, [events, dataUpdatedAt])
 
   // ── stats ──
@@ -523,9 +568,13 @@ export default function CrewPageView({ crewId, onEdit }: CrewPageViewProps) {
               {log.recent.map((e) => (
                 <tr key={e.id} data-testid={`work-log-row-${e.id}`} data-recent="true">
                   <td className={`${TD} border-l-2 border-l-accent whitespace-nowrap text-muted`} title={fmtDateTime(e.ts)}>
-                    {fmtRelative(e.ts, { now: log.nowMs })}
+                    {isOngoing(e, log.ongoingId, !paused)
+                      ? t('apps.issueRadar.views.crews.page.work_log_checking_since', {
+                        when: fmtRelative(e.ts, { now: log.nowMs }),
+                      })
+                      : fmtRelative(e.ts, { now: log.nowMs })}
                   </td>
-                  <td className={`${TD} whitespace-nowrap font-mono`}>#{e.number}</td>
+                  <td className={`${TD} whitespace-nowrap font-mono`}>{issueCell(e.number)}</td>
                   <td className={`${TD} break-words leading-relaxed`}>{e.text}</td>
                   <td className={`${TD} text-right whitespace-nowrap`}>
                     <Badge variant={kindVariant(e.kind)} className="font-body">{t(KIND_LABEL_KEY[e.kind])}</Badge>
@@ -542,9 +591,13 @@ export default function CrewPageView({ crewId, onEdit }: CrewPageViewProps) {
               {log.earlier.map((e) => (
                 <tr key={e.id} data-testid={`work-log-row-${e.id}`} data-recent="false">
                   <td className={`${TD} border-l-2 border-l-transparent whitespace-nowrap text-muted`} title={fmtDateTime(e.ts)}>
-                    {shortDate(e.ts, log.nowMs)}
+                    {isOngoing(e, log.ongoingId, !paused)
+                      ? t('apps.issueRadar.views.crews.page.work_log_checking_since', {
+                        when: shortDate(e.ts, log.nowMs),
+                      })
+                      : shortDate(e.ts, log.nowMs)}
                   </td>
-                  <td className={`${TD} whitespace-nowrap font-mono`}>#{e.number}</td>
+                  <td className={`${TD} whitespace-nowrap font-mono`}>{issueCell(e.number)}</td>
                   <td className={`${TD} break-words leading-relaxed`}>{e.text}</td>
                   <td className={`${TD} text-right whitespace-nowrap`}>
                     <Badge variant={kindVariant(e.kind)} className="font-body">{t(KIND_LABEL_KEY[e.kind])}</Badge>

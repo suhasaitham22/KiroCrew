@@ -2298,6 +2298,7 @@
             "kind_reply": "답변함",
             "kind_review": "리뷰",
             "kind_skip": "범위 외 판단",
+            "kind_sweep": "확인함",
             "kind_yield": "양보함",
             "no_next_recorded": "기록된 다음 단계 없음",
             "no_open_work_items": "진행 중인 작업 없음",
@@ -2330,6 +2331,7 @@
             "state_idle": "유휴",
             "state_paused": "일시 중지",
             "work_log": "작업 기록",
+            "work_log_checking_since": "{{when}}부터 확인 중",
             "work_log_hint": "최근 24시간 강조"
           },
           "rail_section": "크루",

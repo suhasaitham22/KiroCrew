@@ -2398,6 +2398,7 @@
             "kind_reply": "Répondu",
             "kind_review": "Revue",
             "kind_skip": "Écarté",
+            "kind_sweep": "Parcouru",
             "kind_yield": "Libéré",
             "no_next_recorded": "aucune étape suivante enregistrée",
             "no_open_work_items": "Rien en cours",
@@ -2432,6 +2433,7 @@
             "state_idle": "inactive",
             "state_paused": "en pause",
             "work_log": "Journal de travail",
+            "work_log_checking_since": "vérifie depuis {{when}}",
             "work_log_hint": "24 h mises en évidence"
           },
           "rail_section": "Équipes",

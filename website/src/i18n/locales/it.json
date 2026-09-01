@@ -2354,6 +2354,7 @@
             "kind_reply": "Risposto",
             "kind_review": "Revisione",
             "kind_skip": "Scartata",
+            "kind_sweep": "Verificato",
             "kind_yield": "Rilasciata",
             "no_next_recorded": "nessun passo successivo registrato",
             "no_open_work_items": "Niente in corso",
@@ -2388,6 +2389,7 @@
             "state_idle": "inattiva",
             "state_paused": "in pausa",
             "work_log": "Registro di lavoro",
+            "work_log_checking_since": "controlla da {{when}}",
             "work_log_hint": "ultime 24h evidenziate"
           },
           "rail_section": "Crew",

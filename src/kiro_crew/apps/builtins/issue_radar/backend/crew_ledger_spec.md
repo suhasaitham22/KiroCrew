@@ -276,8 +276,35 @@ a lock and was caught in review — take its `_LedgerLock` too).
  "crew_id":"c_7f3a","number":2251,"kind":"ci","text":"CI round 3 — 41/47 green, 6 inherited from main"}
 ```
 
+`number` is OMITTED on a **crew-level** line — a step that belongs to no issue,
+which today is only `kind: "sweep"` (the crew checked the queue and took
+nothing). The key is absent rather than `null` or `0`: a reader tells "this line
+is about no issue" from its absence, and a `0` would be indistinguishable from a
+real issue number in every filter and join that keys on it. In the id, an absent
+number renders as the empty string, so the formula for a numbered line is
+unchanged and the two families cannot collide.
+
+The pairing is enforced in both directions, in the write route and in the store:
+a numberless line must carry a crew-level kind, and a crew-level kind must not
+carry a number. Neither shape can drift into the other's meaning.
+
+**Consecutive sweeps coalesce.** "Checked, took nothing" is a recurring
+latest-value fact, not an event, and a crew is nudged on a timer — so one line per
+idle cycle would be an unbounded run. Reads here are capped and discard the OLDEST
+line first, so a crew idling a couple of hundred cycles would push its real work
+history out of its own work log. The FIRST sweep after real work is written; a
+sweep whose crew already has one as its newest line is answered with that existing
+line, and the response says `coalesced`. The surviving timestamp therefore marks
+when the idle stretch BEGAN, which is the more useful reading. This is the same
+record-the-transition discipline `phase` already follows — stamped only when an
+item is created or actually moves. The tail check and the append happen under ONE
+hold of the events lock, or two crew turns waking together would both see no
+trailing sweep and both append.
+
 One log feeds **two** surfaces: the work-log table on the crew page, and the
-`<details>` progress list inside the public claim comment.
+`<details>` progress list inside the public claim comment. A crew-level line
+reaches only the first — it has no issue, so there is no claim comment to render
+it into.
 
 That dual use imposes the stricter constraint on both: **`text` becomes public**,
 so it must never contain an absolute path, a host name, or anything from the
@@ -396,7 +423,7 @@ five findings fields the same way). Empty fields are dropped, so a partial patch
 preserves what an earlier write stored.
 
 ```
-number                    required int
+number                    optional int — omit ONLY with `event_kind: sweep`
 phase                     optional enum
 outcome                   optional enum
 next                      optional str
@@ -414,8 +441,17 @@ skip_scope                optional enum — why a pass was recorded, including
                           `needs-decision` / `needs-investigation` when the next
                           step belongs to a human
 event                     optional str — the public progress line
-event_kind                optional enum (claim|investigate|reply|implement|ci|review|conflict|merge|handback|skip|yield)
+event_kind                optional enum (claim|investigate|reply|implement|ci|review|conflict|merge|handback|skip|yield|sweep)
 ```
+
+Nothing is unconditionally required. `number` was, which left a crew that swept
+an empty queue no way to record the cycle without inventing an issue number. The
+coupling that replaced the requirement is a relation between two fields, which a
+per-field schema cannot express, so it lives on the write route and in the store:
+a missing `number` is valid ONLY with `sweep`, `sweep` is invalid WITH one, and a
+numberless call takes none of the work-item fields (they patch an item this call
+does not create, so they are refused rather than dropped). A present-but-invalid
+number stays a 400 and is never reinterpreted as "no issue".
 
 Validation lives in `validation.py` alongside the existing schemas. The handler
 sends `owner`/`repo` explicitly so a same-numbered issue in another repo cannot

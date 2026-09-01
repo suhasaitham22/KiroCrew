@@ -287,6 +287,107 @@ describe('CrewPageView — work log 24h boundary', () => {
     await screen.findByTestId('work-log-row-e-1h')
     expect(screen.queryByTestId('work-log-earlier')).not.toBeInTheDocument()
   })
+
+  it('renders a crew-level line with an em dash rather than a bare hash', async () => {
+    // A `sweep` line records that the crew checked the queue and took nothing, so
+    // it belongs to no issue and the backend omits `number` entirely. The Issue
+    // column is monospaced and right-aligned against real numbers, so a bare `#`
+    // would read as a number that failed to load.
+    const sweep = event('e-sweep', 1, {
+      kind: 'sweep',
+      text: 'checked 42 open issues, took none',
+      number: undefined,
+    })
+    api.crew.mockResolvedValue(payload({ events: [sweep, event('e-ci', 2)] }))
+    renderPage()
+
+    const row = await screen.findByTestId('work-log-row-e-sweep')
+    const issueCell = within(row).getAllByRole('cell')[1]
+    expect(issueCell.textContent).toBe('\u2014')
+    expect(issueCell.textContent).not.toContain('#')
+    // The numbered sibling is untouched, so the guard is on absence, not on kind.
+    const numbered = within(screen.getByTestId('work-log-row-e-ci')).getAllByRole('cell')[1]
+    expect(numbered.textContent).toBe('#2251')
+  })
+
+  it('translates the sweep kind through the catalog like every other kind', async () => {
+    const sweep = event('e-sweep', 1, { kind: 'sweep', text: 'queue empty', number: undefined })
+    api.crew.mockResolvedValue(payload({ events: [sweep] }))
+    renderPage()
+
+    const row = await screen.findByTestId('work-log-row-e-sweep')
+    expect(within(row).getByText(copy('kind_sweep'))).toBeInTheDocument()
+  })
+
+  it('reads the newest sweep as an ongoing stretch, not as a past instant', async () => {
+    // Consecutive sweeps coalesce in the store, so the timestamp marks when the
+    // idle stretch BEGAN and the crew keeps checking after it. With the bare
+    // "3h ago" the other kinds use, an actively-idling crew reads as one that has
+    // done nothing for three hours.
+    const sweep = event('e-sweep', 1, { kind: 'sweep', text: 'queue empty', number: undefined })
+    api.crew.mockResolvedValue(payload({ events: [sweep, event('e-ci', 3)] }))
+    renderPage()
+
+    const when = within(await screen.findByTestId('work-log-row-e-sweep')).getAllByRole('cell')[0]
+    // The relative string comes from the real formatter, not a hardcoded literal:
+    // its wording is locale data, so pinning "1 hour ago" would assert the
+    // formatter's current output rather than this row's qualifier.
+    const rendered = (await import('../i18n/format')).fmtRelative(ago(1), { now: NOW.getTime() })
+    expect(when.textContent).toBe(copy('work_log_checking_since', { when: rendered }))
+    // A discrete act keeps the plain past-instant wording, so the qualifier marks
+    // the open stretch rather than every row.
+    const act = within(screen.getByTestId('work-log-row-e-ci')).getAllByRole('cell')[0]
+    expect(act.textContent).not.toContain(copy('work_log_checking_since', { when: '' }).trim())
+  })
+
+  it('drops the ongoing wording once the crew takes work again', async () => {
+    // Keyed on RECENCY, not on kind. A sweep with newer work above it is a CLOSED
+    // stretch, and leaving it saying "checking since" would put a claim on screen
+    // that the rows directly above it contradict.
+    const stale = event('e-sweep', 5, { kind: 'sweep', text: 'queue empty', number: undefined })
+    api.crew.mockResolvedValue(
+      payload({ events: [event('e-claim', 1, { kind: 'claim' }), stale] }),
+    )
+    renderPage()
+
+    const when = within(await screen.findByTestId('work-log-row-e-sweep')).getAllByRole('cell')[0]
+    const rendered = (await import('../i18n/format')).fmtRelative(ago(5), { now: NOW.getTime() })
+    expect(when.textContent).toBe(rendered)
+  })
+
+  it('drops the ongoing wording while the crew is paused', async () => {
+    // "checking since" is a present-tense activity claim, and a paused crew is not
+    // checking -- the page's own paused badge says so higher up the same view.
+    const sweep = event('e-sweep', 1, { kind: 'sweep', text: 'queue empty', number: undefined })
+    api.crew.mockResolvedValue(
+      payload({ crew: crew({ enabled: false, paused_reason: 'operator paused' }), events: [sweep] }),
+    )
+    renderPage()
+
+    const when = within(await screen.findByTestId('work-log-row-e-sweep')).getAllByRole('cell')[0]
+    const rendered = (await import('../i18n/format')).fmtRelative(ago(1), { now: NOW.getTime() })
+    expect(when.textContent).toBe(rendered)
+  })
+
+  it('marks at most one row as ongoing when several sweeps are stored', async () => {
+    // Coalescing makes CONSECUTIVE sweeps impossible, but a pair separated by real
+    // work is normal -- and only the newest of them can still be running.
+    const events = [
+      event('e-sweep-new', 1, { kind: 'sweep', text: 'empty again', number: undefined }),
+      event('e-claim', 3, { kind: 'claim' }),
+      event('e-sweep-old', 6, { kind: 'sweep', text: 'queue empty', number: undefined }),
+    ]
+    api.crew.mockResolvedValue(payload({ events }))
+    renderPage()
+
+    await screen.findByTestId('work-log-row-e-sweep-new')
+    const qualifier = copy('work_log_checking_since', { when: '' }).trim()
+    const ongoing = ['e-sweep-new', 'e-claim', 'e-sweep-old'].filter((id) => {
+      const cell = within(screen.getByTestId(`work-log-row-${id}`)).getAllByRole('cell')[0]
+      return cell.textContent?.includes(qualifier)
+    })
+    expect(ongoing).toEqual(['e-sweep-new'])
+  })
 })
 
 describe('CrewPageView — the next column', () => {

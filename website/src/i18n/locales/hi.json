@@ -2517,6 +2517,7 @@
             "kind_reply": "जवाब दिया",
             "kind_review": "समीक्षा",
             "kind_skip": "दायरे से बाहर",
+            "kind_sweep": "जाँचा गया",
             "kind_yield": "छोड़ दिया",
             "no_next_recorded": "अगला क़दम दर्ज नहीं",
             "no_open_work_items": "कुछ भी चालू नहीं",
@@ -2550,6 +2551,7 @@
             "state_idle": "खाली",
             "state_paused": "रुका हुआ",
             "work_log": "कार्य-वृत्त",
+            "work_log_checking_since": "{{when}} से जाँच रहा है",
             "work_log_hint": "24 घंटे उजागर"
           },
           "rail_section": "क्रू",
