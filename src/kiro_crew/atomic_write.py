@@ -8,6 +8,7 @@ writers target the same file.
 from __future__ import annotations
 
 import asyncio
+import base64
 import errno
 import io
 import logging
@@ -91,6 +92,28 @@ _CARRIED_INFORMATIONAL_XATTR_PREFIXES = ("user.",)
 ACCESS_CONTROL_XATTRS_SUPPORTED = all(
     hasattr(os, name) for name in ("listxattr", "getxattr", "setxattr")
 )
+
+
+def pinned_parent_replace_supported() -> bool:
+    """Whether an inode-replacing write can be staged and renamed through a dir fd.
+
+    The staged temp file is created with ``os.open(name, ..., dir_fd=)`` and the
+    rename that publishes it is ``renameat`` -- ``os.rename`` with both
+    ``src_dir_fd`` and ``dst_dir_fd``. Both syscalls must accept a directory
+    descriptor, or a caller that passes ``parent_dir_fd`` would fall through to
+    the by-name floor.
+
+    ``os.rename`` is probed rather than ``os.replace``: on this interpreter family
+    ``os.rename`` is in ``os.supports_dir_fd`` while ``os.replace`` is not, and on
+    POSIX ``os.rename`` already overwrites an existing destination, so the replace
+    semantics hold. ``O_NOFOLLOW`` is part of the requirement because the staged
+    file must refuse a link planted at the temp name.
+    """
+    return (
+        hasattr(os, "O_NOFOLLOW")
+        and os.open in os.supports_dir_fd
+        and os.rename in os.supports_dir_fd
+    )
 
 
 def open_access_control_source(path: Path | str) -> int | None:
@@ -223,6 +246,42 @@ def _write_all(fd: int, data: bytes, path: Path) -> None:
                 f"{len(view)} of {len(data)} still pending"
             )
         view = view[written:]
+
+
+#: Bytes of randomness in a pinned-parent temp name. tempfile.mkstemp uses eight
+#: random characters; matching that entropy keeps the collision odds equivalent to
+#: the by-name floor while the O_EXCL create below is what actually makes the name
+#: unique -- a collision simply retries.
+_PINNED_TMP_RANDOM_BYTES = 6
+_PINNED_TMP_MAX_ATTEMPTS = 100
+
+
+def _mkstemp_at(dir_fd: int) -> tuple[int, str]:
+    """Create a unique temp file relative to *dir_fd*; return ``(fd, name)``.
+
+    ``tempfile.mkstemp`` cannot be driven through a directory descriptor -- it
+    only takes a ``dir=`` PATH, which re-resolves every component and so reopens
+    exactly the ancestor-swap window the pinned parent exists to close. This is
+    the descriptor-relative equivalent: ``O_CREAT|O_EXCL|O_NOFOLLOW`` under the
+    pinned parent, so the create is atomic, refuses a link planted at the temp
+    name, and never leaves the directory the caller walked.
+
+    The name is returned as a bare component (no directory part); the caller
+    addresses it only through *dir_fd*, never by joining it to a path.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_BINARY", 0)
+    for _ in range(_PINNED_TMP_MAX_ATTEMPTS):
+        token = base64.urlsafe_b64encode(os.urandom(_PINNED_TMP_RANDOM_BYTES)).decode("ascii")
+        token = token.rstrip("=").replace("-", "_")
+        name = f".{token}.tmp"
+        try:
+            fd = os.open(name, flags, 0o600, dir_fd=dir_fd)
+        except FileExistsError:
+            continue
+        return fd, name
+    raise OSError(  # pragma: no cover - 100 consecutive collisions is not reachable
+        errno.EEXIST, "could not create a unique temp file under the pinned parent"
+    )
 
 
 def on_event_loop() -> bool:
@@ -626,6 +685,7 @@ def atomic_write(
     restrict_to_owner: bool = False,
     restrict_on_error: RestrictErrorPolicy = "raise",
     preserve_access_control_from: int | None = None,
+    parent_dir_fd: int | None = None,
 ) -> None:
     """Write *content* to *path* atomically via unique temp file + rename.
 
@@ -696,6 +756,20 @@ def atomic_write(
     there are none. Reading from the descriptor rather than by name keeps the
     read pinned to the inode the caller validated. The carry is ADDITIVE to
     ``mode=``, not a replacement.
+
+    *parent_dir_fd* is an OPEN descriptor for the destination's directory,
+    already pinned component-by-component by the caller (``pinned_fs`` supplies
+    the walk). When given on a platform that can stage and rename through a
+    descriptor (:func:`pinned_parent_replace_supported`), the temp file is
+    created with ``os.open(name, O_CREAT|O_EXCL|O_NOFOLLOW, dir_fd=)`` and the
+    publishing rename is ``renameat`` -- both ends relative to that descriptor --
+    so neither the temp creation nor the rename re-resolves the parent by name and
+    an ancestor swapped after the caller's validation cannot redirect the write.
+    ``None`` (default), or a platform without the descriptor-relative syscalls,
+    keeps the by-name ``mkstemp`` + rename floor exactly as before: it is the same
+    platform that cannot pin a directory at all, so this adds no exposure the
+    declared by-name traversal does not already carry. The destination's own name
+    still comes from *path*; only the directory it is resolved through is pinned.
     """
     binary = isinstance(content, bytes)
     if binary and newline is not None:
@@ -726,13 +800,21 @@ def atomic_write(
         # would create the missing directories under its target, so checking
         # after it would find a tree the write itself had already built.
         _refuse_linked_parent(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    # A pinned parent descriptor stages and renames through the fd the caller
+    # already walked; without one (or on a platform lacking the descriptor-
+    # relative syscalls) the by-name mkstemp + rename is the floor.
+    pin = parent_dir_fd if pinned_parent_replace_supported() else None
+    if pin is None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    else:
+        fd, tmp = _mkstemp_at(pin)
     try:
         if restrict_to_owner:
             # Before fdopen, matching the shipping order in webhooks.py and
             # mcp_gateway/rewriter.py: the DACL lands while the file is still
-            # empty, so a secret never exists in a readable file.
+            # empty, so a secret never exists in a readable file. Secret writers
+            # do not pass parent_dir_fd, so tmp is a full path here.
             try:
                 platform_compat.restrict_to_owner(tmp)
             except OSError:
@@ -767,7 +849,22 @@ def atomic_write(
         # cannot double-close if this close is itself what fails.
         fd, open_fd = -1, fd
         os.close(open_fd)
-        replace_with_retry(tmp, path)
+        if pin is None:
+            replace_with_retry(tmp, path)
+        else:
+            # renameat, both ends relative to the pinned parent: neither the temp
+            # name nor the destination name is re-resolved from the root, so an
+            # ancestor swapped after the caller's walk cannot redirect the
+            # publish. os.rename overwrites an existing destination on POSIX, so
+            # the replace semantics hold; os.replace is not in supports_dir_fd on
+            # every interpreter, os.rename is (pinned_parent_replace_supported
+            # probes rename for exactly this reason).
+            os.rename(
+                os.path.basename(tmp),
+                path.name,
+                src_dir_fd=pin,
+                dst_dir_fd=pin,
+            )
     except BaseException:
         # BaseException, not Exception. Three of the hand-rolled writers this
         # helper replaces already cleaned up under ``except BaseException``:
@@ -782,7 +879,13 @@ def atomic_write(
         if fd >= 0:
             os.close(fd)
         try:
-            os.unlink(tmp)
+            if pin is None:
+                os.unlink(tmp)
+            else:
+                # Removed relative to the same pinned descriptor the temp was
+                # created under, so cleanup cannot reach a different file even if
+                # the parent name has since been swapped.
+                os.unlink(os.path.basename(tmp), dir_fd=pin)
         except OSError:
             pass
         raise
