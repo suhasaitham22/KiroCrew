@@ -13,7 +13,12 @@ window of the current branch's history:
   deferrals -- open `deferred-finding` issues: tracked share (assignee +
                'Due: YYYY-MM-DD' body line or milestone due), overdue count
   harvest   -- merged fix-titled PRs in the window carrying a
-               '## Pattern harvest' section
+               '## Pattern harvest' section. Scoped to PRs merged into the
+               DEFAULT branch whose own hygiene check RAN under the gate: a
+               release-branch PR ran that branch's workflow version and a PR
+               whose hygiene check never ran was never asked, so neither is a
+               non-adopter. Both are counted separately, leaving `escapes` to
+               mean what it says.
 
 Needs `git` (full-depth checkout) and `gh` (GH_TOKEN) on PATH. Emits JSON to
 --out and a markdown table to --summary. Pure stdlib by design: the weekly
@@ -158,6 +163,82 @@ def deferral_metrics(repo: str) -> dict:
     }
 
 
+def default_branch(repo: str) -> str:
+    """The repo's own default branch, so the harvest denominator is not a literal.
+
+    Derived rather than hardcoded because it decides which PRs the gate is even
+    expected to have run on: a release-branch PR runs the workflow version that
+    lives on THAT branch.
+    """
+    data = gh_json("repo", "view", repo, "--json", "defaultBranchRef")
+    name = ((data or {}).get("defaultBranchRef") or {}).get("name") or ""
+    if not name:
+        raise RuntimeError(f"could not resolve the default branch of {repo}")
+    return str(name)
+
+
+# When the Pattern harvest requirement began applying. Used to date the PR's own
+# hygiene RUN, never the PR itself -- see gate_ran_on.
+HARVEST_GATE_ACTIVE_ISO = "2026-08-31T08:01:43Z"
+
+# The hygiene check's name, as `.github/workflows/code-review.yml` declares it.
+HYGIENE_CHECK_NAME = "PR Hygiene"
+
+
+def gate_ran_on(repo: str, head_sha: str) -> bool:
+    """Whether the harvest gate actually evaluated this PR.
+
+    Applicability is derived from the PR's own hygiene run rather than from when
+    the PR was OPENED, because the two disagree in exactly the case that matters:
+    a PR opened before the rollout but pushed to afterwards gets a FRESH hygiene
+    run carrying the gate, and if it then merged with no section that is a real
+    escape. Keying on the PR's creation time would exclude it and publish a false
+    zero -- hiding a hole is worse than reporting a phantom one.
+
+    A `pull_request` run uses the workflow from the merge ref, so a hygiene run
+    that STARTED after the gate merged necessarily carried the harvest step. The
+    start time is the only observable that separates the two workflow versions:
+    the check's name is identical in both.
+
+    False when no hygiene run exists on the head at all -- a PR whose workflows
+    are still awaiting maintainer approval was never asked.
+
+    One API call per candidate PR (~100 a week). A failed call raises, per this
+    module's contract: a report that silently drops a PR is a report that
+    understates its own denominator.
+    """
+    if not head_sha:
+        return False
+    payload = gh_json("api", f"repos/{repo}/commits/{head_sha}/check-runs?per_page=100")
+    runs = payload.get("check_runs", []) if isinstance(payload, dict) else []
+    return any(
+        str(r.get("started_at") or "") >= HARVEST_GATE_ACTIVE_ISO
+        for r in runs
+        if str(r.get("name") or "") == HYGIENE_CHECK_NAME and r.get("started_at")
+    )
+
+
+# What the PR Hygiene gate accepts, transcribed from its own two `grep -qiE`
+# patterns in `.github/workflows/code-review.yml`. They MUST stay identical: the
+# gate is case-insensitive and space-tolerant, so a body reading
+# `### pattern harvest` passes it -- and a stricter reading here would publish
+# that PR as an escape, corrupting the one number this metric exists to make
+# trustworthy. `test_fix_loop_discipline.py` extracts the gate's patterns and
+# fails when these drift from them.
+#
+# Both are required, matching the gate: the heading alone is not a harvest, and a
+# PR that merged without satisfying what the gate demands IS an escape.
+HARVEST_HEADING_RE = re.compile(r"^##+ *Pattern harvest", re.MULTILINE | re.IGNORECASE)
+HARVEST_ANSWER_RE = re.compile(
+    r"^ *(Rule candidate|Not generalizable) *:", re.MULTILINE | re.IGNORECASE
+)
+
+
+def has_harvest_section(body: str) -> bool:
+    """Whether *body* satisfies the same contract the hygiene gate enforces."""
+    return bool(HARVEST_HEADING_RE.search(body) and HARVEST_ANSWER_RE.search(body))
+
+
 def harvest_metrics(repo: str, since_iso: str) -> dict:
     """since_iso is the exact UTC timestamp of the window start; the gh search
     uses its date as a coarse pre-filter and mergedAt enforces the precise
@@ -174,7 +255,7 @@ def harvest_metrics(repo: str, since_iso: str) -> dict:
         "--limit",
         "1000",
         "--json",
-        "title,body,mergedAt",
+        "title,body,mergedAt,baseRefName,headRefOid",
     )
     if len(prs) >= 1000:
         raise RuntimeError(
@@ -183,11 +264,30 @@ def harvest_metrics(repo: str, since_iso: str) -> dict:
         )
     prs = [p for p in prs if (p.get("mergedAt") or "") >= since_iso]
     fix_prs = [p for p in prs if FIX_SUBJECT_RE.match(p.get("title") or "")]
-    with_section = sum(1 for p in fix_prs if "## Pattern harvest" in (p.get("body") or ""))
+
+    # Two exclusions, both answering "was this PR ever asked for a section?".
+    # A PR merged into a release branch ran that branch's workflow version, which
+    # has no harvest step; a PR whose hygiene check never ran under the gate was
+    # likewise never asked. Counting either as a non-adopter reports a hole that
+    # does not exist -- the first audit of this mechanism misread the first case
+    # and called two release backports escapes. They are reported separately so a
+    # REAL escape still stands out.
+    base = default_branch(repo)
+    on_default = [p for p in fix_prs if (p.get("baseRefName") or "") == base]
+    other_base = len(fix_prs) - len(on_default)
+    in_scope = [p for p in on_default if gate_ran_on(repo, str(p.get("headRefOid") or ""))]
+    never_asked = len(on_default) - len(in_scope)
+    with_section = sum(1 for p in in_scope if has_harvest_section(p.get("body") or ""))
     return {
-        "merged_fix_prs": len(fix_prs),
+        "merged_fix_prs": len(in_scope),
         "with_harvest_section": with_section,
-        "adoption_pct": round(100 * with_section / len(fix_prs), 1) if fix_prs else None,
+        "adoption_pct": round(100 * with_section / len(in_scope), 1) if in_scope else None,
+        # A non-zero count here is the signal to investigate: the gate ran on
+        # these PRs, it is required on this branch, and they merged anyway.
+        "escapes": len(in_scope) - with_section,
+        "excluded_other_base": other_base,
+        "excluded_gate_never_ran": never_asked,
+        "default_branch": base,
     }
 
 
@@ -267,11 +367,20 @@ def main() -> int:
         json.dump(result, f, indent=2)
 
     vol, szz, dfr, hrv = result["volume"], result["szz"], result["deferrals"], result["harvest"]
+
+    def pct(value: object) -> str:
+        """Render a percentage, or `n/a` when the denominator was zero.
+
+        A `None` percentage formatted straight into the table published `None%`,
+        which reads as a measurement rather than as an empty denominator.
+        """
+        return "n/a" if value is None else f"{value}%"
+
     lines = [
         "| Metric | Value |",
         "|---|---|",
         f"| Commits in window | {vol['commits']} |",
-        f"| Fix commits | {vol['fix_commits']} ({vol['fix_pct']}%) |",
+        f"| Fix commits | {vol['fix_commits']} ({pct(vol['fix_pct'])}) |",
         f"| SZZ coverage | {vol['szz_analyzed']}/{vol['fix_commits']}"
         f"{' (CAPPED — trends only, not totals)' if vol['szz_capped'] else ' (full)'} |",
         f"| SZZ: introduced by reviewed PR | {szz['classes']['traced_to_pr']} |",
@@ -279,9 +388,14 @@ def main() -> int:
         f"| SZZ: pure addition (omission) | {szz['classes']['add_only']} |",
         f"| Median bug age (days) | {szz['median_age_days']} |",
         f"| Deferred findings open / tracked / overdue | "
-        f"{dfr['open']} / {dfr['tracked']} ({dfr['tracked_pct']}%) / {dfr['overdue']} |",
+        f"{dfr['open']} / {dfr['tracked']} ({pct(dfr['tracked_pct'])}) / {dfr['overdue']} |",
         f"| Harvest-section adoption on fix PRs | "
-        f"{hrv['with_harvest_section']}/{hrv['merged_fix_prs']} ({hrv['adoption_pct']}%) |",
+        f"{hrv['with_harvest_section']}/{hrv['merged_fix_prs']} ({pct(hrv['adoption_pct'])}) |",
+        # Escapes are the actionable half: on the default branch the gate is
+        # required, so a gap means it did not run and wants investigating.
+        f"| Harvest escapes (default-branch fix PRs with no section) | {hrv['escapes']} |",
+        f"| Excluded: another base / gate never ran | "
+        f"{hrv['excluded_other_base']} / {hrv['excluded_gate_never_ran']} |",
     ]
     with open(args.summary, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")

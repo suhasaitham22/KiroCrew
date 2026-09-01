@@ -16,7 +16,12 @@ still there and still pointed at the same names.
 
 from __future__ import annotations
 
+import importlib.util
+import re
 from pathlib import Path
+from typing import Iterator
+
+import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 TEMPLATE = ROOT / ".github" / "PULL_REQUEST_TEMPLATE.md"
@@ -32,6 +37,296 @@ PREPARE_PR = (
 )
 
 LABEL = "deferred-finding"
+
+ANALYSIS = ROOT / ".github" / "workflows" / "fix-loop-analysis.yml"
+METRICS_SCRIPT = ROOT / ".github" / "scripts" / "fix_loop_metrics.py"
+
+# Names the runner defines for every step, plus shell specials. A reference to
+# one of these is defined even though nothing in the workflow assigns it.
+_RUNNER_PROVIDED = frozenset(
+    {
+        "CI",
+        "HOME",
+        "PATH",
+        "PWD",
+        "SHELL",
+        "TMPDIR",
+        "IFS",
+        "RANDOM",
+        "LINENO",
+        "BASH_ENV",
+        "BASH_SOURCE",
+        "FUNCNAME",
+        "OSTYPE",
+        "HOSTNAME",
+        "USER",
+        "LANG",
+    }
+)
+
+
+def _shell_steps(workflow: Path) -> Iterator[tuple[str, str, set[str], str]]:
+    """Yield (job, step name, names defined for it, the shell body) per run step."""
+    doc = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+    workflow_env = set((doc.get("env") or {}).keys())
+    for job_id, job in (doc.get("jobs") or {}).items():
+        job_env = workflow_env | set((job.get("env") or {}).keys())
+        for step in job.get("steps") or []:
+            body = step.get("run")
+            if not body:
+                continue
+            defined = job_env | set((step.get("env") or {}).keys())
+            yield job_id, str(step.get("name") or "<unnamed>"), defined, str(body)
+
+
+def _assigned_in_block(body: str) -> set[str]:
+    """Names the shell body itself creates, so a local variable is not a miss."""
+    names: set[str] = set()
+    names |= set(re.findall(r"^\s*(?:local\s+|export\s+)?([A-Za-z_][A-Za-z0-9_]*)\+?=", body, re.M))
+    names |= set(re.findall(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\b", body))
+    names |= set(re.findall(r"\bread\s+(?:-r\s+)?([A-Za-z_][A-Za-z0-9_]*)", body))
+    return names
+
+
+def undefined_expansions(body: str, defined: set[str]) -> set[str]:
+    """Variable names the block expands but nothing defines.
+
+    GitHub `${{ ... }}` expressions are removed first: they are substituted
+    before the shell ever sees them, so their contents are not shell names.
+    Whole-line comments are removed too -- a line whose first non-space
+    character is `#` is unconditionally a comment in bash, so prose describing
+    an expansion must not read as one. A TRAILING `#` is deliberately left
+    alone: it is ambiguous inside a string (`grep -oE '#[0-9]+'`), and cutting
+    at it would truncate real code.
+    """
+    shell = re.sub(r"\$\{\{.*?\}\}", "", body, flags=re.S)
+    shell = "\n".join(line for line in shell.splitlines() if not line.lstrip().startswith("#"))
+    known = defined | _assigned_in_block(shell) | _RUNNER_PROVIDED
+    referenced = {
+        m.group(1)
+        for m in re.finditer(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)", shell)
+        if not m.group(1).startswith(("GITHUB_", "RUNNER_", "INPUT_", "ACTIONS_"))
+    }
+    return referenced - known
+
+
+class TestNoSilentlyBrokenShell:
+    """A reference to an undefined name is invisible until the unhappy path runs.
+
+    `set -euo pipefail` makes an unset expansion fatal, and these two lanes are
+    non-blocking by design: the deferral checker replies instead of failing a
+    required check, and the analysis step is `continue-on-error`. So a typo in a
+    branch that only executes when something is WRONG takes the whole reply or
+    the whole narrative down while the run still reports success.
+
+    That is not hypothetical. `Checked disposition: $COMMENT_URL_` -- a markdown
+    italic terminator absorbed into the variable name -- killed the refusal reply
+    on every one of the first 18 incomplete deferrals, and nothing went red.
+    """
+
+    WORKFLOWS = (DEFERRAL_CHECK, AUDIT, ANALYSIS)
+
+    def test_extractor_catches_the_defect_it_was_written_for(self) -> None:
+        """Pin the ratchet itself against the exact shape that escaped.
+
+        A linter for a class nobody can reproduce is a linter nobody can trust,
+        so the historical form is asserted directly rather than assumed covered.
+        """
+        assert undefined_expansions('echo "at: $COMMENT_URL_"', {"COMMENT_URL"}) == {"COMMENT_URL_"}
+        assert undefined_expansions('echo "at: ${COMMENT_URL}_"', {"COMMENT_URL"}) == set()
+
+    def test_every_expansion_resolves(self) -> None:
+        misses: list[str] = []
+        for workflow in self.WORKFLOWS:
+            for job, step, defined, body in _shell_steps(workflow):
+                unknown = undefined_expansions(body, defined)
+                if unknown:
+                    misses.append(f"{workflow.name} :: {job} :: {step} -> {sorted(unknown)}")
+        assert not misses, "shell steps expand names nothing defines:\n" + "\n".join(misses)
+
+
+class TestFailedHalvesAreVisible:
+    """Fail-soft must not mean fail-silent.
+
+    Letting the model step fail is the right product call -- a broken narrative
+    must never cost the deterministic numbers. But `continue-on-error` also made
+    the run report SUCCESS, so a weekly job nobody opens became the perfect place
+    for a permanently broken half to hide: the first scheduled run published a
+    metrics-only issue and the Actions list stayed green.
+    """
+
+    def test_the_analysis_failure_is_reraised_after_the_issue_is_filed(self) -> None:
+        doc = yaml.safe_load(ANALYSIS.read_text(encoding="utf-8"))
+        steps = doc["jobs"]["analyze"]["steps"]
+        names = [str(s.get("name") or "") for s in steps]
+        filed = next(i for i, n in enumerate(names) if "issue" in n.lower())
+        reraise = [
+            i
+            for i, s in enumerate(steps)
+            if "narrate" in str(s.get("if") or "") and "failure" in str(s.get("if") or "")
+        ]
+        assert reraise, "a failed analysis step must re-raise so the run goes red"
+        assert reraise[-1] > filed, (
+            "the re-raise must come AFTER the issue is filed, or the deterministic "
+            "numbers are lost with the narrative"
+        )
+        assert "exit 1" in str(steps[reraise[-1]].get("run") or "")
+
+    def test_the_issue_title_says_when_only_numbers_landed(self) -> None:
+        """The issue list is the surface a reader scans without opening anything."""
+        text = ANALYSIS.read_text(encoding="utf-8")
+        assert "metrics only" in text, "a degraded report must be labelled in its title"
+
+
+class TestHarvestRecognitionMatchesTheGate:
+    """What the metric counts as a harvest must be what the gate accepts.
+
+    The gate is case-insensitive and space-tolerant (`grep -qiE`), so a body
+    reading `### pattern harvest` passes it. A stricter reading in the metric
+    publishes that PR as an escape -- corrupting the single number the metric
+    exists to make trustworthy, in the direction that manufactures alarm.
+
+    Two halves are pinned: the patterns are literally the gate's own, and the
+    behaviour they produce is asserted on the shapes that differ between a
+    substring test and the gate.
+    """
+
+    def _module(self):
+        spec = importlib.util.spec_from_file_location("fix_loop_metrics", METRICS_SCRIPT)
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_patterns_are_transcribed_from_the_gate(self) -> None:
+        """Drift is silent: both sides keep working, and only the count is wrong."""
+        gate_patterns = set(re.findall(r"grep -qiE '([^']+)'", CODE_REVIEW.read_text("utf-8")))
+        mod = self._module()
+        for attr in ("HARVEST_HEADING_RE", "HARVEST_ANSWER_RE"):
+            pattern = getattr(mod, attr).pattern
+            assert pattern in gate_patterns, (
+                f"{attr} is {pattern!r}, which the hygiene gate does not use; "
+                f"the gate's patterns are {sorted(gate_patterns)}"
+            )
+
+    def test_the_shapes_the_gate_accepts_are_counted(self) -> None:
+        """Each body here passes the gate but fails a case-sensitive substring test."""
+        mod = self._module()
+        accepted = (
+            "## Pattern harvest\nRule candidate: semgrep",
+            "### pattern harvest\nRule candidate: semgrep",
+            "##   Pattern harvest\nRule candidate: semgrep",
+            "## PATTERN HARVEST\n  not generalizable : one-off",
+        )
+        for body in accepted:
+            assert mod.has_harvest_section(body), f"the gate accepts this body: {body!r}"
+
+    def test_a_heading_with_no_answer_is_not_a_harvest(self) -> None:
+        """The gate demands both, so a PR that merged with only a heading escaped."""
+        mod = self._module()
+        assert not mod.has_harvest_section("## Pattern harvest\n<!-- comment only -->")
+        assert not mod.has_harvest_section("Rule candidate: semgrep")
+
+
+class TestHarvestDenominator:
+    """`escapes` must mean "the gate ran and this merged anyway" -- nothing else.
+
+    Two ways to corrupt it, in opposite directions, and both have already
+    happened. Counting a PR the gate never applied to manufactures a hole: the
+    first audit of this mechanism reported two release backports as escapes. And
+    excluding by the PR's CREATION time hides a real one: a PR opened before the
+    rollout but pushed to afterwards gets a fresh hygiene run carrying the gate,
+    so if it merged with no section it escaped -- and a creation-time filter
+    publishes that as zero.
+
+    Applicability is therefore read off the PR's own hygiene run.
+    """
+
+    def _module(self):
+        spec = importlib.util.spec_from_file_location("fix_loop_metrics", METRICS_SCRIPT)
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    @staticmethod
+    def _fake_gh(prs: list[dict], hygiene_started: dict[str, str] | None = None):
+        """Stand in for `gh`: the default-branch probe, check-runs, then the PR list."""
+        started = hygiene_started or {}
+
+        def fake_gh_json(*args, **kwargs):
+            if args and args[0] == "repo":
+                return {"defaultBranchRef": {"name": "main"}}
+            if args and args[0] == "api":
+                sha = str(args[1]).split("/commits/")[1].split("/")[0]
+                when = started.get(sha)
+                runs = [{"name": "PR Hygiene", "started_at": when}] if when else []
+                return {"check_runs": runs}
+            return prs
+
+        return fake_gh_json
+
+    @staticmethod
+    def _pr(title: str, body: str, sha: str, base: str = "main") -> dict:
+        return {
+            "title": title,
+            "body": body,
+            "mergedAt": "2026-09-01T00:00:00Z",
+            "baseRefName": base,
+            "headRefOid": sha,
+        }
+
+    def test_other_base_prs_are_excluded_not_counted_as_escapes(self) -> None:
+        mod = self._module()
+        prs = [
+            self._pr("fix: a", "## Pattern harvest\nRule candidate: semgrep", "sha-a"),
+            self._pr("fix: b", "no section", "sha-b", base="release/0.5.0"),
+            self._pr("feat: c", "", "sha-c"),
+        ]
+        fake = self._fake_gh(prs, {"sha-a": "2026-09-01T00:00:00Z"})
+        mod.gh_json = fake
+        out = mod.harvest_metrics("o/r", "2026-08-31T00:00:00Z")
+        assert out["merged_fix_prs"] == 1, "only default-branch fix PRs are in scope"
+        assert out["escapes"] == 0, "a release backport is not an escape"
+        assert out["excluded_other_base"] == 1
+        assert out["adoption_pct"] == 100.0
+
+    def test_a_pr_whose_hygiene_never_ran_under_the_gate_is_excluded(self) -> None:
+        """Two ways to have never been asked: an older run, or no run at all."""
+        mod = self._module()
+        prs = [
+            self._pr("fix: pre-gate run", "no section", "sha-old"),
+            self._pr("fix: no run at all", "no section", "sha-none"),
+        ]
+        mod.gh_json = self._fake_gh(prs, {"sha-old": "2026-08-30T00:00:00Z"})
+        out = mod.harvest_metrics("o/r", "2026-08-31T00:00:00Z")
+        assert out["merged_fix_prs"] == 0
+        assert out["escapes"] == 0
+        assert out["excluded_gate_never_ran"] == 2
+        assert out["adoption_pct"] is None, "an empty denominator must not render a percentage"
+
+    def test_a_pre_gate_pr_re_run_under_the_gate_is_a_real_escape(self) -> None:
+        """The case a creation-time filter hides.
+
+        This PR predates the rollout, so it would have been excluded by its own
+        creation date -- but it was pushed to afterwards, the gate ran on it, and
+        it merged with no section. That is an escape and must be reported.
+        """
+        mod = self._module()
+        prs = [self._pr("fix: opened early, pushed late", "no section", "sha-late")]
+        mod.gh_json = self._fake_gh(prs, {"sha-late": "2026-09-01T00:00:00Z"})
+        out = mod.harvest_metrics("o/r", "2026-08-31T00:00:00Z")
+        assert out["merged_fix_prs"] == 1
+        assert out["escapes"] == 1
+        assert out["excluded_gate_never_ran"] == 0
+
+    def test_a_real_escape_is_still_reported(self) -> None:
+        mod = self._module()
+        prs = [self._pr("fix: a", "no section", "sha-a")]
+        mod.gh_json = self._fake_gh(prs, {"sha-a": "2026-09-01T00:00:00Z"})
+        out = mod.harvest_metrics("o/r", "2026-08-31T00:00:00Z")
+        assert out["escapes"] == 1
+        assert out["adoption_pct"] == 0.0
 
 
 class TestPatternHarvest:
