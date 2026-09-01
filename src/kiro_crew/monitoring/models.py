@@ -202,6 +202,43 @@ class MonitorState:
     input_tokens: int = 0
     output_tokens: int = 0
     consecutive_provider_errors: int = 0
+    #: Adoption metering. Without these two numbers a probe gate that never
+    #: fires and a probe gate that is doing its job are indistinguishable from
+    #: the outside -- which is how the earlier attempts at this saving stayed at
+    #: zero adoption, unnoticed, for over a week. ``quiet_ticks`` is the count of
+    #: observations that cost no model turn; ``wakes`` the count that did.
+    quiet_ticks: int = 0
+    wakes: int = 0
+    #: Ticks where the gate could not decide and the loop fired on its plain
+    #: timer instead. Counted apart from ``wakes`` so the metering cannot
+    #: flatter itself: a gate that is permanently broken would otherwise read as
+    #: a busy, well-used watch.
+    gate_fallbacks: int = 0
+    #: Ticks still owed to the agent after a wake, during which the gate is
+    #: bypassed and the loop fires on its plain timer.
+    #:
+    #: A woken agent usually cannot finish inside one turn -- it reads the
+    #: findings, fixes some, and needs another turn to finish. The probe cannot
+    #: see any of that: it watches the SUBJECT, so an agent that was woken and
+    #: has not yet pushed produces no observable change, and a pure gate would
+    #: report "nothing happened" and starve the work it just started. Firing once
+    #: more after every wake costs one turn per wake and removes that stall
+    #: entirely, which is the right trade against a watch that goes quiet holding
+    #: half-finished work.
+    followup_ticks: int = 0
+    #: Consecutive quiet observations since the last delivered turn.
+    #:
+    #: The gate watches the SUBJECT, so a loop whose duty is to act WHILE the
+    #: subject is quiet -- refresh a heartbeat file, chase a reviewer who still
+    #: has not replied, keep a branch rebased on a moving base -- produces no
+    #: observable change and would never be delivered again. Inference cannot
+    #: tell that intent from the wording, and guessing it is worse than bounding
+    #: it: after enough consecutive quiet ticks the loop is delivered anyway.
+    quiet_streak: int = 0
+    #: Turns delivered because the quiet streak hit its floor rather than because
+    #: anything was observed. Counted apart from wakes so the metering does not
+    #: report a periodic delivery as a real signal.
+    floor_ticks: int = 0
     next_probe_at: float = 0.0
     outcome: MonitorOutcome | None = None
     stopped_reason: str = ""
@@ -231,6 +268,12 @@ class MonitorState:
             "input_tokens",
             "output_tokens",
             "consecutive_provider_errors",
+            "quiet_ticks",
+            "wakes",
+            "gate_fallbacks",
+            "followup_ticks",
+            "quiet_streak",
+            "floor_ticks",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:

@@ -48,6 +48,7 @@ from kiro_crew.agent_sdk import AgentTurnUsage
 from kiro_crew.agents_janitor import sweep_agents_dir
 from kiro_crew.autonudge import (
     APPROVAL_STALL_REASON,
+    MONITOR_TERMINAL_REASON,
     AutoNudgeService,
     NudgeLoop,
 )
@@ -5986,6 +5987,21 @@ class GatewayOrchestrator:
                     "runs meant to go unattended overnight, Settings → "
                     "agent.yolo_duration has an 'until_shutdown' option that "
                     "has no timed expiry."
+                )
+            elif not capped_out and loop.stopped_reason == MONITOR_TERMINAL_REASON:
+                # A FINISH, not a bound. The subject the loop was watching reached
+                # its end (a merged or closed pull request), so there is nothing
+                # left to service and nothing for the operator to raise. Without
+                # this case the reason falls through to the cycle-cap wording
+                # below and reports a cap that never fired, pointing them at a
+                # setting that was never the problem -- exactly the confusion the
+                # rest of this notifier exists to remove.
+                title = "Monitoring loop finished — what it was watching is done"
+                body = (
+                    f"The loop stopped after {loop.cycle_count} cycles because "
+                    "the pull request it was watching was merged or closed, so "
+                    "there is nothing left to observe. No action needed; arm a "
+                    "new loop if you want to watch something else."
                 )
             else:
                 title = "Monitoring loop hit its cycle cap"

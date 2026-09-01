@@ -41,7 +41,7 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterator
 
-from kiro_crew import platform_compat, shutdown_event
+from kiro_crew import irq, platform_compat, probes, shutdown_event
 from kiro_crew.atomic_write import replace_with_retry
 from kiro_crew.config.loader import config_dir, data_home
 from kiro_crew.config.paths import legacy_home
@@ -59,9 +59,32 @@ from kiro_crew.monitoring.models import (
     monitor_state_to_dict,
     quarantine_monitor_state,
 )
+from kiro_crew.probes import targets
 from kiro_crew.security import is_sensitive_path
 
 logger = logging.getLogger(__name__)
+
+#: ``stopped_reason`` for a loop whose watched subject finished (a merged or
+#: closed pull request). Distinct from the bound reasons because it is a
+#: SUCCESSFUL end -- there is nothing left to service -- and a revival check
+#: that treated it as a cap would re-arm a watch on a dead subject.
+MONITOR_TERMINAL_REASON = "monitor_terminal"
+
+#: Ticks the gate is bypassed for after each wake, so a woken agent gets a
+#: second turn to finish. One, because the cost is paid per wake and a second
+#: free turn buys progress the probe cannot observe; raising it multiplies the
+#: cost of every wake, and lowering it to zero reintroduces the stall.
+_WAKE_FOLLOWUP_TICKS = 1
+
+#: Consecutive quiet observations after which a gated loop is delivered anyway.
+#:
+#: This is what makes "gating slows an act-on-quiet loop" true instead of
+#: "gating silences it". Ten keeps the great majority of the saving (nine ticks
+#: in ten cost nothing) while bounding how long any loop can go undelivered to
+#: ten intervals -- under an hour on the 300s interval agents actually use.
+#: Lower wastes the saving on loops that had nothing to do; higher starts to
+#: look like silence to whoever armed the watch.
+_MAX_QUIET_STREAK = 10
 
 _NUDGES_FILE = "autonudge.json"
 _STORE_VERSION = 1
@@ -403,6 +426,16 @@ class NudgeLoop:
     # the persisted ``created_ts`` (not arm time) makes the budget restart-proof
     # — a gateway restart re-arms the loop but never resets its clock.
     max_runtime_secs: int = 0
+    #: Whether this loop may be observation-gated. Defaults to True, which is what
+    #: an older stored record without the key decodes to -- the same answer the
+    #: arming tool gives when the caller says nothing.
+    #:
+    #: Persisted because the opt-out has to SURVIVE. The instruction is the target,
+    #: so editing it re-infers the subject; without a remembered decision an
+    #: explicitly ungated loop would be silently re-gated by the next wording
+    #: change -- exactly the harm the opt-out exists to prevent, arriving through
+    #: the documented way to revise a loop.
+    gate: bool = True
     # WHY the loop was last deactivated: "" (active / never stopped),
     # "manual" (user pause / any caller that didn't say otherwise),
     # "autonudge_stop" (deliberate directive), "cycle_cap",
@@ -501,6 +534,45 @@ def _locked_file(path: Path, mode: str) -> Iterator[Any]:
             yield fh
 
 
+def infer_monitor(message: str, now: float) -> MonitorState | None:
+    """Build a monitor for *message*'s subject, or ``None`` to stay ungated.
+
+    ``None`` is the common, safe answer: a loop watching something with no probe
+    -- a deployment, a ticket, a file -- keeps exactly the behaviour it had
+    before this feature existed. Only a message that names ONE observable
+    subject becomes a gated monitor.
+
+    Public because the ARMING SURFACE has to report this same decision in its
+    acknowledgement, and the reasons it can answer ``None`` are not all in
+    :func:`targets.infer` -- a subject that will not form a valid monitor is
+    another. An ack that re-derived the answer from the target alone could claim
+    a gate the loop never got, which is the one thing a disclosure must not do.
+    One function, one answer.
+
+    Budgets are left at their defaults and are NOT enforced on this path. The
+    default cap is 8 agent turns, and real babysit loops run for dozens of
+    cycles, so enforcing it here would stop working watches early -- a
+    regression wearing a budget's clothing. Enforcement belongs with the
+    decision controller that owns the rest of the budget vocabulary, and is
+    deliberately not smuggled in behind a token saving.
+    """
+    target = targets.infer(message)
+    if target is None:
+        return None
+    try:
+        return MonitorState(
+            kind=target.kind,
+            target=target.subject,
+            objective="review_ready",
+            created_ts=now,
+        )
+    except ValueError:
+        # A subject that cannot form a valid monitor is not a reason to refuse
+        # the loop the caller asked for. Arm it ungated.
+        logger.warning("AutoNudge: inferred target %r rejected by MonitorState", target.subject)
+        return None
+
+
 class AutoNudgeService:
     """Manages reactive per-slot nudge loops with restart-survival."""
 
@@ -523,6 +595,10 @@ class AutoNudgeService:
         # succeeded. A caller may retry remove(id) after the first write fails;
         # an arbitrary unknown id remains a no-op.
         self._pending_removals: set[str] = set()
+        # Loop ids whose CURRENT tick observed a wake but has not yet had its fire
+        # confirmed. Transient on purpose: it is a claim about a turn in flight,
+        # so a restart must forget it rather than charge a turn that never ran.
+        self._pending_monitor_wake: set[str] = set()
         # Loop ids whose timer task is CURRENTLY inside its ``_on_fire`` await.
         # ``update()`` must not cancel such a timer: for channel-bound loops the
         # fire callback runs the unattended turn INLINE, so cancelling it kills
@@ -567,6 +643,22 @@ class AutoNudgeService:
                     for key in raw
                     if key in NudgeLoop.__dataclass_fields__ and key != "monitor"
                 }
+                # ``gate`` decides whether a loop may be observation-gated, and a
+                # stored value that is not a bool is not a decision: the STRING
+                # "false" is truthy, so passing it through would gate a loop that
+                # asked not to be. Normalise it here, at the boundary, rather than
+                # hardening each read site -- and normalise to the DOCUMENTED
+                # DEFAULT rather than to False, because reading corrupt data as an
+                # opt-out would silently ungate loops on the strength of a value
+                # nobody wrote deliberately.
+                raw_gate = loop_values.get("gate")
+                if raw_gate is not None and not isinstance(raw_gate, bool):
+                    logger.warning(
+                        "AutoNudge: loop %s stored a non-boolean gate (%r); using the default",
+                        raw.get("id"),
+                        raw_gate,
+                    )
+                    loop_values["gate"] = True
                 loop = NudgeLoop(**loop_values)
                 if "monitor" in raw:
                     monitor_raw = raw["monitor"]
@@ -584,8 +676,14 @@ class AutoNudgeService:
                         )
                     if loop.monitor.version != MONITOR_STATE_VERSION:
                         # An older controller cannot safely interpret a newer
-                        # policy. Runtime guards keep it inert without
-                        # rewriting the active intent a newer gateway needs.
+                        # policy. The stored ``active`` intent is deliberately
+                        # left alone -- it belongs to the gateway that wrote it
+                        # and must survive a downgrade so an upgrade resumes the
+                        # watch -- and inertness is enforced instead by
+                        # ``_arm_from_deadline`` refusing a timer to an
+                        # unsupported version. Do not "fix" this by deactivating
+                        # here: that trades a record this gateway cannot read for
+                        # one it has silently destroyed.
                         loop.monitor.outcome = MonitorOutcome.BLOCKED
                         loop.monitor.stopped_reason = MONITOR_STOP_UNSUPPORTED_VERSION
                     elif loop.monitor.wake_in_flight:
@@ -601,14 +699,25 @@ class AutoNudgeService:
                         loop.active = False
                         loop.next_due_ts = 0.0
                         self._store_dirty = True
-                    elif loop.active:
-                        # Structured monitor delivery belongs to the controller,
-                        # which is intentionally not wired in this substrate.
-                        # Deactivate rather than allowing the legacy timer to
-                        # inject the prompt before a typed decision is made.
+                    # A CURRENT monitor that already carries an outcome is
+                    # finished -- merged subject, spent budget -- so it must not
+                    # re-arm on a restart. Deliberately NOT reached for a future
+                    # version: the branch above synthesises an outcome for one on
+                    # every load, so checking the outcome alone here would retire
+                    # the very intent that branch exists to preserve.
+                    elif loop.monitor.outcome is not None and loop.active:
                         loop.active = False
                         loop.next_due_ts = 0.0
                         self._store_dirty = True
+                    # A current, un-claimed, unsettled monitor keeps its active
+                    # intent and re-arms like any other loop. It used to be
+                    # deactivated here because delivery had no gate and the
+                    # legacy timer would have injected a prompt without a
+                    # decision; the gate in _monitor_tick_is_quiet now makes that
+                    # decision on every tick, so surviving a restart is correct
+                    # rather than a hazard. Deactivating instead would end every
+                    # watch at the next gateway restart -- silently, since a
+                    # stopped watch and a quiet one look identical from outside.
                 # Re-home / re-validate the persisted kill-switch path. A loop
                 # armed before the data-home move would otherwise be re-armed
                 # with a sentinel path nothing can ever create (see
@@ -851,6 +960,7 @@ class AutoNudgeService:
         stop_sentinel_path: str = "",
         max_runtime_secs: int = 0,
         admission_check: Callable[[], bool] | None = None,
+        gate: bool = True,
     ) -> NudgeLoop:
         # CANCELLATION SAFETY: the mutate+persist runs as a SHIELDED task. If
         # the awaiting caller is cancelled mid-write, a bare await would release
@@ -873,6 +983,7 @@ class AutoNudgeService:
                 stop_sentinel_path=stop_sentinel_path,
                 max_runtime_secs=max_runtime_secs,
                 admission_check=admission_check,
+                gate=gate,
             )
         )
         self._inflight_adds.add(inner)
@@ -895,6 +1006,7 @@ class AutoNudgeService:
         stop_sentinel_path: str,
         max_runtime_secs: int = 0,
         admission_check: Callable[[], bool] | None = None,
+        gate: bool = True,
     ) -> NudgeLoop:
         async with _maintenance_lock(self._base_dir):
             return await self._add_unserialized(
@@ -905,6 +1017,7 @@ class AutoNudgeService:
                 stop_sentinel_path=stop_sentinel_path,
                 max_runtime_secs=max_runtime_secs,
                 admission_check=admission_check,
+                gate=gate,
             )
 
     async def _add_unserialized(
@@ -917,6 +1030,7 @@ class AutoNudgeService:
         stop_sentinel_path: str,
         max_runtime_secs: int = 0,
         admission_check: Callable[[], bool] | None = None,
+        gate: bool = True,
     ) -> NudgeLoop:
         idle_secs = max(_MIN_IDLE_SECS, min(_MAX_IDLE_SECS, int(idle_secs)))
         async with self._lock:
@@ -943,6 +1057,23 @@ class AutoNudgeService:
                 # moment the loop is armed, and user turns from here on only
                 # defer delivery, never restart it.
                 next_due_ts=now + idle_secs,
+                # Gating is decided HERE, from the instruction the caller already
+                # wrote, rather than from a parameter. Every earlier attempt at
+                # this saving shipped as an opt-in and measured zero adoption:
+                # the switch existed, the agent arming the loop was mid-task,
+                # and nothing made it worth its five steps. There is no
+                # parameter to forget here, and no call site to update -- every
+                # surface that arms a loop (the MCP tool, the dashboard, a
+                # channel) inherits the gate by construction.
+                #
+                # ``gate=False`` is the one escape, and it is an opt-OUT: the
+                # default still gates every surface, so it cannot repeat the
+                # zero-adoption failure, and it exists because a loop whose duty
+                # is to act WHILE its subject is quiet is invisible to an
+                # observation of that subject. Keying that only on the wording of
+                # the instruction made a cadence contract depend on prose.
+                monitor=infer_monitor(message, now) if gate else None,
+                gate=gate,
             )
             self._loops[loop.id] = loop
             # Persist WITHOUT blocking the event loop (no-blocking-call rule:
@@ -1122,7 +1253,37 @@ class AutoNudgeService:
             previous = {item.name: getattr(loop, item.name) for item in fields(loop)}
             was_active = loop.active
             if message is not None:
+                retarget = message != loop.message
                 loop.message = message
+                if retarget:
+                    # The instruction IS the target, so a changed instruction can
+                    # change the subject. Re-infer, or the loop keeps polling the
+                    # pull request it was armed on: the new subject is never
+                    # watched, and the old one merging would retire the loop while
+                    # the work it was retargeted to sits unobserved.
+                    #
+                    # An unchanged subject keeps its existing monitor rather than a
+                    # fresh one -- refining the wording of an instruction about the
+                    # same PR is the common use of this path, and rebuilding would
+                    # discard the metering counters and the follow-up allowance for
+                    # no reason. A message that no longer names one subject clears
+                    # the monitor, which returns the loop to a plain timer.
+                    #
+                    # A loop armed with gate=False is never re-inferred here. Its
+                    # caller said the cadence matters, and re-gating it because the
+                    # wording changed would revoke that through the documented way
+                    # to revise a loop -- silently, since an ungated loop and a
+                    # re-gated one look identical until the turns stop arriving.
+                    inferred = infer_monitor(message, time.time()) if loop.gate else None
+                    current = loop.monitor
+                    same_subject = (
+                        inferred is not None
+                        and current is not None
+                        and current.kind == inferred.kind
+                        and current.target == inferred.target
+                    )
+                    if not same_subject:
+                        loop.monitor = inferred
             interval_changed = False
             if idle_secs is not None:
                 new_idle = max(_MIN_IDLE_SECS, min(_MAX_IDLE_SECS, int(idle_secs)))
@@ -1133,16 +1294,32 @@ class AutoNudgeService:
             if max_runtime_secs is not None:
                 loop.max_runtime_secs = max(0, int(max_runtime_secs))
             if active is not None:
-                if active and loop.monitor is not None:
-                    if loop.monitor.version == MONITOR_STATE_VERSION:
-                        # The generic loop update path owns legacy prompt cycles,
-                        # not structured monitor policy. Task4 supplies the
-                        # controller that can deliberately re-arm these records.
-                        loop.active = False
-                        loop.next_due_ts = 0.0
-                    # An older gateway cannot interpret future structured state.
-                    # Ignore its generic Save flag instead of changing the outer
-                    # active intent that a compatible version may resume.
+                if (
+                    active
+                    and loop.monitor is not None
+                    and loop.monitor.version != MONITOR_STATE_VERSION
+                ):
+                    # A FUTURE version cannot be interpreted here. IGNORE the
+                    # flag -- deliberately without touching ``loop.active`` --
+                    # because the stored intent belongs to the newer gateway that
+                    # wrote it and will resume it. Forcing it off would let an
+                    # older process silently retire a watch it cannot even read.
+                    pass
+                elif active and loop.monitor is not None and loop.monitor.outcome is not None:
+                    # A monitor with an outcome is finished -- its subject merged,
+                    # or its budget is spent. Reviving it would fire ungated
+                    # prompts at a settled subject, because the tick gate
+                    # declines to observe a monitor that already has an outcome.
+                    #
+                    # A current, unsettled monitor falls through to the ordinary
+                    # activation below: its delivery is gated per tick, so
+                    # resuming it cannot inject an ungated prompt. Spelling both
+                    # refusals out separately matters -- collapsing them into one
+                    # branch on ``loop.monitor is not None`` swallowed the
+                    # revival entirely, leaving the loop neither refused nor
+                    # activated.
+                    loop.active = False
+                    loop.next_due_ts = 0.0
                 # TERMINAL-TRANSITION ATOMICITY: a bound-tagged deactivation
                 # (stopped_reason supplied — the _timer's cycle_cap /
                 # runtime_budget paths) must never OVERWRITE a deactivation
@@ -1728,6 +1905,13 @@ class AutoNudgeService:
         if t is _current_task_or_none():
             return
         t.cancel()
+        # That cycle is dead, so its wake claim dies with it. Without this the id
+        # stays in the claim set and the loop's NEXT delivered fire -- a fallback,
+        # a floor tick, a plain re-arm -- inherits it and is counted as a wake
+        # that no observation ever made. A cancel is the one way the claim can
+        # outlive the tick that took it: the fire path releases it on both its
+        # delivered and refused branches, and neither runs once the task is gone.
+        self._pending_monitor_wake.discard(loop_id)
 
     def _arm_timer(self, loop: NudgeLoop, delay: float | None = None) -> None:
         self._cancel_timer(loop.id)
@@ -1748,12 +1932,34 @@ class AutoNudgeService:
         instantly, so a user mid-conversation keeps deferring it simply by
         sending another message. The delay is capped at ``idle_secs`` so a
         clock jump can never park the timer beyond one full interval.
+
+        A monitor loop arms through this same path and on the same deadline. Its
+        cadence is the interval the user already set, not a second clock on the
+        monitor record: two clocks for one countdown would have to be kept
+        agreed, and the one the user can see is the one they set. What differs
+        for a monitor is not WHEN the timer wakes but what the wake costs -- the
+        probe gate in :meth:`_timer` decides whether that tick spends a turn.
+
+        ONE monitor is refused a timer outright: a record whose ``version`` this
+        gateway does not implement. Such a record belongs to a newer gateway
+        (a downgrade or a rollback read its store), and this controller cannot
+        interpret its policy -- so arming it would run the loop under a policy
+        nobody here understands, which for the pre-gate code path means
+        injecting the raw message every interval with no decision at all. The
+        refusal is deliberately made HERE, on the arm, rather than by rewriting
+        the record: the stored ``active`` intent belongs to the gateway that
+        wrote it and must survive the downgrade so an upgrade resumes the watch.
+        Inertness is the local consequence, not a change of intent.
         """
-        if loop.monitor is not None:
-            # A typed monitor needs a pre-delivery decision controller. PR1
-            # persists its substrate only, so any legacy timer is cancelled and
-            # cannot reach _run_fire_cycle before Task4 wires that controller.
-            self._cancel_timer(loop.id)
+        monitor = loop.monitor
+        if monitor is not None and monitor.version != MONITOR_STATE_VERSION:
+            logger.info(
+                "AutoNudge: not arming loop %s -- its monitor record is version %s and "
+                "this gateway implements %s",
+                loop.id,
+                monitor.version,
+                MONITOR_STATE_VERSION,
+            )
             return
         now = time.time()
         if loop.next_due_ts <= 0:
@@ -1786,19 +1992,208 @@ class AutoNudgeService:
 
         task.add_done_callback(_finish)
 
+    async def _monitor_tick_is_quiet(self, loop: NudgeLoop) -> bool:
+        """Observe this loop's subject cheaply; say whether to skip the turn.
+
+        Returns True only when the tick is DEFINITELY not worth a model turn.
+        Every other case -- no monitor, no probe for that subject kind, an
+        un-inferable target, a probe defect, a kernel that reached no verdict --
+        returns False so the caller fires exactly as it does today.
+
+        The asymmetry is the whole safety argument. A wrongly-QUIET tick is
+        silence: the loop stops waking and the work it was watching stalls with
+        nothing on screen to say why. A wrongly-spent tick costs one turn, which
+        is what every tick costs today. So every uncertain path resolves toward
+        spending, and only a positive "nothing happened" from the kernel skips.
+
+        The kernel call is offloaded to a thread because observing runs ``gh``
+        as a subprocess with a 25s timeout. On the event loop that would freeze
+        chat, the channel transports and the liveness probes for as long as one
+        slow GitHub call takes.
+        """
+        monitor = loop.monitor
+        if monitor is None or monitor.outcome is not None:
+            return False
+        # A wake buys the agent one more turn, unconditionally and BEFORE any
+        # observation. The probe watches the subject, not the agent: a turn that
+        # was woken and has not pushed yet leaves the subject unchanged, so
+        # observing here would read "nothing happened" and starve work already in
+        # progress. Bounded on purpose -- one tick per wake, spent whether or not
+        # it was needed -- because the alternative designs both fail worse: an
+        # unbounded allowance driven by a completion signal disables gating
+        # entirely on any surface where that signal never arrives, and no
+        # allowance at all lets a watch go silent while holding half-finished
+        # work. Costing one turn per wake is the cheap failure.
+        if monitor.followup_ticks > 0:
+            monitor.followup_ticks -= 1
+            self._persist_soon()
+            logger.debug("AutoNudge: loop %s spending a post-wake follow-up tick", loop.id)
+            return False
+        probe = probes.build(monitor.kind)
+        if probe is None:
+            return False
+        # Derive the probe's config from the LOOP'S OWN INSTRUCTION, then check
+        # the subject it yields against the stored monitor.
+        #
+        # Not from ``monitor.target``: that is the CANONICAL subject
+        # ("owner/name#123"), a shorthand, and a shorthand deliberately carries no
+        # host -- so re-inferring from it would discard the github.com pin that a
+        # URL-armed watch is entitled to, and on a machine configured for an
+        # enterprise server the probe would resolve the slug there. A
+        # same-numbered enterprise pull request being merged would then falsely
+        # terminate a live public watch.
+        #
+        # The instruction is the only place the original spelling survives, and
+        # storing the host a second time would put one fact in two places that can
+        # disagree. So infer from the message and REQUIRE the result to name the
+        # subject the monitor is bound to; a mismatch means the two have drifted
+        # apart, which is not something to resolve by guessing -- fire instead, the
+        # same direction every other uncertain path takes.
+        target = targets.infer(loop.message)
+        if target is None or (target.kind, target.subject) != (monitor.kind, monitor.target):
+            if target is not None:
+                logger.info(
+                    "AutoNudge: loop %s instruction names %s but its monitor is bound to "
+                    "%s -- firing instead of observing",
+                    loop.id,
+                    target.subject,
+                    monitor.target,
+                )
+            return False
+        # Captured BEFORE the poll, which awaits: this is what the verdict is
+        # about, and it is checked again afterwards.
+        binding = (monitor.kind, monitor.target)
+        try:
+            verdict = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: irq.poll(loop.id, target.message, probe)
+            )
+        except Exception:
+            logger.warning(
+                "AutoNudge: probe gate raised for loop %s — firing as usual",
+                loop.id,
+                exc_info=True,
+            )
+            return False
+
+        # The poll above is a real await -- it runs ``gh`` in a thread for up to
+        # 25 seconds -- so the loop can be RETARGETED while it is in flight:
+        # ``update(message=...)`` rebinds the monitor to a different pull request,
+        # or clears it. Acting on this verdict now would apply an observation of
+        # the OLD subject to the new one, and the terminal branch would deactivate
+        # a watch that had just been pointed at a live pull request. Compare the
+        # binding, not the object: a retarget mutates the same MonitorState.
+        if loop.monitor is not monitor or (monitor.kind, monitor.target) != binding:
+            logger.info(
+                "AutoNudge: loop %s was retargeted while its probe was in flight -- "
+                "discarding the stale verdict and firing as usual",
+                loop.id,
+            )
+            return False
+
+        if verdict.outcome is irq.Outcome.TERMINAL:
+            # The subject is finished (a merged or closed pull request). Stop the
+            # loop rather than firing: there is nothing left to service, and one
+            # more turn would only rediscover that. ``expired`` is the existing
+            # channel for "this loop stopped rather than the agent finishing",
+            # and the emitted payload carries ``stopped_reason``, which is what
+            # distinguishes a merged subject from a spent bound.
+            #
+            # Deliberately NOT counted as a wake: no turn is delivered here. A
+            # terminal observation that incremented ``wakes`` would report a turn
+            # that never ran, in the very counters this change exists to make
+            # trustworthy.
+            # Record the finish ON THE MONITOR, not only on the loop. Without
+            # this the record reads as merely paused, and the generic resume path
+            # -- the goal popover's Save, which is allowed to revive a current
+            # unsettled monitor -- would re-arm the watch onto a subject that is
+            # already merged. It would then observe TERMINAL, deactivate, and be
+            # revivable again: a loop that cannot be told apart from a working
+            # one. Reaching the end of the thing you were watching is a SUCCESS,
+            # so the outcome says so rather than borrowing a bound's vocabulary.
+            monitor.outcome = MonitorOutcome.SUCCESS
+            monitor.stopped_reason = MONITOR_TERMINAL_REASON
+            monitor.stopped_at = time.time()
+            logger.info("AutoNudge: loop %s subject reached a terminal state", loop.id)
+            # EMIT FIRST, then deactivate. ``update`` runs its mutation as a
+            # separate shielded task, so its ``_cancel_timer`` does not see this
+            # timer as "the current task" and cancels it -- and this gate RUNS in
+            # that timer, outside the ``_firing`` window that would have deferred
+            # the cancel. Awaiting it here therefore cancels the very task waiting
+            # on it, and anything after the await never runs. That used to be the
+            # notification, so a finished watch told nobody.
+            #
+            # The order is chosen by the same asymmetry as the gate itself. If the
+            # process dies between the emit and the persisted deactivation, the
+            # loop re-arms on restart, observes TERMINAL again, and notifies
+            # again: a duplicate. Deactivating first would risk the opposite --
+            # a settled record whose notification was never sent, which is
+            # silence, and silence is the failure this whole change exists to
+            # avoid.
+            self._emit("expired", loop)
+            await self.update(loop.id, active=False, stopped_reason=MONITOR_TERMINAL_REASON)
+            return True
+
+        if verdict.outcome is irq.Outcome.QUIET:
+            monitor.quiet_ticks += 1
+            monitor.quiet_streak += 1
+            monitor.last_observed_at = time.time()
+            if monitor.quiet_streak >= _MAX_QUIET_STREAK:
+                # Floor reached: deliver anyway. The gate can only see the
+                # SUBJECT, and a loop whose duty is to act while the subject is
+                # quiet -- refresh a heartbeat, chase a silent reviewer, rebase
+                # onto a moving base -- is invisible to it and would otherwise
+                # never be delivered again. Inference cannot read that intent out
+                # of the wording, so the honest answer is not to guess it but to
+                # bound how long any loop can go undelivered.
+                monitor.quiet_streak = 0
+                monitor.floor_ticks += 1
+                logger.info(
+                    "AutoNudge: loop %s hit the quiet-streak floor after %d quiet ticks",
+                    loop.id,
+                    _MAX_QUIET_STREAK,
+                )
+                # Persisted AFTER the reset, not before it. Today the earlier
+                # call would have captured this anyway, because the write is a
+                # detached task that cannot run until this block yields -- but
+                # that is an accident of the persist being deferred, and a
+                # restart reading a streak that was never reset would deliver one
+                # extra turn and under-count the floor. Ordering it explicitly
+                # costs nothing and does not depend on that.
+                self._persist_soon()
+                return False
+            self._persist_soon()
+            logger.debug("AutoNudge: loop %s quiet tick (%s)", loop.id, verdict.body)
+            return True
+
+        # WAKE, and FALLBACK, both spend a turn. FALLBACK is counted separately
+        # from a wake so the metering cannot flatter itself: a gate that never
+        # works would otherwise read as a busy, well-used watch.
+        monitor.quiet_streak = 0
+        if verdict.outcome is irq.Outcome.WAKE:
+            # NOT charged here. A wake is a DELIVERED turn, and this tick has not
+            # delivered one yet -- the fire that follows can still be refused (a
+            # busy slot, a callback error, a loop deactivated mid-flight). Charging
+            # now would report a turn that never ran and would hand out the
+            # follow-up allowance for it, so the next tick would skip its
+            # observation to protect work that was never started. The charge is
+            # claimed at the one point delivery is confirmed, in
+            # :meth:`_run_fire_cycle`. A process that dies in between charges
+            # nothing, which is the right direction: never invent a turn.
+            self._pending_monitor_wake.add(loop.id)
+        else:
+            # A fallback is an OBSERVATION outcome, not a delivery, so it is
+            # counted here where it happened.
+            monitor.gate_fallbacks += 1
+        monitor.last_observed_at = time.time()
+        self._persist_soon()
+        return False
+
     async def _timer(self, loop: NudgeLoop, delay: float | None = None) -> None:
         try:
             await asyncio.sleep(loop.idle_secs if delay is None else delay)
         except asyncio.CancelledError:
             return
         if shutdown_event.is_set():
-            return
-        if loop.monitor is not None:
-            # A timer can predate monitor attachment or a process upgrade. It
-            # must never dispatch a structured record through legacy prompt
-            # delivery, even if it was already sleeping when state changed.
-            if loop.active:
-                await self.update(loop.id, active=False)
             return
         # Kill switch: sentinel file present?
         if loop.stop_sentinel_path and Path(loop.stop_sentinel_path).exists():
@@ -1867,7 +2262,45 @@ class AutoNudgeService:
         # Fire. Update state only if the callback reports actual delivery —
         # otherwise skipped nudges (e.g. slot mid-turn) inflate cycle_count and
         # prematurely trip max_cycles. Missing callback → nothing to deliver.
-        if self._on_fire is None or loop.monitor is not None:
+        if self._on_fire is None:
+            return
+        # Probe gate. For a monitor loop, decide whether this tick is worth a
+        # turn BEFORE spending one: a quiet tick returns here having cost one
+        # bounded subprocess and no model call at all, which is the entire
+        # saving this path exists for. A loop with no monitor -- and a monitor
+        # whose subject has no probe, or whose probe failed -- falls straight
+        # through to the unchanged legacy fire, so the absence of a gate can
+        # never be the reason a loop goes silent.
+        #
+        # This moves what ``max_cycles`` bounds. ``cycle_count`` only advances on
+        # a DELIVERED fire, so for a gated loop the cap now counts wakes rather
+        # than ticks: a watch can sit on a pull request for days inside a small
+        # cap. That is the intended reading of the number, and monitor_start's
+        # own description says so at the arming surface.
+        if await self._monitor_tick_is_quiet(loop):
+            # A quiet tick MUST re-arm itself. Nothing else will: the delivered
+            # paths re-arm through notify_turn_complete (dashboard slots) or
+            # through the fire cycle's own exit (channel keys), and a quiet tick
+            # reaches neither. Returning here without arming would make the FIRST
+            # quiet observation the last one the watch ever makes -- the exact
+            # silent failure this gate is otherwise built to avoid, and invisible
+            # from outside because a dead watch and a calm one look identical.
+            #
+            # Self-re-arm from inside the running timer is the supported pattern
+            # (see _cancel_timer, which refuses to cancel the current task), and
+            # is what the delivered path's own `finally` already does.
+            #
+            # ONLY while the loop is still live, though. "Do not spend a turn" and
+            # "keep watching" are different answers, and the terminal verdict
+            # returns the first while having just deactivated the loop: re-arming
+            # on that would poll a merged pull request forever and re-emit its
+            # expiry notification on every tick. Registration is checked too, so
+            # a loop removed during the observation is not resurrected by its own
+            # in-flight tick.
+            if loop.active and loop.id in self._loops:
+                loop.next_due_ts = time.time() + loop.idle_secs
+                self._persist_soon()
+                self._arm_from_deadline(loop)
             return
         self._firing.add(loop.id)
         try:
@@ -1891,7 +2324,7 @@ class AutoNudgeService:
         Runs entirely inside the caller's ``_firing`` window so a concurrent
         ``update()`` never cancels this task between delivery and persistence.
         """
-        if self._on_fire is None or loop.monitor is not None:
+        if self._on_fire is None:
             return
         # Mark the fire window so a concurrent update() defers its re-arm
         # instead of cancelling this task mid-turn (see update()). The window
@@ -1916,6 +2349,20 @@ class AutoNudgeService:
                     loop.id,
                     self._rearm_fail_count.get(loop.id, 0) + 1,
                 )
+        claimed_wake = loop.id in self._pending_monitor_wake
+        self._pending_monitor_wake.discard(loop.id)
+        if claimed_wake and delivered and loop.monitor is not None:
+            # The turn happened, so it is a wake, and only now does the agent own
+            # work the probe cannot see -- which is what the follow-up allowance
+            # protects. A refused fire falls through here uncharged.
+            #
+            # No persist call of its own: the delivered path below reaches
+            # ``await self._persist_locked()`` with no await in between, so these
+            # counters are already in the state that write serialises -- and that
+            # write is the stronger one, since it holds the lock and cannot be
+            # clobbered by a concurrent update()'s snapshot.
+            loop.monitor.wakes += 1
+            loop.monitor.followup_ticks = _WAKE_FOLLOWUP_TICKS
         if not delivered:
             # If the fire path already removed the loop (e.g. slot missing →
             # remove()), do NOT resurrect it with a fresh timer — that would

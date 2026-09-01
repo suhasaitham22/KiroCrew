@@ -983,3 +983,109 @@ def run(
         f"coalescing window open {int(oldest)}s/{int(coalesce_secs)}s, "
         f"{len(window)} anomaly(ies) coalescing, {tick.pending} pending"
     )
+
+
+# --------------------------------------------------------------- driver front door
+
+
+class Outcome(Enum):
+    """What one tick tells a non-cron driver to do."""
+
+    #: Nothing to service. The driver must not spend a model turn.
+    QUIET = "quiet"
+    #: Service this now; :attr:`Verdict.body` is the wake text.
+    WAKE = "wake"
+    #: The subject is finished. Stop watching it.
+    TERMINAL = "terminal"
+    #: The kernel could not reach a verdict. The driver keeps whatever
+    #: schedule it already had, so behaviour is unchanged rather than silent.
+    FALLBACK = "fallback"
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """One tick's instruction to a driver, as a value rather than an exception."""
+
+    outcome: Outcome
+    #: Delivered text for WAKE and TERMINAL; a log-only reason otherwise.
+    body: str = ""
+
+
+@dataclass(frozen=True)
+class _DriverJob:
+    id: str
+
+
+@dataclass(frozen=True)
+class _DriverCtx:
+    """The whole context the kernel needs, for a driver that has no cron job.
+
+    The kernel reads exactly two things off a ctx -- ``job.id`` for the state
+    identity and (through the probe) ``message`` for configuration -- both via
+    ``getattr`` with a default, and :func:`run` types its parameter as a bare
+    ``object``. So the kernel was never cron-specific; this makes that a named,
+    tested entry point instead of a property a caller has to rediscover.
+    """
+
+    job: _DriverJob
+    message: str
+
+
+def poll(
+    identity: str,
+    message: str,
+    probe: Probe,
+) -> Verdict:
+    """Run ONE tick and return its verdict instead of raising it.
+
+    This is the entry point for a driver that is not a script cron -- an
+    in-process scheduler that owns its own wake mechanism and only needs the
+    kernel's *decision*. :func:`run` stays exactly as it is: its raise-based
+    contract is what the cron runner consumes, and rewriting it would churn the
+    one shipped probe for no gain.
+
+    ``identity`` replaces the cron job id in the state digest, so two drivers
+    watching one subject keep independent dedupe memories. Pass something stable
+    for the life of the watch (a loop id), never something regenerated per tick
+    -- a fresh identity is a fresh memory, which re-wakes on signals already
+    serviced.
+
+    ``message`` is the probe's configuration, in the same shape the probe already
+    parses off a cron message, so a probe needs no change to be driven here.
+
+    The kernel's bounds are deliberately NOT forwarded from here. A probe already
+    declares what it needs through :meth:`Probe.tuning`, no caller of this
+    function passes a bound, and a passthrough with no producer is a contract
+    nobody exercises -- the second driver would then build on a shape that was
+    never tested. Add the parameter when a driver needs it.
+
+    **Failure direction is deliberate.** Anything unexpected -- a probe bug, a
+    kernel contract break -- resolves to :attr:`Outcome.FALLBACK`, which tells
+    the driver to keep the schedule it already had. The alternative default,
+    QUIET, would convert a bug into silence: the driver would stop waking and
+    the work it was watching would stall with nothing to show why. A redundant
+    cycle costs tokens; a lost wake costs the task.
+    """
+    ctx = _DriverCtx(job=_DriverJob(id=str(identity or "")), message=str(message or ""))
+    try:
+        run(ctx, probe)  # type: ignore[arg-type]
+    except Skip as exc:
+        return Verdict(Outcome.QUIET, str(exc))
+    except Report as exc:
+        return Verdict(Outcome.WAKE, str(exc))
+    except Done as exc:
+        return Verdict(Outcome.TERMINAL, str(exc))
+    except Exception:
+        # A probe is documented as not raising for an expected failure (it
+        # returns Tick(fetch_ok=False) and lets the kernel own the backstop), so
+        # arriving here means a defect. Log it once per tick and degrade.
+        logger.warning(
+            "irq: poll(%s) raised; falling back to the driver's own schedule",
+            identity,
+            exc_info=True,
+        )
+        return Verdict(Outcome.FALLBACK, "probe raised")
+    # run() raises on every path; a plain return is a contract break, not a
+    # quiet tick. Degrade the same way rather than inventing a decision.
+    logger.warning("irq: poll(%s) returned without a verdict", identity)
+    return Verdict(Outcome.FALLBACK, "no verdict")

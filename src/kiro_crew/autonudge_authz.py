@@ -218,6 +218,7 @@ async def authorize_and_add_nudge(
     max_runtime_secs: int = 0,
     source: str,
     caller: str = "",
+    gate: bool = True,
 ) -> tuple[Any | None, str | None, int]:
     """Validate + authorize + arm a nudge loop; return ``(loop, error, status)``.
 
@@ -454,6 +455,7 @@ async def authorize_and_add_nudge(
             stop_sentinel_path=stop_sentinel_path,
             max_runtime_secs=int(max_runtime_secs),
             admission_check=admission_check,
+            gate=gate,
         )
     except NudgeAdmissionRefused:
         return _deny("session changed before nudge arm committed", 409)

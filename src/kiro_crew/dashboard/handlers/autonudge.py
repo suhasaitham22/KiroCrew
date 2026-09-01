@@ -100,7 +100,8 @@ async def api_autonudge_get(request: web.Request) -> web.Response:
 async def api_autonudge_start(request: web.Request) -> web.Response:
     """POST /api/autonudge — start or replace a loop on a slot.
 
-    Body: { slot_key, message, idle_secs?, max_cycles?, max_runtime_secs?, stop_sentinel_path? }
+    Body: { slot_key, message, idle_secs?, max_cycles?, max_runtime_secs?,
+            stop_sentinel_path?, gate? }
     """
     svc = _autonudge_get()
     if svc is None:
@@ -139,6 +140,17 @@ async def api_autonudge_start(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "idle_secs, max_cycles and max_runtime_secs must be integers"}, status=400
         )
+    # The gating opt-out has to exist HERE too, not only on the MCP tool: this is
+    # the route the dashboard arms a loop through, and an escape that only one of
+    # the arming surfaces offers is not an escape. Absent means gated, matching
+    # the tool's default; a non-boolean is refused rather than coerced, because
+    # `"false"` is truthy and would silently gate a loop that asked not to be.
+    raw_gate = body.get("gate")
+    if raw_gate is not None and not isinstance(raw_gate, bool):
+        return web.json_response(
+            {"error": "gate must be a boolean", "code": "not_a_boolean"}, status=400
+        )
+    gate = True if raw_gate is None else raw_gate
     loop, error, status = await authorize_and_add_nudge(
         svc=svc,
         state=state,
@@ -150,6 +162,7 @@ async def api_autonudge_start(request: web.Request) -> web.Response:
         max_runtime_secs=max_runtime_secs,
         source="dashboard",
         caller=request.remote or "",
+        gate=gate,
     )
     if error is not None:
         return web.json_response({"error": error, "code": "autonudge_not_armed"}, status=status)
