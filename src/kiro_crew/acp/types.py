@@ -17,6 +17,7 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_KNOWN,
+    ACP_BACKENDS_SESSION_MCP_ARRAY,
     selectable_backends,
 )
 
@@ -225,12 +226,15 @@ KAS_CLIENT_CAPABILITIES: dict = {
 # Values written into a per-session settings.local.json
 # ``permissions.defaultMode`` for the ``ACP_BACKEND_CLAUDE`` backend.
 # ``default`` = per-tool approval; ``auto`` = the SDK auto-accept mode
-# (Auto-mode / permission-UI parity). Nothing in the base client writes that file
-# today — it is an edition override — so these are defined here to give the
-# client's ``permission_mode`` kwarg and any writer one canonical vocabulary
-# rather than duplicating string literals.
+# (Auto-mode / permission-UI parity). ``AcpClient._write_claude_local_settings``
+# is the writer; these exist so it and the client's ``permission_mode`` kwarg
+# share one vocabulary rather than duplicating string literals.
 CC_PERMISSION_MODE_DEFAULT = "default"
 CC_PERMISSION_MODE_AUTO = "auto"
+# NOT a mode Crew ever selects. Named because it is the one value the adapter
+# treats as "never call the host back at all", so the settings writer has to
+# recognize it in a file it inherited and refuse to run a session under it.
+CC_PERMISSION_MODE_BYPASS = "bypassPermissions"
 
 # ── ACP Session Update Types ──
 

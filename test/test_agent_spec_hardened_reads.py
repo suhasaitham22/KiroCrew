@@ -770,6 +770,7 @@ class TestDenialAttribution:
 # Forwarding helpers are pinned as forwarding rather than forced to use a fixed
 # literal that would erase the caller's attribution.
 _EXPECTED_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
+    "kiro_crew/acp/session_mcp.py": [("session_mcp_servers", "unknown")],
     "kiro_crew/agent.py": [
         ("agent_spec_lookup", "unknown"),
         ("migrate_agent_specs", "unknown"),

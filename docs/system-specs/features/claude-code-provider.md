@@ -124,41 +124,142 @@ the untrusted copy being read at all. Whether `claude-agent-acp` forwards either
 ACP is not answered in this repository, and is the prerequisite for Crew gating
 *every* Claude tool call rather than every call Claude asks about.
 
-### Known gap: a Claude session has no Crew MCP tools
+### MCP tools on a Claude session
 
-`AcpClient._claude_session_mcp_servers()` is an overridable seam that **defaults
-to returning `[]`**, and the `claude-agent-acp` adapter does not read
-`kirocrew.mcp.json` on its own. On a build that does not override that method — the
-public core does not — a Claude session starts with **zero MCP tools**. The
-harness itself works: prompts, streaming, model and effort selection, and the
-full `session/request_permission` flow. What is absent is Crew's own tooling,
-`kirocrew-core`, cron, and every user-configured MCP server.
+The `claude-agent-acp` adapter reads **no** agent file: the `mcpServers` array on
+`session/new` / `session/load` is the entire MCP surface a Claude session has, and
+an empty one means zero Crew tools — `kirocrew-core`, cron and every
+user-configured server absent, while the harness itself (prompts, streaming, model
+and effort selection, the full `session/request_permission` flow) works. So
+`_session_mcp_servers()` fills it, from `acp/session_mcp.py`:
 
-The default is byte-identical for kiro-cli, which receives its servers via
-`--agent` and is unaffected. Both call sites carry the gap —
+- **The materialized kiro agent spec is the source.** `~/.kiro/agents/<name>.json`
+  is already the merge point for the dashboard's Kiro Crew scope
+  (`~/.kiro/crew/mcp.json`) and kiro's global `mcp.json`, so a user-installed
+  server needs nothing CC-specific. There is no second, CC-shaped registry to keep
+  in sync, and the spec is read **per spawn** — installing or toggling a server
+  takes effect on the next session, with no gateway restart. The read goes through
+  `agent_discovery._read_agent_spec`, the repo's one hardened reader, labelled
+  `operation="session_mcp_servers"`: the agents directory is user-writable and
+  shared with other tools, so a symlink whose resolved target is sensitive is
+  refused and audited, and an oversized file is refused at the size cap rather
+  than being read into memory mid-spawn.
+- **`tools` references decide what mounts.** kiro-cli mounts a server only when
+  `tools` names it (`@server` or `@server/tool`); the CC array has no such
+  indirection, so the reference is applied during translation. Without that, an
+  entry deliberately left unreferenced — the shape every `opt_in` grant uses, and
+  what a hand-narrowed spec looks like — would come alive the moment a session ran
+  on CC.
+- **kiro-cli's registry filter is mirrored, and it is SYMMETRIC.** In registry
+  mode kiro-cli resolves the entries carrying `type: "registry"` against the
+  admin's catalog and silently drops every entry that does not; outside registry
+  mode the marked entries are the dropped ones. The translation applies the same
+  rule in both directions — mirroring only one half would invert the
+  administrator's policy on this backend, withholding exactly the catalogued
+  servers while launching the local ones kiro-cli refuses. `command`/`args` are
+  retained on a marked entry precisely so a non-registry consumer can still run
+  it, which is what makes the governed half translatable at all; the residual
+  difference is that a catalog *override* of the command cannot be applied here,
+  since only kiro-cli talks to the catalog.
+- **A server the MCP gateway brokers yields to its stub.** The pooled broker
+  emits a stub under the SAME name as the agent-spec entry it rewrites, and the
+  caller appends those stubs to this array. Emitting both would put two elements
+  with one `name` in a single array: either the raw entry shadows the stub and
+  the session bypasses the broker, or both register and every pooled backend runs
+  twice (#927). The client resolves `injection_server_names` for its overlay and
+  passes the set down; an unreadable overlay degrades to "no stubs", never to a
+  session with no servers.
+- **Crew's control plane is re-derived, not copied.** `kirocrew-core` and
+  `kirocrew-cron` come from `agent.managed_mcp_spec_entry`, so a stale hand-edited
+  command in the spec cannot cost a session the tools it needs to report back at
+  all. A missing or malformed spec degrades to the control plane alone; nothing in
+  the path raises, because a bad element fails the whole `session/new`.
+- **`autoApprove` is not translated.** Its nearest CC equivalent is a
+  `permissions.allow` entry, and a pre-approved tool is one Claude never asks
+  about — so the call would never reach the host gate that carries the deny floor,
+  the sensitive-path check and the governance ceiling. Every MCP call on this
+  backend stays gated. `timeout` is kiro-only and dropped.
+- **`disabledTools` becomes a `permissions.deny` rule.** It cannot ride along in
+  an array element either, but it is a RESTRICTION: dropping it while forwarding
+  the server it narrows would silently widen the session's tool surface, which is
+  what the dashboard writes that key to prevent. `session_mcp_deny_rules` turns
+  each entry into `mcp__<server>__<tool>` and the settings writer merges those
+  into `permissions.deny`, which CC evaluates ahead of every allow rule and of the
+  host callback. One asymmetry remains open: a `@server/tool` reference grants ONE
+  tool on kiro-cli while the array mounts the whole server here, and the set to
+  deny is not knowable without connecting to the server — those extra tools still
+  reach the host permission gate, so the surface is wider, not ungated.
+
+Both call sites are fed from the one function —
 `_new_session_following_substitution` (`session/new`) and the `session/load`
-branch — so closing it for the public build means translating
-`kirocrew.mcp.json` into that array in one place.
+branch — and the array is ordered by server name so the two are comparable. The
+kiro-cli path is unchanged: it receives the same servers via `--agent`, and a
+duplicate array here would shadow the spec's own entries, so that backend passes
+none.
 
-### Companion-owned glue stays out of the core
+### Session-scoped Claude settings
 
-The public client accepts edition-supplied Claude settings behavior without
-owning it, hooked through `getattr` so the core is byte-identical when the hook
-is absent:
+`_write_claude_local_settings` writes `<work_dir>/.claude/settings.local.json`
+before the primary spawn (not only on the model-substitution retry) with four
+things: `permissions.defaultMode` when the session asked for one, the
+`permissions.deny` rules derived from the spec's `disabledTools`,
+`availableModels` from the registry, and `model` when the session pinned one. The
+allowlist is not cosmetic — without it the adapter can collapse a versioned `[1m]`
+id back to the 200K window.
 
-- `_spawn` calls an optional `_write_claude_local_settings` on the **primary**
-  spawn path, not only on the model-substitution retry — a session that skips it
-  collapses to the 200K context default.
-- `_spawn` merges `extra_env` into the child environment, which is how a
-  caller-supplied `CLAUDE_CONFIG_DIR` reaches the adapter
-  (`test_spawn_forwards_claude_config_dir_from_extra_env`).
-- `AcpClient._reset_state` removes `<work_dir>/.claude/settings.local.json` for a
-  Claude client. This is load-bearing because no caller retries teardown, so a
-  session-scoped elevated permission setting must not outlive its client.
+An **inherited `bypassPermissions`** is stripped for the session's duration unless
+Crew itself asked for that mode. It is the one value the adapter treats as "never
+call the host back", so leaving it in place would take every tool call out of the
+deny floor, the sensitive-path check and the governance ceiling. The base code
+swept this whole file on every reset for exactly that reason; preserving the user's
+file instead must not also preserve that value. The original bytes come back on
+reset, so nothing the user wrote is edited — only the window Crew drives is
+protected.
 
-Standing rule, unchanged by Claude Code becoming selectable: `agent.provider`
-stays single-valued and **no provider selector is re-added**. The harness switch
-is `agent.acp_backend`, and it is gated in exactly one place
+The work dir is frequently a project the user also drives with CC by hand, so the
+writer **snapshots** any pre-existing file (bytes and mode) and merges Crew's keys
+over the user's JSON rather than replacing it. `AcpClient._reset_state` restores
+that snapshot byte-for-byte, or removes the file when Crew created it, and leaves a
+file Crew never seeded alone. This is load-bearing in both directions: no caller
+retries teardown, so a session-scoped elevated permission setting must not outlive
+its client — and a user's own project settings must not be deleted by a session
+that merely borrowed the directory.
+
+The snapshot is held **per path in a process-level registry**, not per client:
+`work_dir` is caller-supplied and every keyless client shares one default, so
+several Claude sessions routinely seed one file. The first claimant captures the
+user's original and later ones are handed that same copy; only the last session out
+restores it (or unlinks a file Crew created), and earlier resets stand aside so
+they cannot delete a file that is still configuring a live adapter. A file whose
+contents no longer match what Crew last wrote is left alone — a user or another
+tool has edited it since.
+
+`_spawn` also merges `extra_env` into the child environment, which is how a
+caller-supplied `CLAUDE_CONFIG_DIR` reaches the adapter
+(`test_spawn_forwards_claude_config_dir_from_extra_env`). The public core does not
+set that variable itself: an isolated CC config root (seeding a Crew-owned
+directory from the user's `~/.claude`, keeping credentials and models while
+stripping inherited `permissions` that would pre-approve past Crew's gate) is
+**not implemented here** — see the known gap below.
+
+### Known gap: the user's global `~/.claude` is inherited
+
+With no `CLAUDE_CONFIG_DIR` set by the core, the adapter and the SDK read the
+user's real `~/.claude`. Project-scope `settings.local.json` outranks it for
+`defaultMode`, but `permissions.allow` entries **merge** rather than being
+overridden — so a user whose global settings pre-approve a tool family gets those
+calls auto-approved by Claude's own engine, which never calls `canUseTool` and so
+never reaches Crew's gate. This is the same hazard the "no gate on pre-approved
+calls" section above describes, arriving through inherited config instead of
+through the project file. Closing it means an isolated config root, which is a
+separate change: it has to carry credentials across (or CC cannot authenticate at
+all) while dropping exactly the `permissions` keys that bypass the gate.
+
+### Standing rule
+
+Unchanged by Claude Code becoming selectable: `agent.provider` stays
+single-valued and **no provider selector is re-added**. The harness switch is
+`agent.acp_backend`, and it is gated in exactly one place
 (`resolve_selected_backend`).
 
 ## Model registry
