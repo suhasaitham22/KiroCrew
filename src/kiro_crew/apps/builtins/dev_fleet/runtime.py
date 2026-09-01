@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from kiro_crew import platform_compat
-from kiro_crew.apps.builtins.dev_fleet import npm_preflight
+from kiro_crew.apps.builtins.dev_fleet import frontend_skip, npm_preflight
 from kiro_crew.env import find_node_tool, node_bin_dirs
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.loop_lock import LoopBoundLock
@@ -637,6 +637,26 @@ try:
 except OSError:  # pragma: no cover - frozen/zipimported install
     _PREFLIGHT_SOURCE = None
 
+#: The frontend-skip decision's source, captured ONCE at import for the SAME
+#: reason and by the SAME mechanism as ``_PREFLIGHT_SOURCE`` above.
+#:
+#: :mod:`frontend_skip` decides at RUNTIME, inside the generated sync runner,
+#: whether a backend-only Pull+Build may skip both frontend steps. The decision needs the
+#: fetched base ref on disk, which does not exist until the sync's own fetch step
+#: has run, so it cannot be made when the step list is assembled -- it is made in
+#: the runner. The runner is stdlib-only and must not import ``kiro_crew``, so
+#: this helper (which imports only the stdlib) is executed BY PATH from a
+#: pre-merge snapshot, exactly like the preflight and dep_sync snapshots.
+#:
+#: ``None`` when the source cannot be read (frozen/zipimported install). Unlike
+#: the preflight, this does NOT refuse the sync: the skip is a pure optimization,
+#: so a missing snapshot means the runner simply never skips (it runs npm ci and
+#: the build as it does today) -- the conservative, always-correct fallback.
+try:
+    _FRONTEND_SKIP_SOURCE: bytes | None = Path(frontend_skip.__file__).read_bytes()
+except OSError:  # pragma: no cover - frozen/zipimported install
+    _FRONTEND_SKIP_SOURCE = None
+
 #: Label of the ONE sync step whose binary is ours, so its exit code can be
 #: trusted to mean what :mod:`npm_preflight` says it means. Every other step runs
 #: worktree-controlled code and can exit any number it likes, so a reserved code
@@ -649,6 +669,24 @@ except OSError:  # pragma: no cover - frozen/zipimported install
 #: dependencies" reads as work. The runner's trust gate compares against this
 #: constant, so the display name and the gate cannot drift apart.
 _PREFLIGHT_LABEL = "Verify dependencies"
+
+#: The two frontend step labels, named once so the assembly, the skip marker and
+#: the runner all agree. ``npm ci`` deletes and reinstalls website/node_modules;
+#: ``npm build + stage`` runs the vite build and re-stages the dist. On a
+#: backend-only sync both reproduce what is already on disk, so both are the
+#: candidates the runtime skip elides -- TOGETHER, never one alone.
+_NPM_CI_LABEL = "npm ci"
+_BUILD_STAGE_LABEL = "npm build + stage"
+
+#: The step-dict key the runner consults to decide, at runtime, whether a step
+#: may be skipped on a backend-only sync. Mirrors how ``stash`` is attached to a
+#: step dict and read inside the generated runner loop. Its VALUE carries the
+#: evidence the runtime check needs -- the helper snapshot, the git binary, the
+#: repo, the PRE-MERGE base OID and ``sync_base_ref`` -- and its presence is also
+#: the signal that the runner has a skip decision to make for this step (a step
+#: without the key is never a skip candidate -- e.g. every step on an edition
+#: checkout, where the frontend steps are not even in the list).
+_SKIP_MARKER = "skip_if_frontend_unchanged"
 
 
 def _parse_step_marker(text: str) -> tuple[int | None, str | None]:
@@ -1064,10 +1102,13 @@ __all__ = (
     "PodConfig",
     "_ACTIVE_RUNS",
     "_BUILD_PATH_CACHE",
+    "_BUILD_STAGE_LABEL",
+    "_FRONTEND_SKIP_SOURCE",
     "_GIT_ENV_NEUTRALIZERS",
     "_GIT_ERR_MAX",
     "_GIT_TRUSTED_HELPERS",
     "_KEYCHAIN_HELPER_NAMES",
+    "_NPM_CI_LABEL",
     "_POD_AVAILABLE",
     "_POD_ERROR",
     "_POD_IMPORTED",
@@ -1082,6 +1123,7 @@ __all__ = (
     "_SANDBOX_ERR_MAX",
     "_SHUTDOWN_ADMISSION_LOCK",
     "_SHUTDOWN_IN_PROGRESS",
+    "_SKIP_MARKER",
     "_SYNC_LOCK",
     "_SYNC_RUN_LABEL",
     "_TRUSTED_BIN_CACHE",

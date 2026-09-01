@@ -760,6 +760,25 @@ BENIGN_SPAWNS: frozenset[str] = frozenset(
         "apps/builtins/dev_fleet/npm_preflight.py::_extract",
         "apps/builtins/dev_fleet/npm_preflight.py::_install_already_proven",
         "apps/builtins/dev_fleet/npm_preflight.py::probe",
+        # frontend_skip decides whether a backend-only sync may skip the two
+        # frontend steps, and it is the same shape as npm_preflight above: a
+        # stdlib-only module snapshotted by path and executed INSIDE the sync
+        # runner, which runtime.py::worker already wrapped through
+        # sandboxed_spawn_argv before handing it over. Routing these again would
+        # nest one sandbox inside itself; the chokepoint is applied at the call
+        # site.
+        #
+        # Neither spawn is agent-influenced, and both only READ. _git_show runs
+        # `<git> -C <repo> show <ref>:website/package-lock.json` and
+        # website_diff_is_empty runs `<git> -C <repo> diff --name-only <base>
+        # <ref> -- website`: the binary comes from _trusted_bin (never PATH), the
+        # repo from the operator-configured checkout, the base OID from the
+        # gateway's own `git rev-parse HEAD`, the ref from the sync's pinned
+        # refs/kirocrew/sync-base-<pid>, and the pathspec and filename from
+        # module-level constants. A filesystem-scoped wrapper would also break
+        # them for nothing: their whole output is on stdout.
+        "apps/builtins/dev_fleet/frontend_skip.py::_git_show",
+        "apps/builtins/dev_fleet/frontend_skip.py::website_diff_is_empty",
         # Foreground last-resort restart (Make Live on hosts with no drivable
         # service manager): a detached `kirocrew restart --port <marker port>`,
         # fixed argv whose binary is validated (basenamed kirocrew, absolute,

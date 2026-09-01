@@ -62,6 +62,31 @@ def _venv_maps_to_the_synced_checkout():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _sync_snapshots_land_under_the_test_tmpdir(tmp_path, monkeypatch):
+    """Root the sync's by-path snapshots in this test's own temp directory.
+
+    ``_sync_start_locked`` stages its stdlib-only helpers (the preflight probe and
+    the frontend-skip decision) with ``tempfile.mkdtemp`` and registers every one
+    for removal in the run's ``finally``. Every sync test here stubs
+    ``_start_run``, so that ``finally`` never executes and each staged directory
+    outlives the test — a leak no tidier product code can close, because the run
+    that would have destroyed them never starts. Re-rooting the temp base is what
+    keeps the suite off the host: a test destroys what it creates, in its own scope.
+
+    Re-rooting the BASE rather than replacing ``tempfile.mkdtemp`` is the whole
+    point. Sibling tests here monkeypatch ``mkdtemp`` itself to drive a staging
+    failure, and a fixture holding its own patch on that same attribute is
+    restored in an order nobody controls: ``monkeypatch`` undo re-installs the
+    value it captured — the fixture's replacement — after the fixture has already
+    put the real function back, leaving a closure over a deleted directory
+    installed for the rest of the worker. ``tempfile.tempdir`` has no other writer
+    at this scope, so it cannot invert that way, and an explicit ``dir=`` still
+    wins for the tests that pass one.
+    """
+    monkeypatch.setattr(worktree_ops_mod.tempfile, "tempdir", str(tmp_path))
+
+
 # --- worktree porcelain parsing ---
 def test_parse_worktree_porcelain_basic():
     from kiro_crew.apps.builtins.dev_fleet.server import _parse_worktree_porcelain
@@ -947,7 +972,8 @@ async def test_sync_script_emits_step_markers():
     cmd_args = mock_start.call_args[0]
     script_cmd = cmd_args[1]
     assert script_cmd[0].endswith("python") or "python" in script_cmd[0]
-    script_src = script_cmd[2]
+    # The script is the LAST element: interpreter flags (`-I`) precede `-c`.
+    script_src = script_cmd[-1]
     assert "::step::" in script_src
     assert "print(f" in script_src
     repository_mod._UPSTREAM_REMOTE = None
@@ -999,6 +1025,12 @@ _SYNC_REPO = "/fake/main-checkout"
 #: other way, and asserting on it is how a leaked snapshot gets caught.
 _LAST_CLEANUP_PATHS: list[str] = []
 
+#: The full runner ARGV from the last ``_run_sync``, not just its script. The
+#: interpreter flags carry an invariant of their own (``-I``, which keeps the
+#: merged checkout off the runner's import path), and ``_run_sync``'s return value
+#: deliberately exposes only the script.
+_LAST_SYNC_CMD: list[str] = []
+
 
 async def _run_sync(mod, locked):
     """Drive _sync_start_locked with the probe stubbed; return its result dict
@@ -1025,7 +1057,13 @@ async def _run_sync(mod, locked):
         async with mod._SYNC_LOCK:
             result = await mod._sync_start_locked()
     repository_mod._UPSTREAM_REMOTE = None
-    script = mock_start.call_args[0][1][2] if mock_start.call_args else None
+    # The script is the LAST argv element, not a fixed index: the runner argv
+    # carries interpreter flags before `-c` (`-I`, which keeps the merged checkout
+    # off the runner's sys.path), and a positional index silently hands every test
+    # here a flag string instead of the script when one is added.
+    script = mock_start.call_args[0][1][-1] if mock_start.call_args else None
+    global _LAST_SYNC_CMD
+    _LAST_SYNC_CMD = list(mock_start.call_args[0][1]) if mock_start.call_args else []
     # Stubbing _start_run also stubs out its `finally` cleanup, so anything the
     # sync staged for removal (the dependency-only path snapshots dep_sync into a
     # temp dir) would outlive the test. Remove exactly what it registered, in the
@@ -1190,6 +1228,289 @@ async def test_sync_runner_pins_utf8_stdout_before_its_first_print():
 
     assert "reconfigure(encoding='utf-8'" in script
     assert script.index("reconfigure(") < script.index("print(f'::step::")
+
+
+@pytest.mark.asyncio
+async def test_sync_runner_runs_isolated_so_the_merged_tree_is_off_its_import_path():
+    """The runner interpreter carries `-I`, and that is a security boundary.
+
+    `python -c` puts the inherited cwd at sys.path[0], AHEAD of the stdlib, and the
+    cwd a module-style app backend hands down is the gateway's own source root —
+    which on the editable install Dev Fleet manages IS the tree being synced. The
+    runner performs an import AFTER its merge step (the by-path load of the
+    frontend-skip snapshot, whose own `import hashlib` resolves through sys.path
+    like any other), and the runner process is NOT sandbox-wrapped: only the step
+    argvs go through sandboxed_spawn_argv. Without `-I`, `src/hashlib.py` in the
+    incoming revision runs arbitrary code there, outside the per-step sandbox.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    _, script = await _run_sync(mod, [])
+
+    assert script is not None
+    cmd = _LAST_SYNC_CMD
+    assert cmd[0] == sys.executable, cmd
+    # The flags between the interpreter and `-c`, which is the last thing before
+    # the script itself.
+    assert cmd[-2] == "-c", cmd
+    assert "-I" in cmd[1:-2], cmd
+
+
+@pytest.mark.asyncio
+async def test_runner_isolation_keeps_a_poisoned_cwd_out_of_a_by_path_load(tmp_path):
+    """Prove the mechanism with the runner's OWN flags, not their presence in a list.
+
+    Runs the flags the sync actually passes against the shape the runner uses — a
+    module loaded by path whose top-level `import hashlib` resolves through
+    sys.path — from a working directory carrying a `hashlib.py` that writes a file
+    when executed. The stdlib must win and the payload must not run.
+    """
+    import subprocess
+
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    await _run_sync(mod, [])
+    flags = _LAST_SYNC_CMD[1:-2]
+
+    poisoned = tmp_path / "checkout-src"
+    poisoned.mkdir()
+    (poisoned / "hashlib.py").write_text(
+        "import pathlib\n"
+        "pathlib.Path(__file__).with_name('PAYLOAD-RAN').write_text('x')\n"
+        "def sha256(_b):\n"
+        "    raise AssertionError('shadowed hashlib was used')\n",
+        encoding="utf-8",
+    )
+    # The by-path snapshot: what `exec_module` runs, and the only import the runner
+    # performs after untrusted content has landed.
+    snapshot = tmp_path / "snap" / "helper.py"
+    snapshot.parent.mkdir()
+    snapshot.write_text("import hashlib\nWHERE = hashlib.__file__\n", encoding="utf-8")
+
+    body = (
+        "import importlib.util as u\n"
+        f"spec = u.spec_from_file_location('helper', {json.dumps(str(snapshot))})\n"
+        "m = u.module_from_spec(spec)\n"
+        "spec.loader.exec_module(m)\n"
+        "print(m.WHERE)\n"
+    )
+    # cwd under tmp_path, never the repo root a child would otherwise inherit from
+    # pytest: the payload writes beside itself, and this is where it must not land.
+    proc = subprocess.run(
+        [sys.executable, *flags, "-c", body],
+        cwd=str(poisoned),
+        capture_output=True,
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stderr.decode(errors="replace")
+    assert not (poisoned / "PAYLOAD-RAN").exists(), "checkout code ran in the runner"
+    assert str(poisoned) not in proc.stdout.decode(errors="replace")
+
+
+# --- backend-only sync: skip the frontend half at runtime ---
+# The two largest frontend costs (the npm ci reinstall and the vite build+stage)
+# are elided on a website/-unchanged sync, and the skip has to be decided at
+# RUNTIME: the diff evidence needs the fetched ref on disk, which does not exist
+# when the step list is assembled. These pin that the two steps are still
+# ASSEMBLED, that the runner carries the runtime skip gated on sync_base_ref and
+# the PRE-MERGE base, that the two are COUPLED, that a staging failure degrades
+# instead of aborting, and that the edition path is untouched.
+
+
+@pytest.mark.asyncio
+async def test_sync_still_assembles_both_frontend_steps_on_a_stock_checkout(monkeypatch):
+    """The skip is a RUNTIME decision, not an assembly-time omission.
+
+    Both frontend steps must still be in the step list on a stock checkout, in
+    their existing order, so the credential-tier and stash invariants that key
+    off them are unchanged; the runner is what decides at runtime whether to run
+    or skip them.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    monkeypatch.setattr(worktree_ops_mod.frontend, "edition_configured", lambda: False)
+
+    _, script = await _run_sync(mod, [])
+
+    labels = _steps_from_script(script)
+    assert "npm ci" in labels
+    assert "npm build + stage" in labels
+    # Order preserved: ci before build+stage, both after the merge.
+    assert labels.index("npm ci") < labels.index("npm build + stage")
+    assert labels.index("Merge") < labels.index("npm ci")
+
+
+@pytest.mark.asyncio
+async def test_sync_runner_carries_the_runtime_frontend_skip_gated_on_the_base_ref(monkeypatch):
+    """The generated runner evaluates the website/-diff skip against sync_base_ref.
+
+    The decision cannot be made at assembly time (the ref does not exist until
+    fetch runs inside this script), so it lives in the runner: a by-path load of
+    the stdlib-only helper and a call to may_skip_frontend, whose evidence is a
+    diff against the pinned base ref.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    monkeypatch.setattr(worktree_ops_mod.frontend, "edition_configured", lambda: False)
+
+    _, script = await _run_sync(mod, [])
+
+    # The runner loads the helper BY PATH (never imports kiro_crew) and asks it.
+    assert "spec_from_file_location('frontend_skip'" in script
+    assert "may_skip_frontend(" in script
+    # The skip is gated on the pinned base ref this process fetched into.
+    assert f"sync-base-{os.getpid()}" in script
+    # And it prints a skip notice naming website/ as the reason.
+    assert "skipping %s" in script and "website/" in script
+
+
+@pytest.mark.asyncio
+async def test_sync_couples_the_two_frontend_steps_under_one_skip_marker(monkeypatch):
+    """Both frontend steps carry the SAME skip marker; nothing else does.
+
+    They share one cause (no website/ change) and one evidence check, so they
+    skip together or neither does. Every other step (fetch, merge, pip, the
+    preflight) must be free of the marker so it always runs.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    monkeypatch.setattr(worktree_ops_mod.frontend, "edition_configured", lambda: False)
+
+    _, script = await _run_sync(mod, [])
+
+    steps = _sync_steps_from_script(script)
+    by_label = {s["label"]: s for s in steps}
+    marked = [s["label"] for s in steps if "skip_if_frontend_unchanged" in s]
+    assert sorted(marked) == ["npm build + stage", "npm ci"]
+    # The two markers are the SAME object of evidence (same ref/repo/git), which
+    # is what makes the runtime verdict one decision shared by both.
+    assert (
+        by_label["npm ci"]["skip_if_frontend_unchanged"]
+        == by_label["npm build + stage"]["skip_if_frontend_unchanged"]
+    )
+    # The marker carries the pinned base ref the runtime diff is taken against.
+    assert by_label["npm ci"]["skip_if_frontend_unchanged"]["ref"].endswith(
+        f"sync-base-{os.getpid()}"
+    )
+    # No non-frontend step is a skip candidate.
+    for label in ("Pull", "Merge", "pip install"):
+        assert "skip_if_frontend_unchanged" not in by_label[label]
+
+
+@pytest.mark.asyncio
+async def test_sync_skip_marker_carries_the_pre_merge_base_never_head(monkeypatch):
+    """The diff's base side is a commit resolved BEFORE the run, not "HEAD".
+
+    The runner reaches the frontend steps only after the `git merge --ff-only
+    <ref>` step has fast-forwarded HEAD onto that very ref, so a HEAD-relative
+    diff would compare the ref with itself: empty on every successful sync, i.e. a
+    vacuous gate that skips the frontend build for a sync whose whole content is a
+    website/ change. So the marker carries the pre-merge OID and the runner passes
+    it through.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    monkeypatch.setattr(worktree_ops_mod.frontend, "edition_configured", lambda: False)
+
+    _, script = await _run_sync(mod, [])
+
+    steps = _sync_steps_from_script(script)
+    marker = next(s["skip_if_frontend_unchanged"] for s in steps
+                  if "skip_if_frontend_unchanged" in s)
+    # _run_sync stubs _git to answer every query with "main", so this is the
+    # RESOLVED answer to the pre-run `git rev-parse HEAD` -- what matters is that
+    # the marker carries a resolved commit rather than deferring the word "HEAD"
+    # into the runner, where it would name the post-merge commit instead.
+    assert marker["base"] == "main"
+    assert marker["base"] != "HEAD"
+    # The runner forwards it as the base argument, so the helper never has to
+    # fall back to a HEAD-relative diff.
+    assert "marker['base']" in script
+
+
+@pytest.mark.asyncio
+async def test_sync_survives_a_full_tmpdir_while_staging_the_skip_helper(monkeypatch):
+    """An unwritable TMPDIR degrades the skip; it must not abort the Pull+Build.
+
+    The staging failure is handled by logging and leaving the steps untagged, so
+    the sync runs npm ci and the build exactly as it does without the skip. The
+    marker name has to be bound on that path too -- the sibling assignment makes
+    it a function-local, so leaving it unbound turns the graceful-degradation
+    branch into an UnboundLocalError that aborts the whole sync.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    monkeypatch.setattr(worktree_ops_mod.frontend, "edition_configured", lambda: False)
+
+    real_mkdtemp = worktree_ops_mod.tempfile.mkdtemp
+
+    def _fail_only_the_skip_snapshot(*args, prefix="", **kwargs):
+        if prefix.startswith("kirocrew-frontend-skip-"):
+            raise OSError(28, "No space left on device")
+        return real_mkdtemp(*args, prefix=prefix, **kwargs)
+
+    with patch.object(
+        worktree_ops_mod.tempfile, "mkdtemp", side_effect=_fail_only_the_skip_snapshot
+    ):
+        result, script = await _run_sync(mod, [])
+
+    assert result["ok"] is True
+    assert script is not None
+    steps = _sync_steps_from_script(script)
+    labels = [s["label"] for s in steps]
+    # Both frontend steps are present and NEITHER is tagged, so both run.
+    assert "npm ci" in labels and "npm build + stage" in labels
+    assert not any("skip_if_frontend_unchanged" in s for s in steps)
+
+
+@pytest.mark.asyncio
+async def test_sync_runner_skips_before_the_node_modules_stash_transaction(monkeypatch):
+    """A skipped npm ci must not even move node_modules aside.
+
+    The whole point of the skip is that the tree is already what npm ci would
+    produce, so the runner `continue`s past the step BEFORE the stash rename —
+    otherwise a backend-only sync would still take the one trip through the step
+    that can destroy node_modules, which is the second-order cost the issue
+    calls out.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    monkeypatch.setattr(worktree_ops_mod.frontend, "edition_configured", lambda: False)
+
+    _, script = await _run_sync(mod, [])
+
+    # The skip `continue` appears before the stash rename in the step loop body.
+    skip_at = script.index("if marker and may_skip_frontend(marker)")
+    stash_at = script.index("os.rename(stash, backup)")
+    assert skip_at < stash_at
+
+
+@pytest.mark.asyncio
+async def test_sync_frontend_skip_is_a_no_op_on_an_edition_checkout():
+    """On an edition checkout the frontend steps are absent, so the skip cannot
+    fire and must not interfere.
+
+    frontend_half is false on an edition composition root, so neither npm step
+    is assembled and nothing carries the skip marker — the runtime skip is a
+    guarded no-op there. The backend half (fetch, merge, pip) is untouched.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+
+    with patch.object(worktree_ops_mod.frontend, "edition_configured", return_value=True):
+        _, script = await _run_sync(mod, [])
+
+    steps = _sync_steps_from_script(script)
+    labels = [s["label"] for s in steps]
+    # No frontend steps at all, hence nothing to skip.
+    assert "npm ci" not in labels
+    assert "npm build + stage" not in labels
+    assert not any("skip_if_frontend_unchanged" in s for s in steps)
+    # No step carries the marker, so the runner's `st.get(SKIP_MARKER)` is None
+    # for every step and may_skip_frontend is never invoked — a guarded no-op.
+    assert all(s.get("skip_if_frontend_unchanged") is None for s in steps)
+    # Backend half is still there.
+    assert "Pull" in labels and "Merge" in labels and "pip install" in labels
 
 
 def test_utf8_reconfigure_survives_a_legacy_codepage_pipe():
