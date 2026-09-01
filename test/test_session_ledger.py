@@ -456,6 +456,57 @@ def test_record_fails_closed_on_held_lock(monkeypatch):
     assert sl.read_state(key)["goal"] == "z"
 
 
+@pytest.mark.skipif(not IS_POSIX, reason="flock-based holder simulation is POSIX-only")
+def test_held_lock_refusal_is_bounded_by_the_deadline(monkeypatch):
+    """Pins the honest, scoped promise for issue #7645.
+
+    The documented guarantee is that a *live cross-process HOLDER* of the
+    flock costs at most one refused write within ``_LOCK_TIMEOUT_SECS`` — the
+    deadline governs the acquire poll loop, so the refusal is bounded, not an
+    unbounded wait. This asserts both halves of that promise:
+
+    (a) preserved guarantee: a held flock yields a bounded ``OSError`` whose
+        message matches "held by another process"; and
+    (b) bounded timing: with the timeout shortened and the lock held, the
+        refusal returns within roughly the timeout window (elapsed wall time
+        under a generous ceiling), proving the deadline governs the poll.
+
+    Deliberately NOT asserted: a bound on a wedged FILESYSTEM/mount. The
+    pre-lock mkdir/os.open are ordinary syscalls that a dead mount can stall
+    unboundedly, and no in-process deadline can interrupt a stalled syscall
+    (see session_ledger._locked). There is no portable way to simulate a hung
+    mkdir/os.open, and asserting a bound there would re-introduce the false
+    "never a parked worker thread" promise this change removed — so a future
+    reader must not add such an assertion.
+    """
+    import fcntl
+    import time
+
+    timeout = 0.2
+    slack = 2.0  # generous ceiling: bounded, not unbounded, is the claim
+    key = "chat-lock-bounded-7645"
+    sl.record(key, goal="x")  # create the dir + lock inode
+    monkeypatch.setattr(sl, "_LOCK_TIMEOUT_SECS", timeout)
+    fd = os.open(str(sl.ledger_dir(key) / ".lock"), os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        start = time.monotonic()
+        with pytest.raises(OSError, match="held by another process"):
+            sl.record(key, goal="y")
+        elapsed = time.monotonic() - start
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    # The deadline bounds the poll: the refusal must not have waited forever.
+    assert elapsed < timeout + slack, (
+        f"refusal took {elapsed:.3f}s; the deadline is not governing the "
+        f"acquire poll (expected < {timeout + slack:.3f}s)"
+    )
+    # Holder released: the next write still goes through.
+    sl.record(key, goal="z")
+    assert sl.read_state(key)["goal"] == "z"
+
+
 # ── snapshot rendering ────────────────────────────────────────────────────
 
 
