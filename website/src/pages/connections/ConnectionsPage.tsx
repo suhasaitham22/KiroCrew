@@ -488,7 +488,18 @@ function ConnectionCard({
         </span>
       </header>
 
-      <p className="mb-2.5 mt-1.5 min-w-0 text-[12.5px] text-muted" title={valueProp}>
+      {/* A pinned two-line box, not free-flowing text. The value props differ in
+          length -- GitLab's wraps to two lines where Notion's takes one -- and an
+          intrinsic height makes every card as tall as its own copy, so a row of
+          cards renders ragged. Clamping to a fixed two-line height gives every
+          collapsed card the same height, which is also why the grid keeps
+          `items-start`: a card expanded into the approval flow must NOT drag its
+          row partner up to its height. Same construction as the agents gallery
+          card. `title` still carries the full text for anything clamped. */}
+      <p
+        className="mb-2.5 mt-1.5 line-clamp-2 h-[34px] min-w-0 text-[12.5px] leading-[17px] text-muted"
+        title={valueProp}
+      >
         {valueProp}
       </p>
 

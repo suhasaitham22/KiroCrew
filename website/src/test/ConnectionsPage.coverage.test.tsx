@@ -1353,3 +1353,27 @@ describe('the authorization status feed', () => {
     expect(within(card('notion')).queryByText(/is not authorized/)).toBeNull()
   })
 })
+
+// Card height. Descriptions differ in length across providers, and a card that
+// sizes to its own copy makes the row it sits in ragged. jsdom runs no layout
+// engine, so the pinned two-line box IS the observable here: asserting the
+// height/clamp pair on the description is what a browser's equal-height rows
+// reduce to, and it is what a later "tidy up the classes" edit would break.
+describe('the card description box', () => {
+  it('pins every description to the same clamped two-line height', async () => {
+    mount()
+
+    await waitFor(() => expect(card('notion')).toBeInTheDocument())
+    // GitLab's copy wraps to two lines where Notion's takes one: both cards must
+    // still reserve the same vertical space.
+    for (const slug of ['notion', 'gitlab']) {
+      const description = card(slug).querySelector('p')
+      if (!description) throw new Error(`no description paragraph on the ${slug} card`)
+      expect(description).toHaveClass('h-[34px]')
+      expect(description).toHaveClass('line-clamp-2')
+      // An explicit line-height is what makes the fixed height hold exactly two
+      // lines instead of clipping the second one mid-glyph.
+      expect(description).toHaveClass('leading-[17px]')
+    }
+  })
+})
