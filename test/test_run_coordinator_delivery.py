@@ -542,6 +542,32 @@ async def test_startup_orphan_scans_leave_the_event_loop_thread(monkeypatch) -> 
 
 
 @pytest.mark.asyncio
+async def test_startup_orphan_reaping_leaves_the_event_loop_thread(monkeypatch) -> None:
+    event_loop_thread = threading.get_ident()
+    reap_threads: list[int] = []
+    orphan = {"id": "run-1", "pid": 4242}
+
+    def reap_orphan(_state: dict[str, object]) -> bool:
+        reap_threads.append(threading.get_ident())
+        return False
+
+    manager = SubagentManager(
+        sessions=MagicMock(),
+        ctx_builder=MagicMock(),
+        coordinator=MemoryRunCoordinator(),
+    )
+    monkeypatch.setattr("kiro_crew.subagent.list_orphans", lambda: [orphan])
+    monkeypatch.setattr(manager, "_is_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(manager, "_reap_orphan_process", reap_orphan)
+    monkeypatch.setattr(manager, "_notify_orphan", AsyncMock(return_value=False))
+
+    await manager._reconcile_orphans()
+
+    assert len(reap_threads) == 2
+    assert all(thread_id != event_loop_thread for thread_id in reap_threads)
+
+
+@pytest.mark.asyncio
 async def test_startup_kills_surviving_child_before_delivering_its_completion(
     monkeypatch,
 ) -> None:

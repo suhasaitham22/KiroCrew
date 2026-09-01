@@ -1327,6 +1327,10 @@ class SubagentInfo:
     _delivery_event_id: str = ""
     _delivery_failed: bool = False
     _delivery_retry: bool = False
+    # Stable owner for in-process durable retries. The dashboard slot may arm a
+    # new plan between attempts and replace its tracker; retaining the original
+    # tracker preserves a cancellation that belongs to this completion.
+    _delivery_orchestration_tracker: Any = None
     _delivery_batch_progress: dict[str, Any] | None = None
     _delivery_batch_final: bool = False
     # True when the gateway QUEUED this completion's injection because the

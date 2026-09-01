@@ -6563,6 +6563,13 @@ class GatewayOrchestrator:
                     _is_orchestrator = (
                         _slot is not None and getattr(_slot, "mode", "") == "orchestrator"
                     )
+                # Only a durable retry may already own an orchestration
+                # tracker. A fresh completion snapshots the active slot below.
+                tracker = info._delivery_orchestration_tracker if _delivery_retry else None
+                if tracker is None and _slot is not None and _is_orchestrator:
+                    tracker = getattr(_slot, "_orch_tracker", None)
+                    if tracker is not None:
+                        info._delivery_orchestration_tracker = tracker
                 if _slot is not None and _is_orchestrator and not _delivery_retry:
                     from kiro_crew.context_management import (
                         MAX_STAGE_ESCALATIONS,
@@ -6575,17 +6582,19 @@ class GatewayOrchestrator:
                     # planning turn (it clears only when the new plan is
                     # armed), so a latch-based drop here would silently
                     # discard subagent completions belonging to that new
-                    # turn — data loss. tracker.stopped scopes the drop to
-                    # a live-but-stopped orchestration; a stale completion
-                    # landing on a cancelled slot whose tracker is absent
-                    # is bounded accounting noise (the stage loop itself
-                    # stays latched and cannot advance).
-                    if not getattr(_slot, "_orch_tracker", None):
+                    # turn — data loss. The retained tracker scopes the drop
+                    # to the orchestration that owned this delivery even when
+                    # the slot arms a new plan between durable attempts.
+                    if tracker is None:
                         _slot._orch_tracker = OrchestrationTracker()
                     tracker = _slot._orch_tracker
-                    if tracker.stopped:
-                        logger.info("Orchestration stopped, ignoring subagent result %s", info.id)
-                        return
+                    assert tracker is not None
+                    info._delivery_orchestration_tracker = tracker
+                if tracker is not None and getattr(tracker, "stopped", False) is True:
+                    logger.info("Orchestration stopped, ignoring subagent result %s", info.id)
+                    return
+                if _slot is not None and _is_orchestrator and not _delivery_retry:
+                    assert tracker is not None
                     task_key = info.task[:80]
                     if _flush_only:
                         # No task ran — nothing to record. Recording it as a
@@ -7178,6 +7187,18 @@ class GatewayOrchestrator:
                                     raise  # Don't swallow cancellation of this coroutine
                                 except Exception:
                                     pass  # Task failed — slot is now idle
+
+                            delivery_tracker = info._delivery_orchestration_tracker
+                            if (
+                                delivery_tracker is not None
+                                and getattr(delivery_tracker, "stopped", False) is True
+                            ):
+                                logger.info(
+                                    "Orchestration stopped while awaiting delivery, "
+                                    "ignoring subagent result %s",
+                                    info.id,
+                                )
+                                return
 
                             # Re-check: another injection may have claimed the slot
                             # during the await above.

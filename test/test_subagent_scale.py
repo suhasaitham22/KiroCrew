@@ -1471,6 +1471,148 @@ class TestWaveDigest:
         assert combined.count("You MUST ask the user for guidance") == 1
 
     @pytest.mark.asyncio
+    async def test_delivery_retry_does_not_resume_stopped_orchestration(self):
+        orch = _make_orchestrator()
+        orch.sessions = _mock_sessions()
+        orch.ctx_builder = MagicMock()
+        orch.ctx_builder.hooks = MagicMock()
+        orch.dashboard_state = _mock_dashboard_state()
+        tracker = MagicMock()
+        tracker.stopped = True
+        slot = MagicMock()
+        slot.mode = "orchestrator"
+        slot.running = False
+        slot.task = None
+        slot._orch_tracker = tracker
+        slot._subagent_deliveries_inflight = 0
+        orch.dashboard_state.get_slot = MagicMock(return_value=slot)
+        _mgr, on_done = self._capture_on_done(orch)
+        info = SubagentInfo(
+            id="retry-after-stop",
+            task="late durable delivery",
+            parent_session_key="dashboard:main",
+            done=True,
+            result="done",
+        )
+        info._delivery_retry = True
+        run_chat = AsyncMock()
+
+        with patch("kiro_crew.slack.gateway._run_chat", run_chat):
+            await on_done(info)
+            await asyncio.sleep(0)
+
+        scheduled_task = slot.task
+        if isinstance(scheduled_task, asyncio.Task):
+            scheduled_task.cancel()
+            await asyncio.gather(scheduled_task, return_exceptions=True)
+
+        assert scheduled_task is None
+        run_chat.assert_not_awaited()
+        tracker.record_success.assert_not_called()
+        tracker.record_failure.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_delivery_retry_keeps_original_stopped_orchestration_owner(self):
+        orch = _make_orchestrator()
+        orch.sessions = _mock_sessions()
+        orch.ctx_builder = MagicMock()
+        orch.ctx_builder.hooks = MagicMock()
+        orch.dashboard_state = _mock_dashboard_state()
+        stopped_tracker = MagicMock()
+        stopped_tracker.stopped = True
+        current_tracker = MagicMock()
+        current_tracker.stopped = False
+        slot = MagicMock()
+        slot.mode = "orchestrator"
+        slot.running = False
+        slot.task = None
+        slot._orch_tracker = current_tracker
+        slot._subagent_deliveries_inflight = 0
+        orch.dashboard_state.get_slot = MagicMock(return_value=slot)
+        _mgr, on_done = self._capture_on_done(orch)
+        info = SubagentInfo(
+            id="retry-after-new-plan",
+            task="late durable delivery",
+            parent_session_key="dashboard:main",
+            done=True,
+            result="done",
+        )
+        info._delivery_retry = True
+        info._delivery_orchestration_tracker = stopped_tracker
+        run_chat = AsyncMock()
+
+        with patch("kiro_crew.slack.gateway._run_chat", run_chat):
+            await on_done(info)
+            await asyncio.sleep(0)
+
+        scheduled_task = slot.task
+        if isinstance(scheduled_task, asyncio.Task):
+            scheduled_task.cancel()
+            await asyncio.gather(scheduled_task, return_exceptions=True)
+
+        assert scheduled_task is None
+        run_chat.assert_not_awaited()
+        current_tracker.record_success.assert_not_called()
+        current_tracker.record_failure.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_delivery_retry_rechecks_stop_after_busy_slot_wait(self):
+        orch = _make_orchestrator()
+        orch.sessions = _mock_sessions()
+        orch.ctx_builder = MagicMock()
+        orch.ctx_builder.hooks = MagicMock()
+        orch.dashboard_state = _mock_dashboard_state()
+        tracker = MagicMock()
+        tracker.stopped = False
+        slot = MagicMock()
+        slot.mode = "orchestrator"
+        slot.running = False
+        slot._orch_tracker = tracker
+        slot._subagent_deliveries_inflight = 0
+        busy_started = asyncio.Event()
+        release_busy = asyncio.Event()
+
+        async def _busy_turn():
+            busy_started.set()
+            await release_busy.wait()
+
+        current_task = asyncio.create_task(_busy_turn())
+        slot.task = current_task
+        orch.dashboard_state.get_slot = MagicMock(return_value=slot)
+        _mgr, on_done = self._capture_on_done(orch)
+        info = SubagentInfo(
+            id="retry-cancelled-during-wait",
+            task="late durable delivery",
+            parent_session_key="dashboard:main",
+            done=True,
+            result="done",
+        )
+        info._delivery_retry = True
+        info._delivery_orchestration_tracker = tracker
+        run_chat_release = asyncio.Event()
+
+        async def _run_chat(*_args, **_kwargs):
+            await run_chat_release.wait()
+
+        with patch("kiro_crew.slack.gateway._run_chat", side_effect=_run_chat):
+            delivery_task = asyncio.create_task(on_done(info))
+            await busy_started.wait()
+            await asyncio.sleep(0)
+            tracker.stopped = True
+            release_busy.set()
+            await delivery_task
+            await asyncio.sleep(0)
+
+        scheduled_task = slot.task
+        if scheduled_task is not current_task and isinstance(scheduled_task, asyncio.Task):
+            scheduled_task.cancel()
+            await asyncio.gather(scheduled_task, return_exceptions=True)
+
+        assert scheduled_task is current_task
+        tracker.record_success.assert_not_called()
+        tracker.record_failure.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_small_wave_delivers_single_chunk_digest(self):
         """Small multi-task waves (2-10 agents) get ONE consolidated chunk
         digest on wave close — chunking is uniform for every multi-task

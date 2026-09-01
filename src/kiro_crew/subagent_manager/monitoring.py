@@ -116,7 +116,7 @@ class OrphanStallMonitor(ManagerComponent):
                 if (
                     agent_id
                     and agent_id not in self._manager._agents
-                    and self._manager._reap_orphan_process(state)
+                    and await asyncio.to_thread(self._manager._reap_orphan_process, state)
                 ):
                     reaped_orphan_ids.add(agent_id)
         except Exception:
@@ -160,7 +160,7 @@ class OrphanStallMonitor(ManagerComponent):
                     recovery = "undeliverable"
                     if pid and self._manager._is_pid_alive(pid):
                         if agent_id not in reaped_orphan_ids:
-                            self._manager._reap_orphan_process(state)
+                            await asyncio.to_thread(self._manager._reap_orphan_process, state)
                         recovery = "result_available" if has_result else "notification_pending"
                     elif has_result:
                         recovery = "result_available"

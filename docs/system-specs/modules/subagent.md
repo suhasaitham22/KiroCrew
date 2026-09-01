@@ -312,7 +312,11 @@ compatibility role.
 Delivery retries retain their manager context. Lifecycle events, orchestration
 tracking, and wave accounting run once; every composed wave chunk keeps a
 detached retry snapshot, so a failed non-final or final route cannot recount a
-member, discard the composed chunk, or mutate later live wave progress. Cron
+member, discard the composed chunk, or mutate later live wave progress. A retry
+retains the tracker that owned its first delivery attempt, observes a stop on
+that owner even if the slot has since armed a new plan, and exits before routing;
+the dashboard route rechecks that owner after awaiting a busy slot and before
+handoff. Only the one-shot accounting mutations are skipped on retry. Cron
 injection exceptions explicitly record a routing failure before returning, so
 the outbox claim remains pending. A non-empty drain result ends a synchronous
 reporter only when its attempt is actually `DELIVERED`; released or pending
@@ -915,6 +919,10 @@ On startup, `SubagentManager` scans `~/.kiro/crew/subagents/` and reconciles:
 3. **PID dead + no result** → write tombstone with "orphaned" error
 
 **Orphan delivery is wired** (not a stub): the gateway registers `on_orphan_notify` (session injection — rides the parent slot's batched pending-failures drain) and `on_orphan_dm` (fallback). The DM fallback collects every undelivered orphan across the reconciliation scan and sends ONE digest message (`"N subagent(s)…"`) — never N pings; a lone orphan keeps the plain per-agent message.
+
+Legacy folder orphan scans and their identity-checked process reaping run off
+the event loop; process-tree termination may invoke bounded platform tools on
+Windows and must not stall gateway traffic.
 
 ### Tombstone Lifecycle
 
