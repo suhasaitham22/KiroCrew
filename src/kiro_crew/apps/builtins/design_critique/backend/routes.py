@@ -157,13 +157,22 @@ def _probe_put(
     # clone returns "") has no /render counterpart to key against, so skip it.
     if not handle:
         return
+    # Repos get a fresh 12-hex clone id per discover so overwrites never collide,
+    # but a local handle is a stable "local:<path>": re-discovering the same local
+    # project before TTL overwrites its entry, orphaning the previous probe dir
+    # until the sweep. Drop that prior dir here (only if it actually differs) so it
+    # is not leaked. rmtree is blocking IO; this runs inside the discover to_thread
+    # worker, never on the event loop, so it stays off the main loop as before.
     with _PROBE_CACHE_LOCK:
+        prev = _PROBE_CACHE.get(handle)
         _PROBE_CACHE[handle] = {
             "dir": dir_path,
             "routes": dict(routes),
             "created_at": time.time(),
             "source_mtime": source_mtime,
         }
+    if prev is not None and prev.get("dir") and prev["dir"] != dir_path:
+        shutil.rmtree(prev["dir"], ignore_errors=True)
 
 
 def _probe_get(handle: str) -> dict[str, Any] | None:

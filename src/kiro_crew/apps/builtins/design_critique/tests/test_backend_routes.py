@@ -997,6 +997,30 @@ def test_probe_put_get_drop_round_trip(monkeypatch, tmp_path) -> None:  # type: 
     assert not pdir.exists()
 
 
+def test_probe_put_overwrite_drops_prior_dir(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    # A stable "local:<path>" handle re-discovered before TTL overwrites its entry.
+    # The prior retained probe dir must be removed on overwrite so it is not
+    # orphaned until the sweep, while the NEW dir is kept intact.
+    monkeypatch.setattr(routes, "_PROBE_CACHE", {})
+    first = tmp_path / "dc-probe-first"
+    first.mkdir()
+    second = tmp_path / "dc-probe-second"
+    second.mkdir()
+    handle = "local:/some/project"
+    routes._probe_put(handle, str(first), {"/": "/x/a.png"}, 1.0)
+    routes._probe_put(handle, str(second), {"/": "/x/b.png"}, 2.0)
+    # Prior dir gone, new dir retained, cache points at the new record.
+    assert not first.exists()
+    assert second.exists()
+    rec = routes._probe_get(handle)
+    assert rec is not None and rec["dir"] == str(second)
+
+    # Re-storing the SAME dir (unchanged) must NOT delete it (no self-destruct).
+    routes._probe_put(handle, str(second), {"/": "/x/b.png"}, 3.0)
+    assert second.exists()
+    assert routes._probe_get(handle)["source_mtime"] == 3.0
+
+
 def test_probe_get_expired_returns_none(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
     import time
 
@@ -1140,6 +1164,56 @@ async def test_render_mixed_reuse_captures_only_uncovered(monkeypatch, tmp_path)
     screens = rec["result"]["screens"]
     assert screens[0] == {"step": 1, "label": "Home", "path": str(home_png)}
     assert screens[1] == {"step": 2, "label": "About", "path": "/x/about.png"}
+
+
+@pytest.mark.asyncio
+async def test_render_covered_png_deleted_falls_back_to_fresh(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    # The cache holds a route->png for a pick, but the PNG was deleted from disk
+    # between /discover and /render (e.g. swept). That pick must be treated as
+    # UNCOVERED — it lands in the fresh capture --routes CSV — rather than reused.
+    monkeypatch.setattr(routes, "_node", lambda: "/usr/bin/node")
+    monkeypatch.setattr(routes, "_uploads_dir", lambda: tmp_path)
+    monkeypatch.setattr(routes, "_PROBE_CACHE", {})
+    proj = tmp_path / "dc-clones" / "clone-gone"
+    proj.mkdir(parents=True)
+    probe_dir = tmp_path / "dc-probe-gone"
+    probe_dir.mkdir()
+    # The cached PNG for "/" is recorded but NEVER written to disk (deleted/missing).
+    home_png = probe_dir / "home.png"
+
+    seen_cmds: list[list[str]] = []
+
+    async def fake_run(cmd, timeout, env=None):  # type: ignore[no-untyped-def]
+        seen_cmds.append(cmd)
+        return (0, json.dumps({"screens": [{"route": "/", "path": "/x/home-fresh.png"}]}), "")
+
+    monkeypatch.setattr(routes, "_run", fake_run)
+    sig = routes._dir_signature((tmp_path / "dc-clones" / "clone-gone").resolve())
+    routes._probe_put("clone-gone", str(probe_dir), {"/": str(home_png)}, sig)
+    # Sanity: the cache references a path that does not exist on disk.
+    assert not home_png.exists()
+
+    resp = await routes._handle_render(
+        _Req(
+            {
+                "kind": "repo",
+                "handle": "clone-gone",
+                "picks": [{"ref": "/", "label": "Home"}],
+            }
+        )  # type: ignore[arg-type]
+    )
+    assert resp.status == 200
+    assert isinstance(resp.body, bytes)
+    rec = await _drain(json.loads(resp.body)["job"])
+    assert rec is not None and rec["status"] == "done"
+    # The pick was NOT reused: the capture subprocess ran with the pick in --routes.
+    assert len(seen_cmds) == 1
+    routes_flag = next(a for a in seen_cmds[0] if a.startswith("--routes="))
+    assert routes_flag == "--routes=/"
+    # The result serves the FRESH capture, not the missing probe PNG.
+    paths = [s["path"] for s in rec["result"]["screens"]]
+    assert paths == ["/x/home-fresh.png"]
+    assert str(home_png) not in paths
 
 
 @pytest.mark.asyncio
