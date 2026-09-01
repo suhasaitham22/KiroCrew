@@ -30,6 +30,7 @@ import sys
 import time
 import uuid
 import zipfile
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +38,7 @@ from urllib.parse import quote, urlencode
 
 from kiro_crew import __version__, release_channel
 from kiro_crew.config.loader import config_dir
+from kiro_crew.kiro_cli import resolve_kiro_cli
 from kiro_crew.security import (
     is_sensitive_path,
     redact_credentials,
@@ -275,18 +277,53 @@ def _macos_crash_reports() -> list[Path]:
     return reports[:_MAX_IPS_REPORTS]
 
 
-def _kiro_cli_version() -> str:
+def _kiro_cli_version(
+    *,
+    platform_name: str | None = None,
+    home: Path | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> str:
+    """Version string of the installed Kiro CLI, for the support bundle.
+
+    Resolves the binary through :func:`kiro_crew.kiro_cli.resolve_kiro_cli`
+    (fixed install directories first, inherited ``PATH`` after — the same
+    resolver the agent runtime spawn uses, see ``acp/client.py``) instead of
+    spawning the bare name: a collector process whose inherited ``PATH`` lacks
+    the install directory made the bare-name spawn misreport a working install
+    as ``unavailable`` in both ``versions.txt`` and the prefilled bug-report
+    footer (#7674). The keyword-only parameters are passthroughs to the
+    resolver so tests can pin the host layout; production callers pass nothing.
+
+    Return values, each a plain one-line string (both consumers interpolate
+    it verbatim):
+
+    * ``unavailable`` — the resolver found no binary anywhere. This is now the
+      ONLY path producing that string, so it means "genuinely not installed".
+    * ``present but not runnable`` — a resolved binary failed to spawn, timed
+      out, or exited non-zero. Distinct from ``unavailable`` so a broken
+      install is never misread as a missing one.
+    * the trimmed ``--version`` output, or ``unknown`` when a clean exit
+      printed nothing.
+
+    Never raises: diagnostics collection must degrade to a string, so the
+    spawn keeps its existing containment boundary.
+    """
+    binary = resolve_kiro_cli(platform_name=platform_name, home=home, environ=environ)
+    if binary is None:
+        return "unavailable"
     try:
         out = subprocess.run(
-            ["kiro-cli", "--version"],
+            [binary, "--version"],
             capture_output=True,
             text=True,
             timeout=5,
             check=False,
         )
-        return (out.stdout or out.stderr).strip() or "unknown"
     except (OSError, subprocess.SubprocessError):
-        return "unavailable"
+        return "present but not runnable"
+    if out.returncode != 0:
+        return "present but not runnable"
+    return (out.stdout or out.stderr).strip() or "unknown"
 
 
 #: PEP 440 prerelease segment — see
