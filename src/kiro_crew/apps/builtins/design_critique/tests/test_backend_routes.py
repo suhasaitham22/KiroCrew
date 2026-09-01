@@ -968,3 +968,286 @@ async def test_job_status_error_returns_message() -> None:
     assert isinstance(resp.body, bytes)
     body = json.loads(resp.body)
     assert body["status"] == "error" and "kaboom" in body["error"]
+
+
+# ── probe-PNG cache: reuse the discovery capture in /render ──
+
+
+def test_probe_put_get_drop_round_trip(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    # Isolate the module-level cache so the test does not leak entries.
+    monkeypatch.setattr(routes, "_PROBE_CACHE", {})
+    pdir = tmp_path / "dc-probe-abc"
+    pdir.mkdir()
+    routes._probe_put("clone1", str(pdir), {"/": "/x/home.png"}, 123.0)
+    rec = routes._probe_get("clone1")
+    assert rec is not None
+    assert rec["dir"] == str(pdir)
+    assert rec["routes"] == {"/": "/x/home.png"}
+    assert rec["source_mtime"] == 123.0
+    # A shallow copy is returned: mutating it must not corrupt the stored record.
+    rec["routes"]["/"] = "tampered"
+    assert routes._probe_get("clone1")["routes"]["/"] == "/x/home.png"
+    # Unknown handle -> None; a falsy handle is never stored.
+    assert routes._probe_get("nope") is None
+    routes._probe_put("", str(pdir), {"/": "/x/home.png"}, 1.0)
+    assert routes._probe_get("") is None
+    # _probe_drop forgets the entry and removes the retained dir.
+    routes._probe_drop("clone1")
+    assert routes._probe_get("clone1") is None
+    assert not pdir.exists()
+
+
+def test_probe_get_expired_returns_none(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    import time
+
+    monkeypatch.setattr(routes, "_PROBE_CACHE", {})
+    routes._probe_put("clone1", str(tmp_path), {"/": "/x/home.png"}, None)
+    # Age the entry past the TTL: _probe_get must treat it as expired.
+    routes._PROBE_CACHE["clone1"]["created_at"] = time.time() - routes._PROBE_TTL_SEC - 60
+    assert routes._probe_get("clone1") is None
+
+
+def test_dir_signature_none_on_missing_float_on_dir_and_changes(tmp_path) -> None:
+    import os as _os
+
+    assert routes._dir_signature(tmp_path / "does-not-exist") is None
+    sig = routes._dir_signature(tmp_path)
+    assert isinstance(sig, float)
+    # Bumping the dir mtime changes the signature (the staleness token).
+    later = sig + 1000.0
+    _os.utime(tmp_path, (later, later))
+    assert routes._dir_signature(tmp_path) != sig
+
+
+def test_sweep_purges_probe_cache_entry_when_dir_swept(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    import time
+
+    monkeypatch.setattr(routes, "_uploads_dir", lambda: tmp_path)
+    monkeypatch.setattr(routes, "_PROBE_CACHE", {})
+    aged = time.time() - routes._CLONE_TTL_SEC - 60
+    probe_dir = tmp_path / "dc-probe-old"
+    probe_dir.mkdir()
+    os.utime(probe_dir, (aged, aged))
+    # A cache entry pointing at the soon-to-be-swept dir must be purged too, so the
+    # cache never hands /render a path for a directory that no longer exists.
+    routes._probe_put("clone-old", str(probe_dir), {"/": str(probe_dir / "home.png")}, 1.0)
+    routes._sweep_clones()
+    assert not probe_dir.exists()
+    assert routes._probe_get("clone-old") is None
+
+
+@pytest.mark.asyncio
+async def test_render_all_covered_skips_capture_subprocess(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    # When the probe covered every pick, /render must NOT spawn the capture
+    # subprocess and must return the reused PNG paths in pick order.
+    monkeypatch.setattr(routes, "_node", lambda: "/usr/bin/node")
+    monkeypatch.setattr(routes, "_uploads_dir", lambda: tmp_path)
+    monkeypatch.setattr(routes, "_PROBE_CACHE", {})
+    proj = tmp_path / "dc-clones" / "clone42"
+    proj.mkdir(parents=True)
+    probe_dir = tmp_path / "dc-probe-x"
+    probe_dir.mkdir()
+    home_png = probe_dir / "home.png"
+    about_png = probe_dir / "about.png"
+    home_png.write_bytes(b"x")
+    about_png.write_bytes(b"x")
+
+    called = {"run": 0}
+
+    async def fake_run(cmd, timeout, env=None):  # type: ignore[no-untyped-def]
+        called["run"] += 1
+        return (0, "{}", "")
+
+    monkeypatch.setattr(routes, "_run", fake_run)
+    # Cache keyed by the repo handle (clone id), source signature = dir mtime.
+    sig = routes._dir_signature((tmp_path / "dc-clones" / "clone42").resolve())
+    routes._probe_put(
+        "clone42",
+        str(probe_dir),
+        {"/": str(home_png), "/about": str(about_png)},
+        sig,
+    )
+
+    resp = await routes._handle_render(
+        _Req(
+            {
+                "kind": "repo",
+                "handle": "clone42",
+                "picks": [
+                    {"ref": "/", "label": "Home"},
+                    {"ref": "/about", "label": "About"},
+                ],
+            }
+        )  # type: ignore[arg-type]
+    )
+    assert resp.status == 200
+    assert isinstance(resp.body, bytes)
+    rec = await _drain(json.loads(resp.body)["job"])
+    assert rec is not None and rec["status"] == "done"
+    screens = rec["result"]["screens"]
+    assert [s["path"] for s in screens] == [str(home_png), str(about_png)]
+    assert [s["step"] for s in screens] == [1, 2]
+    # The capture subprocess was never invoked.
+    assert called["run"] == 0
+
+
+@pytest.mark.asyncio
+async def test_render_mixed_reuse_captures_only_uncovered(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    # One pick covered by the probe, one not: the capture --routes CSV must contain
+    # ONLY the uncovered ref, and the result merges reused + fresh in pick order.
+    monkeypatch.setattr(routes, "_node", lambda: "/usr/bin/node")
+    monkeypatch.setattr(routes, "_uploads_dir", lambda: tmp_path)
+    monkeypatch.setattr(routes, "_PROBE_CACHE", {})
+    proj = tmp_path / "dc-clones" / "clone7"
+    proj.mkdir(parents=True)
+    probe_dir = tmp_path / "dc-probe-y"
+    probe_dir.mkdir()
+    home_png = probe_dir / "home.png"
+    home_png.write_bytes(b"x")
+
+    seen_cmds: list[list[str]] = []
+
+    async def fake_run(cmd, timeout, env=None):  # type: ignore[no-untyped-def]
+        seen_cmds.append(cmd)
+        # The fresh capture renders the uncovered route /about.
+        return (0, json.dumps({"screens": [{"route": "/about", "path": "/x/about.png"}]}), "")
+
+    monkeypatch.setattr(routes, "_run", fake_run)
+    sig = routes._dir_signature((tmp_path / "dc-clones" / "clone7").resolve())
+    routes._probe_put("clone7", str(probe_dir), {"/": str(home_png)}, sig)
+
+    resp = await routes._handle_render(
+        _Req(
+            {
+                "kind": "repo",
+                "handle": "clone7",
+                "picks": [
+                    {"ref": "/", "label": "Home"},
+                    {"ref": "/about", "label": "About"},
+                ],
+            }
+        )  # type: ignore[arg-type]
+    )
+    assert resp.status == 200
+    assert isinstance(resp.body, bytes)
+    rec = await _drain(json.loads(resp.body)["job"])
+    assert rec is not None and rec["status"] == "done"
+    # The single capture call requested ONLY the uncovered ref.
+    assert len(seen_cmds) == 1
+    routes_flag = next(a for a in seen_cmds[0] if a.startswith("--routes="))
+    assert routes_flag == "--routes=/about"
+    # Reused (step 1, probe PNG) then fresh (step 2), in original pick order.
+    screens = rec["result"]["screens"]
+    assert screens[0] == {"step": 1, "label": "Home", "path": str(home_png)}
+    assert screens[1] == {"step": 2, "label": "About", "path": "/x/about.png"}
+
+
+@pytest.mark.asyncio
+async def test_render_staleness_mismatch_recaptures_all(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    # If the source dir changed since discover (signature mismatch), reuse is
+    # bypassed and ALL picks are re-captured.
+    monkeypatch.setattr(routes, "_node", lambda: "/usr/bin/node")
+    monkeypatch.setattr(routes, "_uploads_dir", lambda: tmp_path)
+    monkeypatch.setattr(routes, "_PROBE_CACHE", {})
+    proj = tmp_path / "dc-clones" / "clone9"
+    proj.mkdir(parents=True)
+    probe_dir = tmp_path / "dc-probe-z"
+    probe_dir.mkdir()
+    home_png = probe_dir / "home.png"
+    home_png.write_bytes(b"x")
+
+    seen_cmds: list[list[str]] = []
+
+    async def fake_run(cmd, timeout, env=None):  # type: ignore[no-untyped-def]
+        seen_cmds.append(cmd)
+        return (
+            0,
+            json.dumps(
+                {
+                    "screens": [
+                        {"route": "/", "path": "/x/home-fresh.png"},
+                        {"route": "/about", "path": "/x/about.png"},
+                    ]
+                }
+            ),
+            "",
+        )
+
+    monkeypatch.setattr(routes, "_run", fake_run)
+    # Store a DELIBERATELY wrong source_mtime so the signature check fails.
+    routes._probe_put("clone9", str(probe_dir), {"/": str(home_png)}, -1.0)
+
+    resp = await routes._handle_render(
+        _Req(
+            {
+                "kind": "repo",
+                "handle": "clone9",
+                "picks": [
+                    {"ref": "/", "label": "Home"},
+                    {"ref": "/about", "label": "About"},
+                ],
+            }
+        )  # type: ignore[arg-type]
+    )
+    assert resp.status == 200
+    assert isinstance(resp.body, bytes)
+    rec = await _drain(json.loads(resp.body)["job"])
+    assert rec is not None and rec["status"] == "done"
+    # All picks re-captured (the CSV contains both refs); no probe PNG reused.
+    assert len(seen_cmds) == 1
+    routes_flag = next(a for a in seen_cmds[0] if a.startswith("--routes="))
+    assert routes_flag == "--routes=/,/about"
+    paths = [s["path"] for s in rec["result"]["screens"]]
+    assert paths == ["/x/home-fresh.png", "/x/about.png"]
+    assert str(home_png) not in paths
+
+
+@pytest.mark.asyncio
+async def test_discover_from_dir_retains_probe_and_caches(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    # A probe that produced a usable screen must RETAIN its dir and cache the
+    # route->PNG map keyed by the handle.
+    monkeypatch.setattr(routes, "_node", lambda: "/usr/bin/node")
+    monkeypatch.setattr(routes, "_uploads_dir", lambda: tmp_path)
+    monkeypatch.setattr(routes, "_PROBE_CACHE", {})
+    proj = tmp_path / "proj"
+    proj.mkdir()
+
+    async def fake_run(cmd, timeout, env=None):  # type: ignore[no-untyped-def]
+        if any("discover-routes" in c for c in cmd):
+            return (0, json.dumps({"framework": "", "routes": [{"path": "/"}]}), "")
+        # Probe manifest: the captured PNG path lives inside the probe --out dir.
+        out_dir = next(a[len("--out=") :] for a in cmd if a.startswith("--out="))
+        png = os.path.join(out_dir, "build-home.png")
+        return (0, json.dumps({"screens": [{"route": "/", "path": png}]}), "")
+
+    monkeypatch.setattr(routes, "_run", fake_run)
+    out = await routes._discover_from_dir(proj, handle="clone-keep")
+    assert out["handle"] == "clone-keep"
+    rec = routes._probe_get("clone-keep")
+    assert rec is not None
+    assert "/" in rec["routes"]
+    # The retained probe dir still exists on disk and is a dc-probe-* dir.
+    assert Path(rec["dir"]).exists()
+    assert "dc-probe-" in Path(rec["dir"]).name
+
+
+@pytest.mark.asyncio
+async def test_discover_from_dir_drops_empty_probe(monkeypatch, tmp_path) -> None:  # type: ignore[no-untyped-def]
+    # A probe with no usable screen must delete its dir immediately and cache nothing.
+    monkeypatch.setattr(routes, "_node", lambda: "/usr/bin/node")
+    monkeypatch.setattr(routes, "_uploads_dir", lambda: tmp_path)
+    monkeypatch.setattr(routes, "_PROBE_CACHE", {})
+    proj = tmp_path / "proj"
+    proj.mkdir()
+
+    async def fake_run(cmd, timeout, env=None):  # type: ignore[no-untyped-def]
+        if any("discover-routes" in c for c in cmd):
+            return (0, json.dumps({"framework": "", "routes": [{"path": "/"}]}), "")
+        # No screens -> nothing usable to retain.
+        return (0, json.dumps({"screens": []}), "")
+
+    monkeypatch.setattr(routes, "_run", fake_run)
+    await routes._discover_from_dir(proj, handle="clone-empty")
+    assert routes._probe_get("clone-empty") is None
+    # No retained dc-probe-* dir was left behind.
+    assert not any(p.name.startswith("dc-probe-") for p in tmp_path.iterdir())

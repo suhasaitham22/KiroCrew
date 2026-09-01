@@ -1,0 +1,7 @@
+{
+  "task_id": "task-dc-reuse-probe-pngs",
+  "task_description": "Design Critique backend: reuse the discovery probe's route->PNG captures in /render so a picked route already captured by the probe is not re-captured, only capturing routes the probe did not cover. Cache probe PNG paths keyed by the discovery handle, retain them past discovery (with a TTL/sweep-coordinated window), apply a staleness rule for a changed source dir, and fall back to a fresh capture for uncovered picks. Scoped to src/kiro_crew/apps/builtins/design_critique/backend/routes.py and its tests; capture-build.mjs is not modified.",
+  "status": "in_progress",
+  "feature_order": ["FEAT-001", "FEAT-002"],
+  "blocked_reason": null
+}

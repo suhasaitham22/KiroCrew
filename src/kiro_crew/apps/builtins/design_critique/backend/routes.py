@@ -131,6 +131,82 @@ def _finish_job(job_id: str, *, result: Any = None, error: str | None = None) ->
             rec["result"] = result
 
 
+# ── discovery-probe PNG cache ──
+#
+# The discover probe (capture-build.mjs over the first <=20 routes) is the slowest
+# step of a critique, and /render used to re-capture the very picks the probe had
+# already rendered — doubling exactly the latency the probe was meant to remove.
+# So instead of throwing the probe PNGs away at discover time, retain them and
+# record a handle-keyed route->PNG map here; /render then reuses a probe PNG for
+# any picked route the probe already captured and only shells out for the rest.
+#
+# Guarded by its own lock, mirroring the _JOBS registry. Each entry is:
+#   {"dir": <retained probe dir>, "routes": {<route>: <abs png path>},
+#    "created_at": <time.time()>, "source_mtime": <float | None>}
+# TTL matches the clone dirs so a probe cached at /discover survives to a later
+# /render within the same window the clone (its source dir) survives.
+_PROBE_CACHE: dict[str, dict[str, Any]] = {}
+_PROBE_CACHE_LOCK = threading.Lock()
+_PROBE_TTL_SEC = _CLONE_TTL_SEC
+
+
+def _probe_put(
+    handle: str, dir_path: str, routes: dict[str, str], source_mtime: float | None
+) -> None:
+    # Store a retained probe under its discovery handle. A falsy handle (a failed
+    # clone returns "") has no /render counterpart to key against, so skip it.
+    if not handle:
+        return
+    with _PROBE_CACHE_LOCK:
+        _PROBE_CACHE[handle] = {
+            "dir": dir_path,
+            "routes": dict(routes),
+            "created_at": time.time(),
+            "source_mtime": source_mtime,
+        }
+
+
+def _probe_get(handle: str) -> dict[str, Any] | None:
+    # Return a shallow copy of a live (non-expired) entry, or None. Copying under
+    # the lock keeps a caller from mutating the shared record or racing a sweep.
+    if not handle:
+        return None
+    now = time.time()
+    with _PROBE_CACHE_LOCK:
+        rec = _PROBE_CACHE.get(handle)
+        if rec is None:
+            return None
+        if now - rec.get("created_at", now) > _PROBE_TTL_SEC:
+            return None
+        return {
+            "dir": rec["dir"],
+            "routes": dict(rec["routes"]),
+            "created_at": rec["created_at"],
+            "source_mtime": rec["source_mtime"],
+        }
+
+
+def _probe_drop(handle: str) -> None:
+    # Forget an entry and remove its retained dir. rmtree is blocking IO; callers
+    # on the event loop should wrap this in asyncio.to_thread.
+    with _PROBE_CACHE_LOCK:
+        rec = _PROBE_CACHE.pop(handle, None)
+    if rec is not None:
+        shutil.rmtree(rec["dir"], ignore_errors=True)
+
+
+def _dir_signature(directory: Path) -> float | None:
+    # A cheap staleness token for the render target: its st_mtime. A probe entry is
+    # reused only when the current signature matches the one captured at discover
+    # time, guarding the case where the clone/local dir changed between /discover
+    # and /render (a reused PNG would then be stale). None on OSError (missing /
+    # unreadable) so a mismatch — never a crash — forces a fresh capture.
+    try:
+        return os.stat(directory).st_mtime
+    except OSError:
+        return None
+
+
 def _start_job(work: Callable[[], Awaitable[dict[str, Any]]]) -> str:
     """Run ``work`` in a detached task and return a job id to poll for its result."""
     job_id = uuid.uuid4().hex
@@ -187,12 +263,31 @@ def _sweep_clones() -> None:
     uploads = _uploads_dir()
     if uploads.exists():
         victims += [c for c in uploads.iterdir() if c.is_dir() and c.name.startswith("dc-probe-")]
+    removed: list[str] = []
     for child in victims:
         try:
             if now - child.stat().st_mtime > _CLONE_TTL_SEC:
                 shutil.rmtree(child, ignore_errors=True)
+                removed.append(str(child))
         except OSError:
             continue
+    # A retained probe dir (dc-probe-*) is swept here on the same TTL, but its
+    # _PROBE_CACHE entry would otherwise outlive the dir and hand /render a
+    # route->png path for a directory that no longer exists. Purge any cache entry
+    # whose retained dir was just removed (or lives under a removed path) so the
+    # cache never serves a missing PNG.
+    if removed:
+        with _PROBE_CACHE_LOCK:
+            stale_handles = [
+                h
+                for h, rec in _PROBE_CACHE.items()
+                if any(
+                    rec.get("dir") == r or rec.get("dir", "").startswith(r + os.sep)
+                    for r in removed
+                )
+            ]
+            for h in stale_handles:
+                _PROBE_CACHE.pop(h, None)
 
 
 def _tool(name: str) -> str | None:
@@ -560,8 +655,16 @@ async def _discover_from_dir(directory: Path, handle: str) -> dict[str, Any]:
             probe = json.loads(pout)
         except ValueError:
             probe = {}
+        route_png_map: dict[str, str] = {}
         for s in probe.get("screens") or []:
-            seeable[str(s.get("route"))] = True
+            route = str(s.get("route"))
+            seeable[route] = True
+            # Cache the route->PNG path so /render can reuse this capture instead
+            # of re-rendering the same route. Only screens with both a route and a
+            # path are usable; the path is absolute, inside probe_out.
+            png = s.get("path")
+            if s.get("route") is not None and png:
+                route_png_map[route] = str(png)
         if probe.get("blockedBy"):
             b = probe["blockedBy"]
             cannot_see.append(
@@ -569,10 +672,29 @@ async def _discover_from_dir(directory: Path, handle: str) -> dict[str, Any]:
             )
         if probe.get("buildDir") is None and probe.get("notes"):
             cannot_see.extend(str(n) for n in probe["notes"])
-        # The probe images are throwaway (only the manifest is used); drop the dir
-        # now rather than wait for the TTL sweep — off the event loop, since a
-        # recursive delete is blocking IO.
-        await asyncio.to_thread(shutil.rmtree, probe_out, ignore_errors=True)
+        # The probe used to be pure throwaway (only its manifest was read) and the
+        # dir was deleted here. Now, when the probe produced at least one usable
+        # screen, RETAIN the dir and cache its route->PNG map keyed by `handle`, so
+        # /render can reuse those PNGs instead of re-capturing (see _PROBE_CACHE).
+        # The retained dir is a dc-probe-* dir, so _sweep_clones already TTL-sweeps
+        # it (and purges the matching cache entry) on the ~1h _CLONE_TTL_SEC window;
+        # its fresh mkdir mtime starts that clock. NOTE: the probe runs WITHOUT
+        # --full while /render runs WITH --full, so a reused probe PNG is a viewport
+        # (non-full) capture — an intentional latency-vs-fidelity tradeoff for
+        # already-probed routes; uncovered picks stay on the fresh --full path.
+        if route_png_map:
+            await asyncio.to_thread(
+                _probe_put,
+                handle,
+                str(probe_out),
+                route_png_map,
+                _dir_signature(directory),
+            )
+        else:
+            # No usable screen: nothing to reuse, so drop the dir now (off the event
+            # loop — a recursive delete is blocking IO) rather than leak it to the
+            # TTL sweep, keeping empty probes from accumulating on disk.
+            await asyncio.to_thread(shutil.rmtree, probe_out, ignore_errors=True)
 
     screens = []
     for i, r in enumerate(routes):
@@ -855,13 +977,20 @@ async def _render_capture_job(
     out_dir: Path,
     refs: list[str],
     labels: list[str],
+    reused: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Run the capture subprocess (detached) and shape its output for the client.
 
     The synchronous validation and the SSRF/handle checks already ran in the
     handler; this only executes the vetted command and parses it, so a client
     disconnect cannot cancel the capture.
+
+    ``reused`` maps a pick's ref -> a probe PNG path already captured at /discover.
+    For those (repo/local) refs the capture command was built to SKIP them, and
+    the reused PNG is merged in below at the pick's original step order, so /render
+    only pays the capture cost for the routes the probe did not cover.
     """
+    reused = reused or {}
     screens: list[dict[str, Any]] = []
     could_not_see: list[str] = []
     try:
@@ -873,6 +1002,12 @@ async def _render_capture_job(
                 raise RuntimeError("could not render the selected screens") from exc
             by_route = {str(s.get("route")): s for s in (cap.get("screens") or [])}
             for i, ref in enumerate(refs):
+                # A covered pick reuses the probe PNG (viewport, not --full) at its
+                # original step; the rest are mapped by route from the fresh
+                # capture, and anything neither reused nor captured is not seeable.
+                if ref in reused:
+                    screens.append({"step": i + 1, "label": labels[i], "path": reused[ref]})
+                    continue
                 s = by_route.get(ref)
                 if s and s.get("path"):
                     screens.append({"step": i + 1, "label": labels[i], "path": s["path"]})
@@ -903,11 +1038,16 @@ async def _render_capture_job(
                     could_not_see.append(str(rec.get("label") or rec.get("route") or "a page"))
         return {"screens": screens, "couldNotSee": could_not_see}
     finally:
-        # A dc-render-* dir is referenced by history ONLY when a screen succeeded.
-        # On any no-screen exit (failed capture, empty result) nothing references
-        # it and the TTL sweep skips dc-render-*, so drop it here to keep repeated
-        # failures from exhausting upload storage.
-        if not screens:
+        # The fresh dc-render-* dir is referenced by history ONLY when a FRESHLY
+        # captured screen landed in it. Reused screens live in the probe dir, not
+        # out_dir, so a result made up entirely of reused screens leaves out_dir
+        # empty. On any no-fresh-screen exit (failed capture, empty result, or
+        # all-reused) nothing references out_dir and the TTL sweep skips
+        # dc-render-*, so drop it here to keep repeated failures / empty dirs from
+        # exhausting upload storage.
+        fresh_paths = {reused[r] for r in reused}
+        has_fresh_screen = any(s.get("path") not in fresh_paths for s in screens)
+        if not has_fresh_screen:
             await asyncio.to_thread(shutil.rmtree, out_dir, ignore_errors=True)
 
 
@@ -982,7 +1122,47 @@ async def _handle_render(request: web.Request) -> web.Response:
                 "the discovered project is no longer available; run discovery again",
                 "handle_expired",
             )
-        csv = ",".join(r for r in refs if r)
+
+        # Reuse the discovery probe's PNGs where we can. The probe cached a
+        # handle-keyed route->PNG map at /discover; reuse a cached PNG for any
+        # picked route it captured (whose file still exists) — but only when the
+        # source dir has not changed since discover (signature match), else a
+        # reused PNG could be stale. Reused PNG paths come from the probe dir the
+        # server created under uploads, so they need no extra path validation
+        # beyond the exists() check. This lookup runs AFTER all the synchronous
+        # validations above (NUL, field-length, handle containment / sensitive
+        # dir, exists), never before.
+        reused: dict[str, str] = {}
+        cached = _probe_get(handle)
+        if cached is not None and cached["source_mtime"] == _dir_signature(directory):
+            cached_routes = cached["routes"]
+            for ref in refs:
+                if not ref:
+                    continue
+                png = cached_routes.get(ref)
+                if png and await asyncio.to_thread(os.path.exists, png):
+                    reused[ref] = png
+
+        # Only the picks the probe did not cover need a fresh capture.
+        uncovered = [r for r in refs if r and r not in reused]
+
+        if not uncovered:
+            # Every pick is covered by the probe: skip the capture subprocess
+            # entirely (no node, no dc-render dir) and return the reused screens
+            # via a job so the response shape stays the job-based contract. Steps
+            # follow each pick's original order (step = index + 1).
+            reused_screens = [
+                {"step": i + 1, "label": labels[i], "path": reused[refs[i]]}
+                for i in range(len(refs))
+                if refs[i] in reused
+            ]
+
+            async def _reused_only() -> dict[str, Any]:
+                return {"screens": reused_screens, "couldNotSee": []}
+
+            return web.json_response({"job": _start_job(_reused_only)})
+
+        csv = ",".join(uncovered)
         uploads_base = await asyncio.to_thread(_uploads_dir)
         out_dir = uploads_base / f"dc-render-{uuid.uuid4().hex[:12]}"
         await asyncio.to_thread(out_dir.mkdir, parents=True, exist_ok=True)
@@ -994,6 +1174,17 @@ async def _handle_render(request: web.Request) -> web.Response:
             f"--out={out_dir}",
             "--full",
         ]
+        # Thread the reused map into the job so it merges reused + freshly captured
+        # screens in original pick order. Bind reused via default arg to snapshot it.
+        return web.json_response(
+            {
+                "job": _start_job(
+                    lambda cmd=cmd, out_dir=out_dir, reused=reused: _render_capture_job(
+                        kind, cmd, out_dir, refs, labels, reused
+                    )
+                )
+            }
+        )
     elif kind == "url":
         base = value or (handle[len("url:") :] if handle.startswith("url:") else "")
         routes = [r for r in refs if r]

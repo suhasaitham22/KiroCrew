@@ -1,0 +1,28 @@
+{
+  "id": "FEAT-001",
+  "type": "chore",
+  "description": "Establish the baseline and the offline validation harness for this task. Because INTEGRATIONS_ONLY blocks PyPI, the normal `pip install -e '.[dev]'` + `python -m pytest` path is not runnable in-sandbox. Confirm the feasible validation commands work against the UNCHANGED file so later features have a known-good baseline to compare against. This feature makes NO code changes.",
+  "status": "completed",
+  "steps": [
+    "Confirm interpreter: `pyenv global` should report 3.11.15 (set it with `pyenv global 3.11.15` if not).",
+    "Confirm PyPI is blocked (expected under INTEGRATIONS_ONLY): `pip install -e '.[dev]'` fails with a 403/tunnel error. Do NOT retry or seek workarounds; record that the full pytest suite cannot run here.",
+    "Confirm Python syntax validation works: `python -m py_compile src/kiro_crew/apps/builtins/design_critique/backend/routes.py` exits 0.",
+    "Confirm ruff is available and capture the BASELINE finding count on the unchanged file: `ruff check src/kiro_crew/apps/builtins/design_critique/backend/routes.py` (expect 6 pre-existing default-rule findings such as RUF059). Record this count; later features must not INCREASE it.",
+    "Confirm the test module compiles: `python -m py_compile src/kiro_crew/apps/builtins/design_critique/tests/test_backend_routes.py` exits 0.",
+    "Confirm node can syntax-check the capture script with the ambient NODE_OPTIONS neutralized: `env -u NODE_OPTIONS node --check src/kiro_crew/apps/builtins/design_critique/skills/design-critique/scripts/capture-build.mjs` exits 0.",
+    "Record all confirmed commands and the ruff baseline count in the feature's findings field."
+  ],
+  "acceptance_criteria": [
+    "`python -m py_compile` on backend/routes.py and tests/test_backend_routes.py both exit 0.",
+    "`ruff check backend/routes.py` runs and its baseline finding count is recorded (expected 6).",
+    "`env -u NODE_OPTIONS node --check capture-build.mjs` exits 0.",
+    "Findings note explicitly states that `python -m pytest` cannot run in-sandbox (aiohttp + kiro_crew not importable) and lists the substitute validation commands."
+  ],
+  "verification": [
+    "python -m py_compile src/kiro_crew/apps/builtins/design_critique/backend/routes.py",
+    "ruff check src/kiro_crew/apps/builtins/design_critique/backend/routes.py",
+    "env -u NODE_OPTIONS node --check src/kiro_crew/apps/builtins/design_critique/skills/design-critique/scripts/capture-build.mjs"
+  ],
+  "blocked_reason": null,
+  "findings": "Baseline established on the UNCHANGED tree (branch feat/dc-reuse-probe-pngs, network mode INTEGRATIONS_ONLY). No source changes made in this feature.\n\nEnvironment:\n- pyenv global = 3.11.15; `python --version` -> Python 3.11.15. Use `python` (not python3).\n- ruff 0.16.1 preinstalled; node v22.23.2.\n\nConfirmed validation commands (all run from repo root /projects/sandbox/KiroCrew):\n1. `python -m py_compile src/kiro_crew/apps/builtins/design_critique/backend/routes.py` -> exit 0 (PYCOMPILE_ROUTES_OK).\n2. `python -m py_compile src/kiro_crew/apps/builtins/design_critique/tests/test_backend_routes.py` -> exit 0 (PYCOMPILE_TESTS_OK).\n3. `ruff check src/kiro_crew/apps/builtins/design_critique/backend/routes.py` -> exit 1, RUFF BASELINE = 6 findings, all RUF059 (Unpacked variable never used) at lines 528 (`rc`), 548 (`prc`, `perr`), 640 (`out`), 868 (`rc`, `cerr`). ruff runs with DEFAULT rules here, NOT the repo flake8 config. Later features MUST NOT increase this count of 6 (net-new RUF059 or other findings introduced by edits are regressions).\n4. `env -u NODE_OPTIONS node --check src/kiro_crew/apps/builtins/design_critique/skills/design-critique/scripts/capture-build.mjs` -> exit 0 (NODE_CHECK_OK). NODE_OPTIONS must be unset because the ambient value points at a missing preload bootstrap.\n\nCONFIRMED BLOCKED (expected under INTEGRATIONS_ONLY): `pip install -e '.[dev]'` fails (PyPI blocked; 'No matching distribution found for setuptools>=64' / 403 tunnel). Do NOT retry or seek workarounds. Consequently aiohttp and the kiro_crew package are NOT importable, so `python -m pytest src/kiro_crew/apps/builtins/design_critique/tests/test_backend_routes.py` CANNOT run in-sandbox.\n\nSubstitute validation path for later features: (a) `python -m py_compile` for Python syntax on changed .py files; (b) `ruff check` on changed files, comparing against the baseline of 6; (c) `env -u NODE_OPTIONS node --check <file>` for any .mjs change; (d) author real pytest tests (CI will run them) and validate their syntax with py_compile since they cannot execute here."
+}
